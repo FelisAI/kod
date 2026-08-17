@@ -742,7 +742,12 @@ impl Orchestrator {
             if let Some(hint) = standup_thread_hint(self.summaries_on, events.is_empty()) {
                 thread = thread.child(
                     div()
-                        .px(px(26.))
+                        // NO horizontal padding. The scroll container this lives in
+                        // already applies px(26) — the same value the headline block
+                        // uses — so anything here is ADDED to it, not aligned with
+                        // it. Measured: with px(26) the line started at x=267 while
+                        // the headline started at x=240. The original px(8) was
+                        // wrong the same way, just less visibly (x=247).
                         .pb(px(6.))
                         .text_size(px(11.5))
                         .text_color(rgb(MUTED2))
