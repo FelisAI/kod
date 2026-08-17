@@ -16,7 +16,7 @@ orchestrator-core = { path = "crates/orchestrator-core" }
 orchestrator-host = { path = "crates/orchestrator-host" }
 orchestrator-store = { path = "crates/orchestrator-store" }
 orchestrator-daemon = { path = "crates/orchestrator-daemon" }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 gpui = "0.2.2"
 # 0.5.6 references ARM SIMD intrinsics removed in this nightly; pin to the known-good rev.
 pathfinder_simd = "=0.5.5"
@@ -27,8 +27,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # compact binary codec for the daemon wire (docs/018 §4) — grid snapshots as JSON
 # would be needlessly fat. 1.3 = the stable, simple serialize/deserialize API.
-bincode = "1.3"
+bincode = "3.0"
 # timezone-aware civil datetime math for the usage-limit reset instant (DST-
 # correct via zoned arithmetic — never a fixed offset). docs/019 auto-continue.
-jiff = "0.1"
+jiff = "0.2"
 libc = "0.2"
