@@ -1,0 +1,4 @@
+{"session_id":"705fb3c8-67e0-4049-89ab-9f8e46b21013","transcript_path":"/Users/me/.claude/projects/-private-tmp-ptyspike-proj/705fb3c8-67e0-4049-89ab-9f8e46b21013.jsonl","cwd":"/private/tmp/ptyspike/proj","permission_mode":"auto","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch /tmp/ptyspike/marker.txt","description":"Create marker file"},"tool_use_id":"toolu_01WiaBMJ1wYTbEvHyfhHB2ub"}
+
+{"session_id":"cbf21ff9-829a-4f4e-bbe5-563ae2d7ceb4","transcript_path":"/Users/me/.claude/projects/-private-tmp-ptyspike-proj/cbf21ff9-829a-4f4e-bbe5-563ae2d7ceb4.jsonl","cwd":"/private/tmp/ptyspike/proj","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm /tmp/ptyspike/marker.txt","description":"Delete marker.txt from /tmp/ptyspike"},"tool_use_id":"toolu_017f1KNV6uhUZYaF8itj4Kaq"}
+

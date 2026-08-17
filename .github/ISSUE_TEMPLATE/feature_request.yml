@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a change to what Kod does.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kod exists to cut the mental overhead of running a fleet of agent sessions. Requests that
+        make a concrete version of that overhead go away land best. Please search open issues
+        first, and keep it to one idea per issue.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem?
+      description: The situation you're in when you want this — not the solution yet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Kod to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What do you do today instead?
+      description: Your workaround, or a tool that already gets this right.

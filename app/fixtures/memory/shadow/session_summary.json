@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "project_key": "orchestrator-shadow",
+  "name": "Session-summary shadow memory eval",
+  "description": "Small shadow fixture for auditing LLM memory output before enabling automatic app usage.",
+  "documents": [
+    {
+      "id": "summary:sess-1:2000",
+      "kind": "session",
+      "uri": "/tmp/orchestrator/sess-1.jsonl",
+      "title": "Map projection and source ledger",
+      "text": "SESSION SUMMARY\nsession: sess-1\nproject: orchestrator\nheadline: wired native memory engine\ndetails:\n- kept Map as projection\n- source ledger validates durable memory\n- kickoff should retrieve durable memory instead of using the map tree as storage\n"
+    },
+    {
+      "id": "summary:sess-2:3000",
+      "kind": "session",
+      "uri": "/tmp/orchestrator/sess-2.jsonl",
+      "title": "Engine choice revision",
+      "text": "SESSION SUMMARY\nsession: sess-2\nproject: orchestrator\nheadline: revised memory engine choice\ndetails:\n- Use source_memory baseline first.\n- Use local_extract instead for typed memory now.\n- Same-title revisions should supersede stale memories.\n"
+    }
+  ],
+  "llm_output": {
+    "memories": [
+      {
+        "id": "map-projection",
+        "kind": "Decision",
+        "title": "Map is projection over memory graph",
+        "body_md": "The Map is a human-facing projection over durable typed memory, not the memory substrate.",
+        "evidence": [
+          {
+            "source_id": "summary:sess-1:2000",
+            "needle": "kept Map as projection"
+          }
+        ]
+      },
+      {
+        "id": "source-ledger",
+        "kind": "Concept",
+        "title": "Source ledger keeps evidence",
+        "body_md": "The source ledger validates durable memory with source evidence.",
+        "evidence": [
+          {
+            "source_id": "summary:sess-1:2000",
+            "needle": "source ledger validates durable memory"
+          }
+        ]
+      },
+      {
+        "id": "source-ledger-duplicate",
+        "kind": "Concept",
+        "title": "Source ledger keeps evidence",
+        "body_md": "The source ledger validates durable memory with source evidence.",
+        "evidence": [
+          {
+            "source_id": "summary:sess-1:2000",
+            "needle": "source ledger validates durable memory"
+          }
+        ]
+      },
+      {
+        "id": "memory-engine-choice-v1",
+        "kind": "Decision",
+        "title": "Memory engine choice",
+        "body_md": "Use source_memory baseline first.",
+        "evidence": [
+          {
+            "source_id": "summary:sess-2:3000",
+            "needle": "Use source_memory baseline first"
+          }
+        ]
+      },
+      {
+        "id": "memory-engine-choice-v2",
+        "kind": "Decision",
+        "title": "Memory engine choice",
+        "body_md": "Use local_extract instead for typed memory now.",
+        "evidence": [
+          {
+            "source_id": "summary:sess-2:3000",
+            "needle": "Use local_extract instead"
+          }
+        ]
+      },
+      {
+        "id": "hallucinated-memory",
+        "kind": "Decision",
+        "title": "Hallucinated memory",
+        "body_md": "This should not be persisted because its evidence is absent.",
+        "evidence": [
+          {
+            "source_id": "summary:sess-1:2000",
+            "needle": "this exact quote is not present"
+          }
+        ]
+      }
+    ]
+  },
+  "queries": [
+    {
+      "id": "q-map-projection",
+      "text": "map projection durable typed memory",
+      "expected_titles": ["Map is projection over memory graph"],
+      "expected_context_contains": ["human-facing projection"]
+    },
+    {
+      "id": "q-source-ledger",
+      "text": "source ledger validates durable memory evidence",
+      "expected_titles": ["Source ledger keeps evidence"],
+      "expected_context_contains": ["source ledger validates durable memory"]
+    },
+    {
+      "id": "q-engine-choice",
+      "text": "local extract typed memory engine choice",
+      "expected_object_ids": ["memory-engine-choice-v2"],
+      "expected_context_contains": ["local_extract instead"]
+    }
+  ],
+  "kickoff_query": {
+    "text": "memory engine choice map projection source ledger",
+    "expected_context_contains": [
+      "Map is a human-facing projection",
+      "source ledger validates durable memory",
+      "local_extract instead"
+    ]
+  }
+}

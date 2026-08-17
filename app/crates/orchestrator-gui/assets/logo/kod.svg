@@ -1,0 +1,28 @@
+<!--
+  The Kod mark: a kodkod reduced to geometry.
+
+  Two knockouts, not two drawn eyes — the holes are cut with fill-rule="evenodd"
+  so the mark sits on ANY ground (it is drawn over the sidebar, the app bg, and
+  a light iconset ground) without carrying a background colour of its own.
+
+  The single amber eye is deliberate continuity: the retired ensō carried exactly
+  one amber accent, and this keeps it. It also happens to say the product's whole
+  idea in one dot — most of what you are running is quiet, one thing wants you.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <path fill="#F2F5FA" fill-rule="evenodd" d="
+    M15 13
+    L23 26
+    Q32 23.5 41 26
+    L49 13
+    Q52.5 23 52.5 32
+    Q52.5 46 42.5 52
+    Q32 56.5 21.5 52
+    Q11.5 46 11.5 32
+    Q11.5 23 15 13
+    Z
+    M20.5 31 H28 V35.5 H20.5 Z
+    M36 31 H43.5 V35.5 H36 Z
+  "/>
+  <path fill="#E6C07A" d="M36 31 H43.5 V35.5 H36 Z"/>
+</svg>

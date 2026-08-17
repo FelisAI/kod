@@ -1,0 +1,369 @@
+{
+  "version": 1,
+  "project_key": "orchestrator",
+  "name": "Orchestrator memory seed eval",
+  "description": "Seed product-memory fixture for docs/020-021. Public evals test generic memory competence; this fixture tests orchestrator-specific retrieval and UI projection.",
+  "source_files": [
+    {
+      "id": "doc-001",
+      "kind": "doc",
+      "path": "../../../../docs/001-product-design.md",
+      "role": "initial product and wiki framing"
+    },
+    {
+      "id": "doc-011-integration",
+      "kind": "doc",
+      "path": "../../../../docs/011-integration-layer.md",
+      "role": "one-writer ownership and wiki contract"
+    },
+    {
+      "id": "doc-017",
+      "kind": "doc",
+      "path": "../../../../docs/017-memory-wiki.md",
+      "role": "wiki demotion and Brain pane"
+    },
+    {
+      "id": "doc-019",
+      "kind": "doc",
+      "path": "../../../../docs/019-map-v3-owned-brain.md",
+      "role": "current Map v3 design"
+    },
+    {
+      "id": "doc-020",
+      "kind": "doc",
+      "path": "../../../../docs/020-memory-backend-and-map.md",
+      "role": "new memory backend architecture"
+    },
+    {
+      "id": "doc-021",
+      "kind": "doc",
+      "path": "../../../../docs/021-memory-start-plan.md",
+      "role": "execution plan"
+    },
+    {
+      "id": "code-tree",
+      "kind": "code",
+      "path": "../../../crates/orchestrator-store/src/tree.rs",
+      "role": "current typed tree model"
+    },
+    {
+      "id": "code-extract",
+      "kind": "code",
+      "path": "../../../crates/orchestrator-gui/src/extract.rs",
+      "role": "current LLM extraction and background prompt provider"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "ret-001-building-derived",
+      "kind": "retrieval",
+      "query": "What governs stored versus derived building status?",
+      "gold": {
+        "answer": "Building is derived-only in Map v3: it is computed from live dispatch/declared session links and should not be stored as a lifecycle assertion.",
+        "evidence_files": ["doc-019", "code-tree"],
+        "memory_objects": [
+          {"kind": "Constraint", "title": "building is derived-only"}
+        ]
+      }
+    },
+    {
+      "id": "ret-002-docs-not-map-root",
+      "kind": "retrieval",
+      "query": "Why should docs/design trail not be a Map root category?",
+      "gold": {
+        "answer": "Docs are source evidence, not product ontology. The Map should project product areas/tasks/concepts; docs should appear in Evidence or Timeline unless documentation is itself a product surface.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Constraint", "title": "source types are not Map categories"}
+        ]
+      }
+    },
+    {
+      "id": "ret-003-wiki-role",
+      "kind": "retrieval",
+      "query": "What is wiki's current role in orchestrator memory?",
+      "gold": {
+        "answer": "wiki is a durable narrative library and optional write-behind/read-mostly source, not the typed/queryable memory backbone.",
+        "evidence_files": ["doc-017", "doc-011-integration"],
+        "memory_objects": [
+          {"kind": "Decision", "title": "wiki is narrative library, store owns typed memory"}
+        ]
+      }
+    },
+    {
+      "id": "ret-004-map-v3-review-model",
+      "kind": "retrieval",
+      "query": "What evidence supports the Map v3 review model for machine changes?",
+      "gold": {
+        "answer": "019 says human edits apply immediately and machine structure edits are carded as changesets, with provenance and review before acceptance.",
+        "evidence_files": ["doc-019"],
+        "memory_objects": [
+          {"kind": "Decision", "title": "machine changes are reviewed changesets"}
+        ]
+      }
+    },
+    {
+      "id": "ret-005-session-kickoff",
+      "kind": "kickoff",
+      "query": "What should a session dispatched from a Map part receive?",
+      "gold": {
+        "answer": "It should receive scoped kickoff context: node path/detail, relevant decisions, constraints, open questions, artifacts, recent sessions, and exact source snippets, with memory available mid-session.",
+        "evidence_files": ["doc-020", "doc-019"],
+        "memory_objects": [
+          {"kind": "Claim", "title": "compose kickoff from memory graph"}
+        ]
+      }
+    },
+    {
+      "id": "ret-006-map-not-memory-substrate",
+      "kind": "retrieval",
+      "query": "Why is the Map a projection rather than the memory substrate?",
+      "gold": {
+        "answer": "A tree cannot represent decisions, contradictions, supersession, evidence, sessions, and cross-links well enough. The Map should compile from typed memory objects and edges.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Decision", "title": "Map is projection over memory graph"}
+        ]
+      }
+    },
+    {
+      "id": "ret-007-memory-stack-synthesis",
+      "kind": "retrieval",
+      "query": "How are existing memory-system ideas combined for our architecture?",
+      "gold": {
+        "answer": "Use Memora-style full evidence/abstraction/cue anchors, Graphiti-style temporal graph, Mem0/LangGraph retrieval, Letta-style mid-session memory tools, consolidation from A-MEM/MemOS/DCPM, and orchestrator-specific UI projections.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Concept", "title": "combined memory stack"}
+        ]
+      }
+    },
+    {
+      "id": "ret-008-build-vs-adopt",
+      "kind": "retrieval",
+      "query": "When should we adopt an existing memory backend instead of building our own?",
+      "gold": {
+        "answer": "Adopt if it wins backend evals and supports exact provenance, temporal revision, session scoping, correction propagation, and typed projection semantics.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Decision", "title": "build-vs-adopt gate"}
+        ]
+      }
+    },
+    {
+      "id": "ret-009-interface-first",
+      "kind": "retrieval",
+      "query": "What product-facing memory interface comes before implementation choice?",
+      "gold": {
+        "answer": "Source -> MemoryObject -> MemoryEdge -> RetrievalResult -> Projection.",
+        "evidence_files": ["doc-020", "doc-021"],
+        "memory_objects": [
+          {"kind": "Constraint", "title": "interface before implementation"}
+        ]
+      }
+    },
+    {
+      "id": "ret-010-public-and-local-evals",
+      "kind": "retrieval",
+      "query": "Why do we need both public memory evals and local orchestrator fixtures?",
+      "gold": {
+        "answer": "Public evals test general memory competence; local fixtures test product acceptance: sessions, code/docs/git, Map dispatch, and UI projections.",
+        "evidence_files": ["doc-020", "doc-021"],
+        "memory_objects": [
+          {"kind": "Decision", "title": "two-track evaluation"}
+        ]
+      }
+    },
+    {
+      "id": "ret-011-source-ledger",
+      "kind": "retrieval",
+      "query": "What belongs in the memory source layer?",
+      "gold": {
+        "answer": "Immutable or append-only evidence such as docs, code, wiki pages, session events, accepted Map diffs, user captures, git commits, and artifacts.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Concept", "title": "source layer"}
+        ]
+      }
+    },
+    {
+      "id": "ret-012-memory-object-types",
+      "kind": "retrieval",
+      "query": "What typed memory objects do we need in v1?",
+      "gold": {
+        "answer": "Concept, Area, Task, Decision, Constraint, Claim, Question, SessionEvent, Learning, and Artifact.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Concept", "title": "memory object types"}
+        ]
+      }
+    },
+    {
+      "id": "ret-013-edge-types",
+      "kind": "retrieval",
+      "query": "Which graph edges are important for project memory?",
+      "gold": {
+        "answer": "Edges include derived_from, mentions, supports, contradicts, supersedes, depends_on, blocks, implements, belongs_to, touches_file, same_as, and related_to.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Concept", "title": "memory edge types"}
+        ]
+      }
+    },
+    {
+      "id": "ret-014-rework-noop",
+      "kind": "stale_or_noop",
+      "query": "How should the system prevent same-name or same-meaning rename suggestions?",
+      "gold": {
+        "answer": "Rename proposals are invalid unless the underlying memory object changes label or meaning; no-op/same-name proposals should become detail updates or be dropped before Map review.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Constraint", "title": "same-meaning rename is invalid"}
+        ]
+      }
+    },
+    {
+      "id": "ret-015-human-edit-propagation",
+      "kind": "retrieval",
+      "query": "How should human corrections affect future retrieval?",
+      "gold": {
+        "answer": "Human edits/rejections should update memory or correction state, and future retrieval/projection should respect them.",
+        "evidence_files": ["doc-020", "doc-021"],
+        "memory_objects": [
+          {"kind": "Constraint", "title": "corrections propagate"}
+        ]
+      }
+    },
+    {
+      "id": "ret-016-why-wiki-not-backbone",
+      "kind": "retrieval",
+      "query": "Why should wiki not be the operational memory backbone?",
+      "gold": {
+        "answer": "It is structurally thin/cold, lacks per-part status and typed operational query surfaces, and should not drive hot loop state.",
+        "evidence_files": ["doc-017", "doc-011-integration"],
+        "memory_objects": [
+          {"kind": "Constraint", "title": "wiki is not operational backbone"}
+        ]
+      }
+    },
+    {
+      "id": "ret-017-map-source-bucket-leakage",
+      "kind": "projection",
+      "query": "What is source-bucket leakage in Map projection?",
+      "gold": {
+        "answer": "A source container such as docs, sessions, or design trail appears as a product ontology category even though it should only provide evidence.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Concept", "title": "source-bucket leakage rate"}
+        ]
+      }
+    },
+    {
+      "id": "ret-018-external-benchmark-target",
+      "kind": "benchmark",
+      "query": "What should external memory benchmarks prove for our backend?",
+      "gold": {
+        "answer": "They should show backend competence on recall, updates, obsolete-memory avoidance, structured organization, multi-session action, and environment/workflow memory.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Concept", "title": "external benchmark track"}
+        ]
+      }
+    },
+    {
+      "id": "ret-019-ui-benchmark-target",
+      "kind": "benchmark",
+      "query": "What should our UI representation benchmark prove?",
+      "gold": {
+        "answer": "It should show memory is represented so the human can understand, edit, trust, and use it to steer agents through Map, Decision, Evidence, Timeline, and Open Questions views.",
+        "evidence_files": ["doc-020"],
+        "memory_objects": [
+          {"kind": "Concept", "title": "UI representation benchmark"}
+        ]
+      }
+    },
+    {
+      "id": "ret-020-first-vertical-slice",
+      "kind": "planning",
+      "query": "What is the first memory-system vertical slice?",
+      "gold": {
+        "answer": "orchestrator fixture -> source ledger -> memory backend interface -> retrieval eval -> Map/Evidence projection eval.",
+        "evidence_files": ["doc-021"],
+        "memory_objects": [
+          {"kind": "Task", "title": "first falsifiable memory slice"}
+        ]
+      }
+    },
+    {
+      "id": "proj-001-map-root-ontology",
+      "kind": "projection",
+      "query": "Given docs and sessions, what should Map roots represent?",
+      "gold": {
+        "answer": "Map roots should represent durable project/product concepts and responsibilities, not file/source categories.",
+        "evidence_files": ["doc-020", "doc-019"],
+        "checks": [
+          "no root named docs",
+          "no root named design trail",
+          "root items have Area/Task/Concept backing memory"
+        ]
+      }
+    },
+    {
+      "id": "proj-002-evidence-drawer",
+      "kind": "projection",
+      "query": "What should an Evidence drawer for a machine-created Map node show?",
+      "gold": {
+        "answer": "It should show source spans, source kind, whether the quote/span is still present, and visible objects that depend on the evidence.",
+        "evidence_files": ["doc-020"],
+        "checks": [
+          "has source spans",
+          "has source kind",
+          "has dependent visible items"
+        ]
+      }
+    },
+    {
+      "id": "proj-003-decision-view",
+      "kind": "projection",
+      "query": "What must a Decision projection answer?",
+      "gold": {
+        "answer": "It must show what needs a call, evidence/metrics, previous decisions superseded or contradicted, and what accepting each option changes.",
+        "evidence_files": ["doc-020"],
+        "checks": [
+          "shows question",
+          "shows options",
+          "shows evidence",
+          "shows supersession/contradiction"
+        ]
+      }
+    },
+    {
+      "id": "proj-004-memory-health",
+      "kind": "projection",
+      "query": "What memory health metrics should the UI expose?",
+      "gold": {
+        "answer": "Source freshness, unprocessed sources, rejected/flagged changes, contradiction count, and projection lag.",
+        "evidence_files": ["doc-020"],
+        "checks": [
+          "source freshness visible",
+          "projection lag visible",
+          "contradictions visible"
+        ]
+      }
+    },
+    {
+      "id": "kick-001-status-code-session",
+      "kind": "kickoff",
+      "query": "A Codex session is dispatched to work on status semantics in tree.rs. What memories should be retrieved?",
+      "gold": {
+        "answer": "Retrieve the derived-only building constraint, kind-aware status decision, current tree.rs lifecycle code, Map v3 status rationale, and any recent session notes touching status.",
+        "evidence_files": ["doc-019", "code-tree", "doc-020"],
+        "checks": [
+          "includes derived-only building",
+          "includes kind-aware area/task/idea semantics",
+          "includes tree.rs evidence"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in Kod is broken or behaves wrongly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kod is macOS-only, pre-1.0, and maintained by one person — one bug per issue, please.
+
+        **Security bugs do not go here.** Report those privately through
+        [security advisories](https://github.com/FelisAI/kod/security/advisories/new) (see `SECURITY.md`).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Kod version or commit
+      description: A release tag, or `git rev-parse --short HEAD` for the build you ran.
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and chip
+      placeholder: 15.3, Apple M2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build
+    attributes:
+      label: Which build?
+      description: Map and Memory are off unless you opted in — they change a lot of behaviour.
+      options:
+        - Default (Map and Memory off)
+        - "--features map"
+        - "--features memory"
+        - "--features map,memory"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, anything the terminal printed
+      description: Issues are public — scrub tokens, home paths, and anything private first.

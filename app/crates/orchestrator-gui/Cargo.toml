@@ -1,0 +1,78 @@
+[package]
+name = "orchestrator-gui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "orchestrator"
+path = "src/main.rs"
+
+# OSS-prep gates (docs: features.rs). Both DEFAULT-OFF: the open-source build ships
+# without the (unfinished, LLM-costly) Map and Memory subsystems. The code stays
+# fully compiled and tested — these features only flip the compile-time consts in
+# features.rs, which fold the LLM-trigger/UI branches to dead code. Re-enable while
+# iterating with `cargo run -p orchestrator-gui --features map` (and/or `memory`).
+[features]
+map = []
+memory = []
+
+[dependencies]
+gpui.workspace = true
+orchestrator-core.workspace = true
+# forces the known-good pathfinder rev into the gpui dep graph
+pathfinder_simd.workspace = true
+# the GUI consumes the terminal substrate as a typed API — it never sees
+# alacritty/portable-pty types directly (docs/013 §1).
+orchestrator-host.workspace = true
+orchestrator-store.workspace = true
+# the session daemon: connect_or_spawn() + the RemoteHost client (docs/018).
+orchestrator-daemon.workspace = true
+serde_json.workspace = true
+# the same glob matcher orchestrator-store uses for anchors — reused pure
+# (Pattern::matches, no filesystem) to intersect touched paths with node anchors
+# (docs/019 slice 3 return channel).
+glob = "0.3"
+# killpg(2): a headless CLI is spawned in its own process group so a TIMEOUT can
+# kill the whole tree. `codex` is a node launcher that runs the real binary as a
+# grandchild with inherited stdio — killing only the child leaves the grandchild
+# holding our pipes, and the reader threads never see EOF (extract::spawn_grouped).
+libc.workspace = true
+
+# Native macOS notifications (macnotify.rs): UNUserNotificationCenter for a
+# properly-attributed "Kod" notification when running from the signed .app bundle;
+# osascript stays the fallback for bare `cargo run` builds. These versions MATCH
+# the objc2 0.6 / 0.3.x stack gpui already pulls in (Cargo.lock: objc2 0.6.4,
+# objc2-foundation 0.3.2, block2 0.6.2) — no duplicate objc2 is introduced.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+block2 = "0.6"
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationTrigger",
+    "UNNotificationSound",
+    "UNError",
+    # Reading back whether the user actually GRANTED notification permission.
+    # Without it there is no way to distinguish "denied" from "delivered but the
+    # tester missed the banner" — the two look identical, which is exactly where
+    # the first real notification test stalled.
+    "UNNotificationSettings",
+] }
+# The Dock-tile badge (macnotify::set_dock_badge). AppKit is already in the graph
+# via gpui, but only transitively — a transitive dep is not a usable import path,
+# and gpui's feature set is gpui's to change, so the badge declares its own.
+# Minimal, and "NSResponder" is NOT filler: objc2-app-kit gates the whole
+# `NSApplication` CLASS on it (NSApplication's superclass), so without it
+# `sharedApplication` does not exist. Features are additive, so this can only
+# ever narrow — never fight — what gpui already turns on.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSResponder",
+    "NSDockTile",
+] }

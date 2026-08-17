@@ -1,0 +1,39 @@
+# Tuned for a SOLO maintainer: monthly, and every bump collapsed into ONE grouped
+# PR per ecosystem. The defaults (weekly, one PR per dependency) would out-post the
+# human on this repo, and a dependabot backlog nobody reads is worse than no bot.
+# Note dependabot cannot add the `Signed-off-by:` line CONTRIBUTING asks for — that
+# is honor-system here (no DCO check runs), so its PRs are fine to merge as-is.
+version: 2
+updates:
+  # The cargo workspace lives under app/ — there is no manifest at the repo root.
+  - package-ecosystem: cargo
+    directory: "/app"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: build
+    ignore:
+      # `=0.5.5` is a deliberate hard pin: 0.5.6 references ARM SIMD intrinsics that
+      # the pinned nightly removed (see the comment in app/Cargo.toml). Every bump PR
+      # for it is wrong by construction.
+      - dependency-name: pathfinder_simd
+      # Git dep pinned to a reviewed zed rev. Walking it to their HEAD is an
+      # unreviewable change to the terminal substrate, not a dependency update.
+      - dependency-name: alacritty_terminal
+
+  # Keeps actions/checkout + Swatinem/rust-cache from quietly aging out from under
+  # the macOS runner image. One PR a month, at most.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
