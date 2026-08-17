@@ -1,0 +1,12 @@
+# Copy to scripts/leakgate.local (gitignored) and fill in.
+#
+# LEAK_RE is an egrep alternation of every string that must never appear in a
+# published tree: retired project names, personal names, email addresses. It
+# lives OUTSIDE version control because the list itself is the private data —
+# committing it would publish exactly what it exists to protect.
+LEAK_RE='old-project-name|your-name|you@example.com'
+
+# Identity the public single-commit is authored under. Defaults to your global
+# git config if unset, which is usually NOT what you want for a company repo.
+GIT_PUBLISH_NAME='YourOrg'
+GIT_PUBLISH_EMAIL='oss@yourorg.example'

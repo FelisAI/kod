@@ -1,0 +1,21 @@
+Copyright 2026 FelisAI
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This software includes third-party open-source components, redistributed under
+their respective licenses:
+
+  - GPUI 0.2.2 — the GPU-accelerated UI framework, published to crates.io
+    (crates.io/crates/gpui). Copyright Zed Industries, Inc. — Apache License 2.0
+
+  - alacritty_terminal 0.25.1 — the terminal emulation substrate, from the Zed
+    fork of Alacritty (github.com/zed-industries/alacritty, rev 9d9640d4)
+    Copyright The Alacritty Project — Apache License 2.0
+
+  - portable-pty — cross-platform PTY handling (part of WezTerm)
+    Copyright Wez Furlong — MIT License
+
+  - Every other Rust crate in the resolved dependency graph is attributed in
+    THIRD-PARTY-LICENSES, which is generated from Cargo.lock and lists all of
+    them with the license each is redistributed under, plus the full text of
+    every license relied on. That file, not this one, is the complete list.

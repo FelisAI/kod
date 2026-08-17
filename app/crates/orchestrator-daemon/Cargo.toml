@@ -1,0 +1,19 @@
+[package]
+name = "orchestrator-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# The session daemon (docs/018): owns the PTYs via orchestrator-host, serves the
+# GUI over a unix socket. GUI-free + storage-free (no gpui, no rusqlite).
+[lib]
+name = "orchestrator_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orchestrator-daemon"
+path = "src/main.rs"
+
+[dependencies]
+orchestrator-host.workspace = true
+libc.workspace = true

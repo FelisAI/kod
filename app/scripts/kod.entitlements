@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened-runtime entitlements for Kod (ai.felis.kod), Developer ID distribution.
+       Intentionally EMPTY. This is not a placeholder — it is the measured answer.
+
+       EDITING THIS COMMENT: never write a double dash inside it. XML forbids one
+       anywhere in a comment except its own terminator, so spell command flags
+       without their leading dashes. `plutil -lint` is lenient and reports this
+       file OK either way; AMFI's parser is not, and codesign dies with
+       "AMFIUnserializeXML: syntax error near line N" — which reads like a broken
+       plist rather than a broken sentence. It cost one signing failure already.
+
+       Under codesign's hardened runtime (its `options runtime` flag) macOS blocks
+       JIT / unsigned executable memory, blocks DYLD_* env injection, and enforces
+       Library Validation. Kod trips none of those:
+         - No embedded JIT / WASM / JS runtime (no wasmtime, cranelift, v8, quickjs
+           in the dep tree). GPUI renders via blade-graphics -> Metal; Metal shader
+           compilation runs OUT OF PROCESS (MTLCompilerService), so no allow-jit /
+           allow-unsigned-executable-memory is required.
+         - Only Apple-signed frameworks are loaded (Metal, AppKit, Foundation);
+           Rust links statically, so Library Validation stays on (no
+           disable-library-validation).
+         - NO App Sandbox: Developer-ID (non-App-Store) distribution does not need
+           it, and it would break orchestrator-daemon's $TMPDIR Unix socket and its
+           CLI subprocess spawning. Do NOT add com.apple.security.app-sandbox.
+         - UserNotifications (UNUserNotificationCenter) needs NO entitlement for
+           LOCAL notifications — only a signed, bundled app with a stable bundle id,
+           which ai.felis.kod + make-app.sh already provide. aps-environment is for
+           REMOTE/push only and is intentionally absent.
+
+       Add an entry below ONLY if a launch crash or a notarization/crash log proves
+       it is needed (the sign + `notarytool submit` with its wait flag + launch is
+       measurement that settles it):
+         - EXC_BAD_ACCESS / mprotect fault mapping executable memory at first frame
+           (some Metal driver paths) ->
+             <key>com.apple.security.cs.allow-jit</key><true/>
+             <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+         - a dlopen of a non-Apple dylib blocked at runtime (only if the dormant
+           Vulkan/ash path ever activates on macOS) ->
+             <key>com.apple.security.cs.disable-library-validation</key><true/>
+  -->
+</dict>
+</plist>

@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# GPUI is a native-macOS UI toolkit, so the app only builds/tests on macOS.
+# The job below builds and tests the DEFAULT feature set — i.e. the open-source
+# build, with the Map and Memory subsystems compiled out (see
+# app/crates/orchestrator-gui/src/features.rs) — and then `cargo check`s the
+# `map`/`memory` combos so an enabled-only build cannot rot unseen. See that step
+# for why it is a `check` and not a build.
+jobs:
+  test:
+    name: test (default / OSS build)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain is NOT pinned here — rustup reads app/rust-toolchain.toml
+      # (a specific nightly the pathfinder_simd pin needs) so the channel has a
+      # single source of truth. The proxy calls below trigger rustup to auto-install
+      # that nightly plus the `clippy` component declared in the pin.
+      #
+      # SETTLED 2026-08-13 (this replaces a "verify on first CI run" note): clippy
+      # IS published for the pinned nightly-2025-11-30 on BOTH apple-darwin arches —
+      # `available = true` under [pkg.clippy-preview.target.{aarch64,x86_64}-apple-
+      # darwin] in that date's channel-rust-nightly.toml — so it resolves whichever
+      # arch macos-latest lands on, and `cargo clippy --version` under the pin runs
+      # locally (clippy 0.1.93). Keep the probes anyway: they are the fail-fast guard
+      # for the NEXT pin bump, where a given nightly's dist genuinely can lack a
+      # component and would otherwise blow up ~10 minutes deep in a build.
+      - name: Install pinned toolchain (rustup reads app/rust-toolchain.toml)
+        run: |
+          cargo --version
+          rustc --version
+          cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      # NOTE: this repo is hand-formatted and does NOT use rustfmt — there is no
+      # `cargo fmt --check` gate (running rustfmt would reformat the whole tree).
+      #
+      # Clippy is ADVISORY (continue-on-error) ON PURPOSE — please do not "fix" this
+      # by adding `-- -D warnings` and dropping continue-on-error. Two reasons, both
+      # measured: the tree carries 55 clippy warnings today (2026-08-13, 0 errors), so
+      # a hard gate would fail every PR from day one; and the toolchain is a *nightly*
+      # pin, so each pin bump lands a fresh batch of nightly lints and the gate would
+      # then redden whichever unrelated PR happened to follow the bump. Lints belong
+      # in the log, not on the merge button, until someone clears the backlog AND
+      # signs up to own that churn.
+      - name: Clippy (advisory)
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true
+
+      - name: Test
+        run: cargo test --workspace
+
+      # `map`/`memory` are default-off, so every step above compiles them OFF and an
+      # enabled-only build is otherwise never exercised. The gap is narrow today —
+      # the gates are `cfg!()` consts (features.rs), not `#[cfg]` attribute-stripping,
+      # so the default build already type-checks the gated bodies — but the first
+      # `#[cfg(feature = "map")]` or `map = ["dep:…"]` in the tree would silently make
+      # the enabled build both unbuilt and untested. This step is what keeps the claim
+      # at the top of this file true instead of aspirational.
+      #
+      # `check`, not build/test: the only thing an enabled build can add today is a
+      # compile error, and the clippy step above already left check-mode metadata for
+      # the (unchanged) dependency graph, so these cost roughly one crate's compile
+      # each rather than three relinks of a GPUI binary. Combos are spelled out rather
+      # than `--all-features` so that adding a third feature can't silently stop
+      # covering `map` alone / `memory` alone — the combos the README tells people to
+      # run. Same job on purpose: rust-cache keys per job, so a separate job would pay
+      # a cold gpui/alacritty graph to re-check one leaf crate.
+      - name: Check map/memory feature combos
+        run: |
+          cargo check --workspace --all-targets --features map
+          cargo check --workspace --all-targets --features memory
+          cargo check --workspace --all-targets --features map,memory
+
+      - name: Build release binaries
+        run: cargo build --release -p orchestrator-gui -p orchestrator-daemon
+
+      # Smoke-test the .app bundler end to end (assembles Kod.app from a build).
+      # `release` is passed EXPLICITLY. make-app.sh defaults to `debug`, so the
+      # bare call bundled a profile the step above never produced: CI paid for a
+      # release build nothing consumed, then compiled the whole tree AGAIN in
+      # debug just to have something to copy.
+      - name: Bundle Kod.app
+        run: bash scripts/make-app.sh release

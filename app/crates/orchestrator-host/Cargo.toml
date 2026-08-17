@@ -1,0 +1,21 @@
+[package]
+name = "orchestrator-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# The terminal-hosting substrate (docs/013 §1). GUI-free: no gpui types anywhere.
+# Public API types are plain serializable data so the M-later daemon extraction
+# is "move the call site behind a socket".
+[dependencies]
+# core is a leaf crate; host→core is a safe new edge (docs/019 codex limit) —
+# the host self-polls codex rollouts via `scan::codex_rollout_path` in the sweep.
+orchestrator-core.workspace = true
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+jiff.workspace = true
+libc.workspace = true
+rusqlite.workspace = true

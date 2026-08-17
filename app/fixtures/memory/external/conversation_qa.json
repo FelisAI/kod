@@ -1,0 +1,67 @@
+{
+  "name": "conversation-qa-smoke",
+  "data": [
+    {
+      "id": "project-alpha",
+      "haystack_sessions": [
+        {
+          "session_id": "alpha-s1",
+          "messages": [
+            {
+              "role": "user",
+              "content": "The deploy train is frozen until the audit log migration lands."
+            },
+            {
+              "role": "assistant",
+              "content": "I will treat the audit log migration as the release blocker."
+            }
+          ]
+        },
+        {
+          "session_id": "alpha-s2",
+          "messages": [
+            {
+              "role": "user",
+              "content": "The map rename bug is lower priority than restoring session kickoff retrieval."
+            }
+          ]
+        }
+      ],
+      "qa": [
+        {
+          "qid": "alpha-q1",
+          "question": "What blocks the deploy train?",
+          "answer": "audit log migration",
+          "evidence_ids": ["alpha-s1"],
+          "question_type": "single-session-recall"
+        },
+        {
+          "qid": "alpha-q2",
+          "question": "What is higher priority than the map rename bug?",
+          "answer": "session kickoff retrieval",
+          "evidence_ids": ["alpha-s2"],
+          "question_type": "preference-recall"
+        }
+      ]
+    },
+    {
+      "id": "project-beta",
+      "conversation": [
+        {
+          "turn_id": "beta-t1",
+          "speaker": "user",
+          "text": "Use the Codex provider for memory proposals because Claude quota is exhausted."
+        },
+        {
+          "turn_id": "beta-t2",
+          "speaker": "assistant",
+          "text": "I will keep memory proposal generation provider configurable."
+        }
+      ],
+      "question": "Which provider should be used for memory proposals?",
+      "answer": "Codex provider",
+      "evidence_ids": ["beta-t1"],
+      "question_type": "direct-fact"
+    }
+  ]
+}

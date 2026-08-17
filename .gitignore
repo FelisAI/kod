@@ -1,0 +1,28 @@
+# build artifacts + deps (app + spikes)
+target/
+node_modules/
+dist/
+# OS noise
+.DS_Store
+# never commit credentials or local env
+.env
+.env.*
+*.pem
+*.key
+credentials*
+# local scratch
+*.tmp
+/Kod.app/
+# separate side projects that live beside this repo but are NOT part of it —
+# ecphory is the private memory-system prototype; must never ship in the OSS repo.
+/ecphory/
+# local working artifacts — design notes, docs, and spikes/experiments. Kept on
+# disk but OUT of the repo (untracked): they're our scratch, not for collaborators
+# or the public build. (The OSS publish already dropped them via its whitelist.)
+/designs/
+/docs/
+/spikes/
+/experiments/
+
+# the leak gate vocabulary — the list IS the private data, never commit it
+scripts/leakgate.local

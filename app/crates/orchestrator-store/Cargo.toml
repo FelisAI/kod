@@ -1,0 +1,17 @@
+[package]
+name = "orchestrator-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# The persisted DESIGN tree (docs/016). Owns the per-project parts tree, the
+# asserted status, code anchors, and an append-only journal (undo +
+# since-you-were-away). Pure tree/diff model + an impure SQLite shell.
+[dependencies]
+orchestrator-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# expand a part's code anchors (globs) to real files, to compare their mtimes
+# against the asserted status time (the freshness reconciler, docs/016).
+glob = "0.3"
