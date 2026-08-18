@@ -80,6 +80,11 @@ h1{
 }
 /* Muted on purpose. An alpha notice has to be READ, not shouted — and amber is
    spent on the one session that needs you, which is the page's whole argument. */
+.soon{
+  font-family:var(--mono); font-size:11px; letter-spacing:.06em; color:var(--muted2);
+  border:1px solid var(--hair); border-radius:20px; padding:3px 9px; vertical-align:middle;
+  margin-left:8px; font-weight:400;
+}
 .alpha{font-size:14px; color:var(--muted2); margin:16px 0 0; max-width:52ch; line-height:1.55}
 
 /* ── the rail: the product's whole argument, in markup ──
@@ -155,7 +160,7 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
   <header><div class="masthead">
     <a class="brand" href="/"><img src="assets/kod-mark.png" alt=""><span>Kod</span></a>
     <nav class="nav">
-      <a href="#what">What it does</a>
+      <a href="#what">How it helps</a>
       <a href="#install">Install</a>
       <a href="https://github.com/FelisAI/kod">Source</a>
     </nav>
@@ -165,9 +170,10 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
     <div>
       <h1>Run a fleet of AI&nbsp;coding agents without frying your brain.</h1>
       <p class="lede">
-        Ten <code>claude</code> and <code>codex</code> sessions across your projects, and you're
-        tab-hopping just to find which one finished and which one is
-        <strong>waiting on you</strong>. Kod watches all of them and tells you.
+        Agents made it cheap to run ten things at once. The part that didn't scale is
+        <strong>you</strong> — holding ten contexts in your head, tracking which one
+        is stuck, remembering what you already explained. That ceiling is what Kod
+        is built to lift.
       </p>
       <div class="cta">
         <a class="btn btn-primary" href="https://github.com/FelisAI/kod/releases/latest/download/Kod.dmg">Download for macOS</a>
@@ -211,23 +217,25 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
 
 <div class="wrap">
   <section id="what">
-    <h2>One screen instead of twelve tabs</h2>
+    <h2>You shouldn't have to track what's running</h2>
     <p class="sub">
-      Every session you've started, across every project, with the one that's blocked
-      pinned to the top. A desktop notification fires the moment an agent needs a
-      decision — so you can look away and trust Kod to pull you back.
+      Which of your agents is working, which is idle, which hit a usage limit, which
+      has been sitting on a question for twenty minutes. That is state a machine
+      should hold, not a person. Kod keeps it across every project and puts whatever
+      is blocked at the top.
     </p>
     <figure>
       <img src="assets/workspace.png" width="1240" height="852"
            alt="Kod's workspace: a rail of projects down the left showing when each was last touched, and a list of recent sessions in the selected project, each with what it last did and a Resume button.">
-      <figcaption>Pick up where you left off — every recent session in a project, with what it last did.</figcaption>
+      <figcaption>Pick up where you left off — every recent session in a project, each with what it last did, so returning to a project costs a glance instead of a re-read.</figcaption>
     </figure>
 
     <div class="grid">
       <div class="card">
         <h3>Standup</h3>
-        <p>Who's live, who's idle, who needs you, and who hit a usage limit — plus idle-time
-        summaries of what each session actually got done.</p>
+        <p>One reactive home across every project — and idle-time summaries of what each
+        session got done, so catching up is reading four lines instead of scrolling four
+        transcripts.</p>
       </div>
       <div class="card">
         <h3>Profiles</h3>
@@ -236,39 +244,44 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
       </div>
       <div class="card">
         <h3>Recover</h3>
-        <p>Find and resume sessions that crashed or that you started in a terminal
-        somewhere and lost track of.</p>
+        <p>Sessions that crashed, or that you started in a terminal somewhere and lost
+        track of, are findable and resumable — losing one stops meaning losing its
+        context.</p>
       </div>
     </div>
   </section>
 
   <section>
-    <h2>Sessions survive the app</h2>
+    <h2>You shouldn't have to watch for it</h2>
     <p class="sub">
-      A background daemon owns your sessions, so quitting the window doesn't kill the
-      work. Kod hosts real terminals — your agents run exactly as they would in a
-      terminal, because they are in one.
+      Polling twelve tabs to see if anything needs you is the tax that makes running
+      several agents exhausting. Kod pulls you back instead: a notification the moment
+      an agent is genuinely blocked, and a count on the Dock icon the rest of the
+      time — ambient, never interrupting. A background daemon owns the sessions, so
+      closing the window doesn't kill the work.
     </p>
     <figure>
       <img src="assets/standup.png" width="1240" height="852"
            alt="Kod's Standup screen reading 'All quiet — nothing needs you right now', above today's activity timeline, with the project rail on the left.">
-      <figcaption>All quiet is a first-class state. Kod is loudest when something is blocked, and silent when nothing is.</figcaption>
+      <figcaption>All quiet is a first-class state — and the one you want most of the time. Kod is loud only when something is genuinely blocked.</figcaption>
     </figure>
   </section>
 
   <section id="next">
-    <h2>What's being built</h2>
+    <h2>You shouldn't have to re-explain it <span class="soon">in progress</span></h2>
     <p class="sub">
-      Kod today watches what is <em>happening</em>. The next layer is memory: what
-      already happened.
+      The last load, and the largest. Kod today holds what is <em>happening</em>; the
+      work underway is holding what already <em>happened</em>.
     </p>
     <p class="note" style="max-width:64ch">
-      A session ends and its context dies with it. You re-explain the same decision
-      to the same agent next week, and to a different agent in a different project
-      the week after. The work underway is a first-party memory system — durable,
-      queryable, per-project — so an agent starts a session already knowing what was
-      decided, what was tried, and what it cost. The per-project map is the view onto
-      that memory rather than a diagram you maintain by hand.
+      A session ends and its context dies with it. So you re-explain the same decision
+      to the same agent next week, and to a different agent in a different project the
+      week after — which means <em>you</em> are still the memory, and the number of
+      projects you can carry is still capped by what you can recall. The work underway
+      is a first-party memory system, durable and per-project, so an agent starts
+      already knowing what was decided, what was tried, and what it cost. The
+      per-project map is the view onto that memory rather than a diagram you maintain
+      by hand.
     </p>
     <p class="note" style="max-width:64ch; margin-top:14px">
       Both ship behind default-off feature flags today, because neither is finished.
