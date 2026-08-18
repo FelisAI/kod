@@ -15,5 +15,17 @@
   "compatibility_date": "2026-08-17",
   "assets": {
     "directory": "./site"
-  }
+  },
+
+  // The custom domain, declared here rather than clicked once in the dashboard —
+  // so it is versioned, reviewable, and reapplied by every deploy instead of
+  // being invisible state someone has to remember.
+  //
+  // `custom_domain: true` makes Cloudflare do the DNS itself: because felisai.pro
+  // is already a zone on this account, deploying PROVISIONS the record and the
+  // TLS certificate. There is no CNAME to add by hand, and pointing one at a
+  // Worker manually does not work anyway — a Worker is not an origin.
+  "routes": [
+    { "pattern": "kod.felisai.pro", "custom_domain": true }
+  ]
 }
