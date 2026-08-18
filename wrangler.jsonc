@@ -1,0 +1,19 @@
+// Cloudflare Workers config for the kod.felisai.pro landing page.
+//
+// WHY THIS EXISTS: Cloudflare has merged Workers and Pages, and the current
+// "Connect to Git" flow lands in WORKERS BUILDS, which asks for a deploy command
+// (`npx wrangler deploy`) instead of Pages' "build output directory" field. That
+// command needs this file to know what to publish — without it the deploy has no
+// idea `site/` is the thing to serve.
+//
+// There is no `main`, deliberately: this is a STATIC-ASSETS-ONLY Worker. No
+// server code runs, nothing is bundled, and the whole deploy is the contents of
+// site/. If a Worker script is ever added, `main` points at it and the assets
+// binding keeps serving the page underneath.
+{
+  "name": "kod",
+  "compatibility_date": "2026-08-17",
+  "assets": {
+    "directory": "./site"
+  }
+}
