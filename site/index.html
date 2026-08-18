@@ -73,7 +73,14 @@ h1{
 .btn-primary:hover{opacity:.88; text-decoration:none}
 .btn-ghost{border-color:var(--hair); color:var(--text)}
 .btn-ghost:hover{border-color:var(--muted2); text-decoration:none}
-.req{font-size:13.5px; color:var(--muted2); margin-top:14px}
+.req{font-size:13.5px; color:var(--muted2); margin-top:14px; display:flex; align-items:center; gap:9px; flex-wrap:wrap}
+.tag{
+  border:1px solid var(--hair); color:var(--muted); border-radius:20px;
+  padding:2px 9px; font-size:11.5px; font-family:var(--mono); letter-spacing:.04em;
+}
+/* Muted on purpose. An alpha notice has to be READ, not shouted — and amber is
+   spent on the one session that needs you, which is the page's whole argument. */
+.alpha{font-size:14px; color:var(--muted2); margin:16px 0 0; max-width:52ch; line-height:1.55}
 
 /* ── the rail: the product's whole argument, in markup ──
    Four sessions. Three quiet. One wants you. That is the app. */
@@ -166,7 +173,18 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
         <a class="btn btn-primary" href="https://github.com/FelisAI/kod/releases">Download for macOS</a>
         <a class="btn btn-ghost" href="https://github.com/FelisAI/kod">View source</a>
       </div>
-      <p class="req">macOS 13+ · Apple silicon &amp; Intel · signed and notarized · Apache-2.0</p>
+      <p class="req">
+        <span class="tag">Early alpha</span>
+        macOS 13+ · Apple silicon &amp; Intel · signed and notarized · Apache-2.0
+      </p>
+      <p class="alpha">
+        Kod is early. It is built and used daily by one person, and rough edges are
+        real: text fields do not accept paste yet, projects cannot be deleted, and
+        the map and memory surfaces are compiled out by default. If that is
+        interesting rather than disqualifying, the
+        <a href="https://github.com/FelisAI/kod/issues">issues</a> are the honest
+        list.
+      </p>
     </div>
 
     <div class="rail" aria-label="Example: four sessions, one needs you">
@@ -236,6 +254,26 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
            alt="Kod's Standup screen reading 'All quiet — nothing needs you right now', above today's activity timeline, with the project rail on the left.">
       <figcaption>All quiet is a first-class state. Kod is loudest when something is blocked, and silent when nothing is.</figcaption>
     </figure>
+  </section>
+
+  <section id="next">
+    <h2>What's being built</h2>
+    <p class="sub">
+      Kod today watches what is <em>happening</em>. The next layer is memory: what
+      already happened.
+    </p>
+    <p class="note" style="max-width:64ch">
+      A session ends and its context dies with it. You re-explain the same decision
+      to the same agent next week, and to a different agent in a different project
+      the week after. The work underway is a first-party memory system — durable,
+      queryable, per-project — so an agent starts a session already knowing what was
+      decided, what was tried, and what it cost. The per-project map is the view onto
+      that memory rather than a diagram you maintain by hand.
+    </p>
+    <p class="note" style="max-width:64ch; margin-top:14px">
+      Both ship behind default-off feature flags today, because neither is finished.
+      They are in the source if you want to read where it is going.
+    </p>
   </section>
 
   <section id="install">
