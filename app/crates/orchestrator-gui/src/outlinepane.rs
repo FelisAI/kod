@@ -402,7 +402,11 @@ fn meter(done: usize, total: usize, width: f32) -> impl IntoElement {
 /// Pure display — main.rs owns the keystream and focus. `pub` so the changeset
 /// review card (rendered in main.rs) reuses the exact editor chrome for its
 /// edit-before-accept name input (docs/019 slice 1c).
-pub fn inline_input(slot_label: &'static str, buf: &str) -> impl IntoElement {
+pub fn inline_input(
+    slot_label: &'static str,
+    buf: &str,
+    caret: crate::textedit::Caret,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
@@ -421,27 +425,42 @@ pub fn inline_input(slot_label: &'static str, buf: &str) -> impl IntoElement {
                 .text_color(rgb(MUTED2))
                 .child(slot_label),
         )
-        .child(
+        .child({
+            // The buffer is drawn as THREE runs — before the selection, the
+            // selection, after it — because that is what lets the caret sit
+            // where the cursor actually IS. The old single run could only ever
+            // put the bar after the whole string, which is why the field was
+            // append-only no matter what the key router did.
+            let mut c = caret;
+            c.clamp(buf);
+            let (s, e) = c.range();
+            let run = |t: &str| {
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_STRONG))
+                    .child(SharedString::from(t.to_string()))
+            };
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .min_w_0()
-                .child(
-                    div()
-                        .text_size(px(12.5))
-                        .text_color(rgb(TEXT_STRONG))
-                        .child(SharedString::from(buf.to_string())),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(2.))
-                        .h(px(13.))
-                        .ml(px(1.))
-                        .bg(rgb(ACCENT)),
-                ),
-        )
+                .child(run(&buf[..s]))
+                // A selection REPLACES the caret as the position indicator:
+                // drawing both at once reads as a rendering bug.
+                .when(s != e, |r| {
+                    r.child(
+                        div()
+                            .rounded(px(2.))
+                            .bg(rgba(0x7EE2C038))
+                            .child(run(&buf[s..e])),
+                    )
+                })
+                .when(s == e, |r| {
+                    r.child(div().flex_none().w(px(2.)).h(px(13.)).bg(rgb(ACCENT)))
+                })
+                .child(run(&buf[e..]))
+        })
         .child(div().flex_1())
         .child(
             div()
@@ -523,6 +542,7 @@ pub fn focus_card(
     ancestry: &str,
     breaking_down: bool,
     edit: &EditState,
+    caret: crate::textedit::Caret,
     h: &OutlineHandlers,
 ) -> impl IntoElement {
     let p = &node.part;
@@ -571,7 +591,7 @@ pub fn focus_card(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(inline_input("rename", &edit.buf))
+                        .child(inline_input("rename", &edit.buf, caret))
                         .into_any_element()
                 } else {
                     let begin = h.begin_edit.clone();
@@ -670,7 +690,7 @@ pub fn focus_card(
         .when(edit.is(EditSlot::AddSibling(id)), |c| {
             // Enter's new-sibling editor renders under the card — where the
             // row will land in the tree (docs/019 OUTLINE grammar).
-            c.child(inline_input("＋ sibling", &edit.buf))
+            c.child(inline_input("＋ sibling", &edit.buf, caret))
         })
         .when_some(ratio_label(done, total), |c, label| {
             c.child(
@@ -1012,6 +1032,7 @@ pub fn sessions_section(sessions: &[SessionRow], h: &OutlineHandlers) -> impl In
 pub fn child_rows(
     children: &[TreeNode],
     edit: &EditState,
+    caret: crate::textedit::Caret,
     h: &OutlineHandlers,
 ) -> impl IntoElement {
     let mut col = div()
@@ -1032,7 +1053,7 @@ pub fn child_rows(
         let p = &ch.part;
         let id = p.id;
         if edit.is(EditSlot::RenameChild(id)) {
-            col = col.child(inline_input("rename", &edit.buf));
+            col = col.child(inline_input("rename", &edit.buf, caret));
             continue;
         }
         let (g, gc) = glyph(p.lifecycle, p.stale);
@@ -1113,7 +1134,11 @@ pub fn child_rows(
 
 /// (4) The add-row: three ghost chips; while an Add* slot is live the whole
 /// row becomes the inline editor (RenameChild renders in place, in child_rows).
-pub fn add_row(edit: &EditState, h: &OutlineHandlers) -> AnyElement {
+pub fn add_row(
+    edit: &EditState,
+    caret: crate::textedit::Caret,
+    h: &OutlineHandlers,
+) -> AnyElement {
     let live = match edit.active {
         Some(EditSlot::AddPart) => Some("＋ part"),
         Some(EditSlot::AddDecision) => Some("＋ decision"),
@@ -1123,7 +1148,7 @@ pub fn add_row(edit: &EditState, h: &OutlineHandlers) -> AnyElement {
     if let Some(slot_label) = live {
         return div()
             .mt(px(6.))
-            .child(inline_input(slot_label, &edit.buf))
+            .child(inline_input(slot_label, &edit.buf, caret))
             .into_any_element();
     }
     let ghost = |id: &'static str, label: &'static str, slot: EditSlot, h: &OutlineHandlers| {
@@ -1264,6 +1289,7 @@ pub fn outline_pane(
     notes: &[NoteRow],
     pending: &[(DiffOp, Option<String>)],
     edit: &EditState,
+    caret: crate::textedit::Caret,
     live_sessions: &[(String, String)],
     link_open: bool,
     sessions: &[SessionRow],
@@ -1278,14 +1304,14 @@ pub fn outline_pane(
         .flex_col()
         .gap(px(6.))
         .p(px(18.))
-        .child(focus_card(node, ancestry, breaking_down, edit, h))
+        .child(focus_card(node, ancestry, breaking_down, edit, caret, h))
         .child(link_row(node.part.id, live_sessions, link_open, h))
         .child(decision_log(notes, now_secs, h))
         .when(!sessions.is_empty(), |c| {
             c.child(sessions_section(sessions, h))
         })
-        .child(child_rows(&node.children, edit, h))
-        .child(add_row(edit, h))
+        .child(child_rows(&node.children, edit, caret, h))
+        .child(add_row(edit, caret, h))
         .when(!pending.is_empty(), |c| {
             c.child(proposed_card(pending, name_of, h))
         })

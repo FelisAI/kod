@@ -654,7 +654,7 @@ impl Orchestrator {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(outlinepane::inline_input("name", &self.outline_edit.buf))
+                    .child(outlinepane::inline_input("name", &self.outline_edit.buf, self.inline_caret))
                     .into_any_element()
             } else {
                 let mut t = div()

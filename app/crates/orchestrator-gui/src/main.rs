@@ -62,6 +62,7 @@ mod spawn;
 mod summaries;
 mod termgeom;
 mod termview;
+mod textedit;
 mod theme;
 mod timefmt;
 mod triage;
@@ -346,6 +347,11 @@ struct Orchestrator {
     /// an in-progress edit of one string-valued setting (Phase 4: a prompt-model
     /// key). Some = its faux-input owns the Settings window's keystream.
     setting_edit: Option<SettingEdit>,
+    /// The caret for whichever inline field is currently live. ONE, not one
+    /// per field: `route_inline_key`'s if/else chain guarantees at most one
+    /// editor is open at a time, so a second caret could only ever be stale.
+    /// Re-seeded (to end-of-text) every time an editor opens or changes slot.
+    inline_caret: textedit::Caret,
     /// expanded timeline rows (key = event ts_ms ^ kind ordinal).
     standup_expanded: std::collections::HashSet<u64>,
     /// deferred outline-open (slug, at_ms): opening INSTANTLY on click-1 of a

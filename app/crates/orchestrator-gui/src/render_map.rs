@@ -1090,6 +1090,7 @@ impl Orchestrator {
                             &notes,
                             &pending_for_node,
                             &self.outline_edit,
+                            self.inline_caret,
                             &live_sessions,
                             self.outline_link_open,
                             &sessions,

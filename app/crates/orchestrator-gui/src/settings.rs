@@ -847,6 +847,7 @@ impl Orchestrator {
             .and_then(|s| s.get_setting(key))
             .unwrap_or_default();
         self.setting_edit = Some(SettingEdit { key, slot, buf });
+        self.seed_inline_caret(InlineTarget::SettingText);
         // never two inline editors at once (mirrors how the profile Edit/Add
         // listeners clear setting_edit).
         if let Some(d) = self.profile_draft.as_mut() {
@@ -870,7 +871,7 @@ impl Orchestrator {
         // this key's faux-input is live → render the shared inline editor with
         // the slot label carried on the edit itself.
         if let Some(edit) = self.setting_edit.as_ref().filter(|e| e.key == key) {
-            return outlinepane::inline_input(edit.slot, &edit.buf).into_any_element();
+            return outlinepane::inline_input(edit.slot, &edit.buf, self.inline_caret).into_any_element();
         }
         let cur = self
             .store
@@ -1498,6 +1499,7 @@ impl Orchestrator {
             if let Some(d) = self.profile_draft.as_mut() {
                 d.editing = Some(DraftSlot::Label);
             }
+            self.seed_inline_caret(InlineTarget::ProfileField);
             cx.notify();
             return;
         }
@@ -1576,7 +1578,7 @@ impl Orchestrator {
             .as_ref()
             .is_some_and(|d| d.editing == Some(slot))
         {
-            return outlinepane::inline_input(slot.slot_label(), value).into_any_element();
+            return outlinepane::inline_input(slot.slot_label(), value, self.inline_caret).into_any_element();
         }
         let empty = value.trim().is_empty();
         let shown = if empty {
@@ -1628,6 +1630,7 @@ impl Orchestrator {
         if let Some(d) = self.profile_draft.as_mut() {
             d.editing = Some(slot);
         }
+        self.seed_inline_caret(InlineTarget::ProfileField);
         self.setting_edit = None;
         self.focus_settings_input(window);
         cx.notify();

@@ -386,6 +386,7 @@ pub(crate) fn run() {
                         settings_focus: None,
                         profile_draft: None,
                         setting_edit: None,
+                        inline_caret: textedit::Caret::default(),
                         standup_expanded: std::collections::HashSet::new(),
                         standup_updates: std::cell::RefCell::new((u64::MAX, Vec::new())),
                         proj_updates: std::cell::RefCell::new((u64::MAX, std::collections::HashMap::new())),

@@ -335,6 +335,7 @@ impl Orchestrator {
             active: Some(slot),
             buf,
         };
+        self.seed_inline_caret(InlineTarget::Outline);
         self.rail_new = None;
         self.root_focus.focus(window); // router owns keys (review 1b)
         cx.notify();
@@ -670,14 +671,41 @@ impl Orchestrator {
     }
 
     /// Create a store-backed idea project (#10) — an idea is just a project.
-    pub(crate) fn route_inline_key(
-        &mut self,
-        ev: &KeyDownEvent,
-        target: InlineTarget,
-        cx: &mut Context<Self>,
-    ) {
-        let k = ev.keystroke.key.as_str();
-        let buf: &mut String = match target {
+    /// The buffer a given inline target edits. Split out of the router so the
+    /// editing path can borrow it AFTER the caret has been lifted out of
+    /// `self` — holding `&mut self.inline_caret` and `&mut self.<buffer>` at
+    /// once is the one thing this cannot do.
+    /// The buffer a target edits, or None when that editor is not open — the
+    /// non-panicking twin of `inline_buf`, for callers that only want to look.
+    fn inline_buf_ref(&self, target: InlineTarget) -> Option<&str> {
+        match target {
+            InlineTarget::RailIdea => self.rail_new.as_deref(),
+            InlineTarget::Outline => Some(self.outline_edit.buf.as_str()),
+            InlineTarget::ProfileField => self.profile_draft.as_ref().map(|d| match d.editing {
+                Some(DraftSlot::Model) => d.model.as_str(),
+                Some(DraftSlot::ExtraArgs) => d.extra_args.as_str(),
+                _ => d.label.as_str(),
+            }),
+            InlineTarget::SettingText => self.setting_edit.as_ref().map(|e| e.buf.as_str()),
+        }
+    }
+
+    /// Re-seed the caret at the END of whichever inline buffer just took the
+    /// keystream. EVERY open-an-editor path calls this: without it the caret
+    /// keeps the offset from the field you just left, which on a shorter buffer
+    /// lands mid-word — `clamp` means never a crash, but visibly wrong.
+    ///
+    /// End, not select-all: a stray keystroke must never wipe a prefilled value
+    /// that took someone a while to type. ⌘A is the deliberate gesture for that.
+    pub(crate) fn seed_inline_caret(&mut self, target: InlineTarget) {
+        self.inline_caret = self
+            .inline_buf_ref(target)
+            .map(textedit::Caret::at_end)
+            .unwrap_or_default();
+    }
+
+    fn inline_buf(&mut self, target: InlineTarget) -> &mut String {
+        match target {
             InlineTarget::RailIdea => self.rail_new.as_mut().unwrap(),
             InlineTarget::Outline => &mut self.outline_edit.buf,
             // both unwraps are gated by the root router (draft.editing.is_some()
@@ -693,7 +721,71 @@ impl Orchestrator {
                 }
             }
             InlineTarget::SettingText => &mut self.setting_edit.as_mut().unwrap().buf,
+        }
+    }
+
+    /// Is this target the outline's Detail slot — the one real textarea? Only
+    /// it keeps newlines; every other field is single-line and must not.
+    fn inline_is_textarea(&self, target: InlineTarget) -> bool {
+        target == InlineTarget::Outline
+            && matches!(
+                self.outline_edit.active,
+                Some(outlinepane::EditSlot::Detail(_))
+            )
+    }
+
+    /// Everything that is not ⏎/esc: ordinary text editing. The grammar itself
+    /// lives in `textedit`, pure and unit-tested; what stays here is the part
+    /// that genuinely needs the `App` — the clipboard — plus the borrow dance.
+    fn inline_edit_key(&mut self, ev: &KeyDownEvent, target: InlineTarget, cx: &mut Context<Self>) {
+        let m = &ev.keystroke.modifiers;
+        let Some(mut op) = textedit::op_for(
+            ev.keystroke.key.as_str(),
+            m.shift,
+            m.secondary(),
+            m.alt,
+            m.control,
+            ev.keystroke.key_char.as_deref(),
+        ) else {
+            // An unmapped chord (⌘S, F5, a bare modifier). The caller still
+            // stops propagation, so it is swallowed exactly as it was before.
+            return;
         };
+        // Paste is resolved HERE rather than in the core: the clipboard needs
+        // the App, and `textedit` deliberately takes neither. Reading it before
+        // the buffer is borrowed also keeps the borrow checker out of it.
+        if op == textedit::EditOp::Paste {
+            let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
+                return;
+            };
+            // Newlines are flattened to spaces for single-line fields rather
+            // than truncated at the first one: someone pasting a wrapped model
+            // id or an args line wants all of it, and keeping only the first
+            // line is data loss you do not notice until the spawn fails.
+            let text = if self.inline_is_textarea(target) {
+                text
+            } else {
+                text.replace(['\r', '\n', '\t'], " ")
+            };
+            op = textedit::EditOp::Insert(text);
+        }
+        // `Caret` is Copy, so lift it out before borrowing the buffer off the
+        // same `self`, then put it back.
+        let mut caret = self.inline_caret;
+        let clip = textedit::apply(self.inline_buf(target), &mut caret, &op);
+        self.inline_caret = caret;
+        if let Some(text) = clip {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    pub(crate) fn route_inline_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        target: InlineTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let k = ev.keystroke.key.as_str();
         match k {
             "enter" => match target {
                 InlineTarget::RailIdea => self.commit_rail_new(cx),
@@ -715,7 +807,13 @@ impl Orchestrator {
                         Some(outlinepane::EditSlot::Detail(_))
                     ) && !ev.keystroke.modifiers.secondary()
                     {
-                        self.outline_edit.buf.push('\n');
+                        let mut caret = self.inline_caret;
+                        textedit::apply(
+                            &mut self.outline_edit.buf,
+                            &mut caret,
+                            &textedit::EditOp::Insert("\n".into()),
+                        );
+                        self.inline_caret = caret;
                     } else {
                         self.commit_outline_edit(cx);
                     }
@@ -747,23 +845,9 @@ impl Orchestrator {
                     self.setting_edit = None;
                 }
             },
-            "backspace" => {
-                buf.pop();
-            }
-            "space" => buf.push(' '),
-            _ => {
-                if !ev.keystroke.modifiers.secondary() && !ev.keystroke.modifiers.control {
-                    if let Some(ch) = ev
-                        .keystroke
-                        .key_char
-                        .clone()
-                        .filter(|c| !c.is_empty())
-                        .or_else(|| (k.chars().count() == 1).then(|| k.to_string()))
-                    {
-                        buf.push_str(&ch);
-                    }
-                }
-            }
+            // Everything else is ordinary text editing — motions, deletion,
+            // selection, the clipboard. The grammar lives in `textedit`.
+            _ => self.inline_edit_key(ev, target, cx),
         }
         cx.stop_propagation();
         cx.notify();
