@@ -149,6 +149,9 @@ impl Orchestrator {
                 let ph = info.phase;
                 let needs_action = ph == orchestrator_host::Phase::AwaitingDecision;
                 let focused = is_sel && self.active_session.get(&slug).copied() == Some(id);
+                // finished a turn you have not opened (#13). Never on the row
+                // you are already on, and never competing with needs-you amber.
+                let unreviewed = !focused && !needs_action && self.session_unreviewed(id);
                 let raw = if info.title.is_empty() {
                     info.kind.label().to_string()
                 } else {
@@ -203,13 +206,19 @@ impl Orchestrator {
                                         .min_w_0()
                                         .truncate()
                                         .text_size(px(12.5))
-                                        .text_color(rgb(if needs_action {
-                                            AMBER
-                                        } else if focused {
-                                            TEXT_STRONG
-                                        } else {
-                                            MUTED
-                                        }))
+                                        // MUTED -> TEXT -> TEXT_STRONG is the
+                                        // brightness ladder; unreviewed sits one
+                                        // step up from resting, so "something
+                                        // finished here" reads without shouting.
+                                        .text_color(rgb(row_tone(
+                                            needs_action,
+                                            focused,
+                                            unreviewed,
+                                        )
+                                        .color()))
+                                        .when(unreviewed, |d| {
+                                            d.font_weight(FontWeight::MEDIUM)
+                                        })
                                         .child(SharedString::from(label)),
                                 )
                                 .when(needs_action, |c| {
@@ -833,6 +842,7 @@ fn rail_new_item(
             }
             this.rail_new_kind = kind;
             this.rail_new = Some(String::new());
+            this.seed_inline_caret(InlineTarget::RailIdea);
             this.rail_new_err = None;
             // the root router owns the keystream — never the PTY (review 1b)
             this.root_focus.focus(window);
@@ -1242,5 +1252,92 @@ mod tests {
                 "elided path missed its budget: {out:?}"
             );
         }
+    }
+}
+
+/// How a session row's title reads. Split out as a pure function because the
+/// PRECEDENCE is the whole rule and it is easy to break by reordering four
+/// branches: needs-you outranks everything, the row you are on is never also
+/// "unreviewed", and resting is the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowTone {
+    /// The agent is blocked on you. Amber, and it owns that colour alone.
+    NeedsYou,
+    /// The session you have open.
+    Focused,
+    /// Finished a turn you have not opened since (#13).
+    Unreviewed,
+    Resting,
+}
+
+impl RowTone {
+    pub(crate) fn color(self) -> u32 {
+        match self {
+            RowTone::NeedsYou => AMBER,
+            RowTone::Focused => TEXT_STRONG,
+            // one step up the MUTED -> TEXT -> TEXT_STRONG ladder: "something
+            // finished here" should read without shouting over needs-you.
+            RowTone::Unreviewed => TEXT,
+            RowTone::Resting => MUTED,
+        }
+    }
+}
+
+pub(crate) fn row_tone(needs_action: bool, focused: bool, unreviewed: bool) -> RowTone {
+    if needs_action {
+        RowTone::NeedsYou
+    } else if focused {
+        RowTone::Focused
+    } else if unreviewed {
+        RowTone::Unreviewed
+    } else {
+        RowTone::Resting
+    }
+}
+
+#[cfg(test)]
+mod row_tone_tests {
+    // Selective imports, not `use super::*`: gpui is glob-imported at the top of
+    // this file and its `test` attribute macro would shadow the real one — which
+    // fails as "recursion limit reached while expanding #[test]". Same reason
+    // rail_order.rs imports selectively.
+    use super::{row_tone, RowTone};
+
+    #[test]
+    fn needs_you_outranks_everything() {
+        // A blocked agent is the only thing amber means; a finished turn must
+        // never dilute it.
+        assert_eq!(row_tone(true, true, true), RowTone::NeedsYou);
+        assert_eq!(row_tone(true, false, true), RowTone::NeedsYou);
+    }
+
+    #[test]
+    fn the_row_you_are_on_is_never_flagged() {
+        // The whole point of the cue is "you have not looked at this". The
+        // session you are watching cannot qualify, even if the flag leaked in.
+        assert_eq!(row_tone(false, true, true), RowTone::Focused);
+    }
+
+    #[test]
+    fn unreviewed_sits_between_resting_and_focused() {
+        assert_eq!(row_tone(false, false, true), RowTone::Unreviewed);
+        assert_eq!(row_tone(false, false, false), RowTone::Resting);
+        // brightness ladder, so the cue reads as "brighter" rather than "other"
+        assert!(RowTone::Resting.color() < RowTone::Unreviewed.color());
+        assert!(RowTone::Unreviewed.color() < RowTone::Focused.color());
+    }
+
+    #[test]
+    fn every_tone_has_a_distinct_colour() {
+        let all = [
+            RowTone::NeedsYou.color(),
+            RowTone::Focused.color(),
+            RowTone::Unreviewed.color(),
+            RowTone::Resting.color(),
+        ];
+        let mut u = all.to_vec();
+        u.sort_unstable();
+        u.dedup();
+        assert_eq!(u.len(), all.len(), "two tones render identically");
     }
 }

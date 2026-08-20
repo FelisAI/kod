@@ -583,6 +583,13 @@ impl Orchestrator {
     fn persist_events(&mut self) {
         use orchestrator_host::{SessionEventKind, ToolVerb};
         let infos = self.host.infos();
+        // BEFORE the store lock: `watched_session` takes &self, and the guard
+        // holds a borrow of self.store for the rest of this function.
+        let watched = self.watched_session();
+        // A session that ended is gone from the rail, so its ledger entry could
+        // never be cleared by a click. Prune here rather than leak forever.
+        let live: std::collections::HashSet<_> = infos.iter().map(|i| i.id).collect();
+        self.sess_unreviewed.retain(|id| live.contains(id));
         let Ok(store) = self.store.lock() else { return };
         // anchors/names per project, loaded once per touched project (not per
         // tick — most ticks have no new events at all).
@@ -618,6 +625,17 @@ impl Orchestrator {
                                 e.at_ms,
                                 &s.chars().take(200).collect::<String>(),
                             );
+                        }
+                        // "Done — review" (#13): this session FINISHED A TURN
+                        // while you were looking at something else.
+                        //
+                        // TurnEnd, deliberately NOT the Busy->Idle phase edge: a
+                        // session drops to Idle between every tool call, so the
+                        // phase edge would light up every row within a minute and
+                        // the cue would mean nothing. A TurnEnd is the assistant
+                        // actually finishing what it had to say.
+                        if watched != Some(info.id) {
+                            self.sess_unreviewed.insert(info.id);
                         }
                         // MAP VERBS (docs/019 T11): the session steers its own
                         // chip. Fenced + minimal — see apply_map_verb.

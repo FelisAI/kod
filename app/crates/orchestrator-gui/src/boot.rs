@@ -364,6 +364,7 @@ pub(crate) fn run() {
                         term_focus: cx.focus_handle(),
                         root_focus: cx.focus_handle(),
                         active_session: std::collections::HashMap::new(),
+                        sess_unreviewed: std::collections::HashSet::new(),
                         infos_cache: std::collections::HashMap::new(),
                         map_drag: None,
                         map_drop_deny: std::collections::HashSet::new(),

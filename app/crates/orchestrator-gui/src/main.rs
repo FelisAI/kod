@@ -256,6 +256,11 @@ struct Orchestrator {
     root_focus: FocusHandle,
     /// the active session per project slug (which chip is selected).
     active_session: std::collections::HashMap<String, SessionId>,
+    /// Sessions that finished a turn you have not opened since (#13). A LEDGER,
+    /// not a phase: phase is whatever the agent is doing now, this is whether
+    /// YOU have caught up with it. Set in `persist_events` on a TurnEnd whose
+    /// session you were not watching; cleared by `select_session`.
+    sess_unreviewed: std::collections::HashSet<SessionId>,
     /// per-frame snapshot of every project's live sessions — populated ONCE at the
     /// top of render() so the sidebar/header/stage don't each re-lock the host
     /// 13-24×/frame (review fix). Read via cached_infos(); ~16ms stale in handlers.
@@ -978,6 +983,27 @@ impl Orchestrator {
         self.scrollbar_drag = None;
     }
 
+    /// The session you are ACTUALLY looking at: the workspace's agent view, on
+    /// the selected project, with that session active. Being the active session
+    /// of some OTHER project does not count, and neither does sitting on the
+    /// Standup screen — which is exactly when a finished turn is worth flagging.
+    ///
+    /// KNOWN GAP: this cannot tell whether Kod is frontmost (gpui's `is_active`
+    /// is not usable from here — see boot.rs), so a turn that lands while you
+    /// are parked on that session in a background window is not flagged. The
+    /// session is already on screen in that case, so the cost is small.
+    fn watched_session(&self) -> Option<SessionId> {
+        if !matches!(self.screen, Screen::Workspace) || !matches!(self.mode, Mode::Agent) {
+            return None;
+        }
+        self.active_session_id()
+    }
+
+    /// This session finished a turn you have not opened since (#13).
+    pub(crate) fn session_unreviewed(&self, id: SessionId) -> bool {
+        self.sess_unreviewed.contains(&id)
+    }
+
     fn active_session_id(&self) -> Option<SessionId> {
         let slug = &self.project().slug;
         let live = self.cached_infos(slug);
@@ -1065,6 +1091,8 @@ impl Orchestrator {
             .position(|p| p.slug == slug)
             .unwrap_or(self.selected);
         self.active_session.insert(slug.to_string(), id);
+        // Opening it IS reviewing it (#13).
+        self.sess_unreviewed.remove(&id);
         self.screen = Screen::Workspace;
         self.mode = Mode::Agent;
         if self.search.session != Some(id) {
