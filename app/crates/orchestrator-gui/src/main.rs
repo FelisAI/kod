@@ -59,6 +59,7 @@ mod search;
 mod session_discovery;
 mod settings;
 mod spawn;
+mod standup_plan;
 mod summaries;
 mod termgeom;
 mod termview;
@@ -256,6 +257,15 @@ struct Orchestrator {
     root_focus: FocusHandle,
     /// the active session per project slug (which chip is selected).
     active_session: std::collections::HashMap<String, SessionId>,
+    /// The ▲ WHAT HAPPENED tier has been expanded past its caps. Deliberately
+    /// NOT persisted: "show me everything" is
+    /// an answer to this morning's question, not a preference, and a standup
+    /// that opens fully expanded every day is the flat list this replaced.
+    standup_updates_all: bool,
+    /// The ● LIVE tier is expanded to its per-session rows. Also transient:
+    /// the collapsed strip is the point, and a persisted 'expanded' would
+    /// restore the wall of rows every morning.
+    standup_live_open: bool,
     /// Sessions that finished a turn you have not opened since (#13). A LEDGER,
     /// not a phase: phase is whatever the agent is doing now, this is whether
     /// YOU have caught up with it. Set in `persist_events` on a TurnEnd whose
@@ -317,11 +327,6 @@ struct Orchestrator {
     /// each project's plain-words rollup line. Deterministic + cheap, but keyed
     /// by write_gen so gap_findings/next_up don't re-run every morning frame.
     /// Rows: (slug, name, rollup line).
-    /// key = (write_gen, minute-bucket): re-memoized on a store write AND on a
-    /// time transition, since the rollup's <48h-building / 14d-45d gap thresholds
-    /// depend on the wall clock, not just writes (review finding 4).
-    #[allow(clippy::type_complexity)]
-    standup_rollups: std::cell::RefCell<((u64, u64), Vec<(String, String, String)>)>,
     /// (write_gen → slug→newest-timeline-ms) memo: each project's last update,
     /// diffed against `proj_seen` to show an UNREAD cue on rail project titles
     /// (#50). Rebuilt only on a store write (mirrors `standup_updates`).
@@ -468,10 +473,6 @@ struct Orchestrator {
     /// settles is a geometry that never persists.
     win_bounds: winchrome::WinBoundsWatch,
     settings_win_bounds: winchrome::WinBoundsWatch,
-    /// Is the standup's quiet ▦ PORTFOLIO tier expanded? (#49) Collapsed by
-    /// default so already-read projects stop burying the timeline; persisted as
-    /// `standup_portfolio_open`.
-    standup_portfolio_open: bool,
     /// in-progress IME composition (preedit) for the focused terminal (#9 3c).
     /// Empty when not composing; the input-handler UTF-16 ranges index into this.
     ime_preedit: String,

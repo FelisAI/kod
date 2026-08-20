@@ -4,95 +4,171 @@ use crate::*;
 
 
 impl Orchestrator {
-    /// One project row in the standup's project tiers (#49).
-    ///
-    /// Shared by ▲ UPDATED and ▦ PORTFOLIO so the two tiers can never drift
-    /// apart visually. `age` is `Some` only for unread rows, which get the
-    /// accent dot, a brighter name, and a "5m ago" stamp; read rows pass `None`
-    /// and stay quiet.
-    fn portfolio_row(
-        &self,
-        slug: String,
-        name: String,
-        line: String,
-        age: Option<u64>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let unread = age.is_some();
-        let jslug = slug.clone();
+    /// A section rule inside a tier: LABEL, then a hairline to the right edge.
+    /// Used for the new/earlier split in ▲ WHAT HAPPENED.
+    fn section_bar(label: SharedString, colour: u32) -> Div {
         div()
-            .id(SharedString::from(format!("pf-{slug}")))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.))
-            .px(px(12.))
-            .py(px(7.))
-            .rounded(px(9.))
-            .bg(rgb(PANEL))
-            .border_1()
-            .border_color(rgb(if unread { 0x346B54 } else { HAIR }))
-            .cursor_pointer()
-            .hover(|h| h.border_color(rgb(0x36404A)))
-            // unread marker: an accent dot, and a reserved gap when read so the
-            // names in both tiers still line up in the same column.
+            .gap(px(9.))
+            .pt(px(6.))
+            .text_size(px(10.))
+            .text_color(rgb(colour))
+            .child(label)
+            .child(div().flex_1().h(px(1.)).bg(rgb(HAIR_SOFT)))
+    }
+
+    /// One project's report in ▲ WHAT HAPPENED.
+    ///
+    /// ONE builder for both densities on purpose: they share the freshness dot,
+    /// the name, the click target and the meta, and differ only in whether the
+    /// event lines render BENEATH the header or the newest one rides inline.
+    /// Two builders would drift the moment either is touched.
+    fn update_block(
+        &self,
+        p: &crate::standup_plan::PlannedProject,
+        name: String,
+        density: crate::standup_plan::Density,
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let digest = matches!(density, crate::standup_plan::Density::Digest);
+        let age = crate::timefmt::age_ms_since(p.newest_ms, now_ms);
+        let (fresh, count, hidden) = (p.fresh, p.total, p.hidden_lines);
+        let jslug = p.key.clone();
+        let lead = p
+            .lines
+            .first()
+            .map(|l| termview::trim(&l.text, 90))
+            .unwrap_or_default();
+        let lines: Vec<(&'static str, u32, String)> = if digest {
+            Vec::new()
+        } else {
+            p.lines
+                .iter()
+                .map(|l| {
+                    let (g, gc) = crate::standup_plan::kind_glyph(&l.kind);
+                    (g, gc, termview::trim(&l.text, 120))
+                })
+                .collect()
+        };
+
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(9.))
+            // a RESERVED blank when read, so names stay column-aligned —
             .child(
                 div()
                     .w(px(6.))
                     .h(px(6.))
-                    .flex_none()
                     .rounded(px(3.))
-                    .when(unread, |d| d.bg(rgb(ACCENT))),
+                    .flex_none()
+                    .when(fresh, |d| d.bg(rgb(ACCENT))),
             )
             .child(
                 div()
                     .flex_none()
-                    .w(px(150.))
+                    .w(px(if digest { 104. } else { 150. }))
                     .min_w_0()
+                    .truncate()
                     .text_size(px(12.5))
-                    .font_weight(if unread {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .text_color(rgb(if unread { TEXT_STRONG } else { TEXT }))
+                    .text_color(rgb(if fresh { TEXT_STRONG } else { MUTED }))
+                    .when(fresh, |d| d.font_weight(FontWeight::SEMIBOLD))
                     .child(SharedString::from(termview::trim(&name, 24))),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.))
-                    .font_family("Menlo")
-                    .text_color(rgb(MUTED))
-                    .child(SharedString::from(line)),
-            )
-            .when_some(age, |c, a| {
-                c.child(
+            .when(digest, |r| {
+                r.child(
                     div()
-                        .flex_none()
-                        .text_size(px(10.5))
-                        .text_color(rgb(MUTED))
-                        .child(SharedString::from(crate::timefmt::ago_label(a))),
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(rgb(if fresh { TEXT } else { MUTED2 }))
+                        .child(SharedString::from(lead)),
                 )
             })
+            .when(!digest, |r| r.child(div().flex_1()))
             .child(
                 div()
                     .flex_none()
+                    .whitespace_nowrap()
                     .text_size(px(10.5))
                     .text_color(rgb(MUTED2))
-                    // with the map compiled out this opens the workspace, not a
-                    // map — so don't promise a map that isn't in the build.
-                    .child(if crate::features::MAP_ENABLED {
-                        "map ▸"
+                    .child(SharedString::from(if digest {
+                        format!("{count} · {age}")
                     } else {
-                        "open ▸"
-                    }),
+                        format!(
+                            "{count} update{} · {age}",
+                            if count == 1 { "" } else { "s" }
+                        )
+                    })),
             )
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.select_project(&jslug, cx)
-            }))
+            .child(
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_size(px(10.5))
+                    .text_color(rgb(MUTED2))
+                    .child("open ▸"),
+            );
+
+        let mut card = div()
+            .id(SharedString::from(format!("upd-{}", p.key)))
+            .flex()
+            .flex_col()
+            .gap(px(5.))
+            .px(px(12.))
+            .py(px(if digest { 5. } else { 9. }))
+            .rounded(px(if digest { 8. } else { 10. }))
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(if fresh { 0x346B54 } else { HAIR }))
+            .cursor_pointer()
+            .hover(|h| h.border_color(rgb(0x36404A)))
+            .child(head);
+        for (glyph, gcol, text) in lines {
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.))
+                    .pl(px(15.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(13.))
+                            .text_size(px(10.5))
+                            .text_color(rgb(gcol))
+                            .child(glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(rgb(TEXT))
+                            .child(SharedString::from(text)),
+                    ),
+            );
+        }
+        if !digest && hidden > 0 {
+            card = card.child(
+                div()
+                    .pl(px(15.))
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED2))
+                    .child(SharedString::from(format!("+{hidden} more"))),
+            );
+        }
+        card.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.select_project(&jslug, cx)
+        }))
     }
+
 
     /// A pill telling the user whether sessions survive a restart — green when
     /// the daemon is attached, a LOUD amber warning on a silent in-process
@@ -313,100 +389,51 @@ impl Orchestrator {
             }
             feed = feed.child(tier);
         }
-        // ── ● LIVE — the working/idle agents that DON'T need you (#21):
-        // one row per live session, ● working / ◌ idle, session label +
-        // project + what it's doing; click opens the session. Restores the
-        // tier the timeline tombstone noted as dead.
-        if work_n + idle_n > 0 {
-            let mut tier = div()
-                .flex().flex_col().gap(px(6.)).px(px(18.)).pt(px(14.))
-                .child(
-                    div().flex().flex_row().items_center().gap(px(7.))
-                        .text_size(px(11.5)).font_weight(FontWeight::BOLD).text_color(rgb(MUTED2))
-                        .child("● LIVE")
-                        .child(div().text_color(rgb(MUTED2)).child(SharedString::from((work_n + idle_n).to_string()))),
-                );
-            for (busy, (name, info)) in working.into_iter().map(|r| (true, r))
-                .chain(idle.into_iter().map(|r| (false, r)))
-            {
-                let (glyph, gcol): (&str, u32) = if busy { ("●", GREEN) } else { ("◌", MUTED2) };
-                let doing = {
-                    let m = info.last_message.trim();
-                    if m.is_empty() { (if busy { "working…" } else { "idle" }).to_string() }
-                    else { termview::trim(m, 80) }
-                };
-                let (jslug, jid) = (info.project_slug.clone(), info.id);
-                tier = tier.child(
-                    div()
-                        .id(SharedString::from(format!("live-{}", jid.0)))
-                        .flex().flex_row().items_center().gap(px(10.))
-                        .px(px(12.)).py(px(7.)).rounded(px(9.))
-                        .bg(rgb(PANEL)).border_1().border_color(rgb(HAIR))
-                        .cursor_pointer().hover(|h| h.border_color(rgb(0x36404A)))
-                        .child(div().flex_none().whitespace_nowrap().w(px(14.)).text_size(px(11.)).text_color(rgb(gcol)).child(glyph))
-                        .child(div().flex_none().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
-                            .child(SharedString::from(termview::session_label(&info))))
-                        .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(rgb(MUTED2)).bg(rgb(CARD)).rounded(px(5.)).px(px(6.)).py(px(1.))
-                            .child(SharedString::from(termview::trim(&name, 20))))
-                        .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(rgb(MUTED)).child(SharedString::from(doing)))
-                        .when_some(info.usage_limit.clone(), |c, u| c.child(crate::render_sidebar::usage_chip(&u)))
-                        .child(div().flex_none().whitespace_nowrap().text_size(px(10.5)).text_color(rgb(MUTED2)).child("open ▸"))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.focus_session(&jslug, jid, window, cx)
-                        })),
-                );
-            }
-            feed = feed.child(tier);
-        }
-        // ── ▦ PORTFOLIO — each project's plain-words rollup (docs/019 slice 4):
-        // the v1 portfolio. Same Rollup::line() the map header shows, per
-        // project, deterministic + memoized by write_gen. Click → open the map.
+        // ── ▲ WHAT HAPPENED — the standup proper.
+        //
+        // This was TWO tiers (▲ UPDATED + ▦ PORTFOLIO), both keyed on rollup
+        // lines, and both sat BELOW the live-session list. That ordering was the
+        // bug: a running session is REASSURANCE — it tells you nothing you can
+        // act on — while an update is the thing you opened the app for. So
+        // reassurance now sits underneath information, as a single line.
+        //
+        // Grouping is by PROJECT, split once at your last check, because the
+        // unit you carry in your head is the project. A flat chronological list
+        // mixing five event kinds across nine projects is what made this
+        // unreadable. Every cap and threshold lives in standup_plan, tested.
+        //
+        // ONE timeline read for the whole screen: this tier and the thread far
+        // below are two views of the SAME events, so a second read would be
+        // another lock AND a chance for the two to disagree.
+        let timeline: Vec<orchestrator_store::TimelineEvent> = if self.scanned {
+            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            store.timeline(120)
+        } else {
+            Vec::new()
+        };
+        let pname = |key: &str| {
+            self.projects
+                .iter()
+                .find(|p| p.slug == key)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| key.rsplit(['/', ':']).next().unwrap_or(key).to_string())
+        };
+        let now_ms = crate::timefmt::now_ms();
         if self.scanned {
-            let rows: Vec<(String, String, String)> = {
-                let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-                let now_secs = orchestrator_core::registry::now_secs();
-                let key = (store.write_gen(), now_secs / 60);
-                let mut memo = self.standup_rollups.borrow_mut();
-                if memo.0 != key {
-                    let mut rows = Vec::new();
-                    for p in &self.projects {
-                        if let Some(r) = deterministic_project_rollup(&store, &p.slug, now_secs) {
-                            rows.push((p.slug.clone(), p.name.clone(), r.line()));
-                        }
-                    }
-                    *memo = (key, rows);
-                }
-                memo.1.clone()
-            };
-            // #49: a flat "every project, every time" list buried the timeline
-            // under rows the user had already read. Split it — what changed
-            // since you last opened a project goes up top as ▲ UPDATED, and the
-            // quiet remainder collapses behind a count so it stops blocking the
-            // feed. Both are newest-activity first.
-            //
-            // NB: the store lock above is released by here. It has to be —
-            // project_unread / project_update_ms take the lock themselves, and
-            // the mutex is not reentrant.
-            let now_ms = crate::timefmt::now_ms();
-            let mut fresh: Vec<(String, String, String, u64)> = Vec::new();
-            let mut rest: Vec<(String, String, String, u64)> = Vec::new();
-            for (slug, name, line) in rows {
-                let ts = self.project_update_ms(&slug);
-                if self.project_unread(&slug) {
-                    fresh.push((slug, name, line, ts));
-                } else {
-                    rest.push((slug, name, line, ts));
-                }
-            }
-            fresh.sort_by(|a, b| b.3.cmp(&a.3));
-            rest.sort_by(|a, b| b.3.cmp(&a.3));
-
-            if !fresh.is_empty() {
+            let plan = crate::standup_plan::plan_updates(
+                &timeline,
+                self.standup_divider_ms,
+                self.standup_updates_all,
+            );
+            if !plan.is_empty() {
+                // The bars exist to SEPARATE two groups. With only one group
+                // they label nothing, so they are suppressed — which is also
+                // the first-ever visit, where everything is new by definition.
+                let bars = !plan.fresh.is_empty() && !plan.earlier.is_empty();
                 let mut tier = div()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .px(px(18.))
                     .pt(px(14.))
                     .child(
                         div()
@@ -417,75 +444,192 @@ impl Orchestrator {
                             .text_size(px(11.5))
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(ACCENT))
-                            .child("▲ UPDATED")
+                            .child("▲ WHAT HAPPENED")
                             .child(
                                 div()
                                     .text_color(rgb(MUTED2))
-                                    .child(SharedString::from(fresh.len().to_string())),
+                                    .child(SharedString::from(plan.reporting.to_string())),
                             ),
                     );
-                for (slug, name, line, ts) in fresh {
-                    let age = crate::timefmt::age_ms_since(ts, now_ms);
-                    tier = tier.child(self.portfolio_row(slug, name, line, Some(age), cx));
+                if bars {
+                    let since = crate::timefmt::age_ms_since(self.standup_divider_ms, now_ms);
+                    tier = tier.child(Self::section_bar(
+                        SharedString::from(format!("NEW SINCE YOU LAST LOOKED · {since}")),
+                        ACCENT,
+                    ));
                 }
-                feed = feed.child(tier);
-            }
-
-            if !rest.is_empty() {
-                let open = self.standup_portfolio_open;
-                let n = rest.len();
-                let mut tier = div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .px(px(18.))
-                    .pt(px(14.))
-                    .child(
+                for pp in &plan.fresh {
+                    tier = tier.child(self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx));
+                }
+                if bars {
+                    tier = tier.child(Self::section_bar("EARLIER".into(), MUTED2));
+                }
+                for pp in &plan.earlier {
+                    tier = tier.child(self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx));
+                }
+                if plan.hidden_projects > 0 {
+                    let n = plan.hidden_projects;
+                    tier = tier.child(
                         div()
-                            .id("pf-toggle")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(7.))
+                            .id("upd-show-all")
+                            .px(px(12.))
+                            .py(px(3.))
                             .cursor_pointer()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(11.))
                             .text_color(rgb(MUTED2))
-                            .hover(|h| h.text_color(rgb(MUTED)))
-                            .child(if open { "▾" } else { "▸" })
-                            .child("▦ PORTFOLIO")
-                            .child(
-                                div()
-                                    .text_color(rgb(MUTED2))
-                                    .child(SharedString::from(n.to_string())),
-                            )
-                            .when(!open, |h| {
-                                h.child(
-                                    div()
-                                        .text_size(px(10.5))
-                                        .font_weight(FontWeight::NORMAL)
-                                        .text_color(rgb(MUTED2))
-                                        .child("nothing new"),
-                                )
-                            })
+                            .hover(|h| h.text_color(rgb(ACCENT)))
+                            .child(SharedString::from(format!(
+                                "{n} more project{} — show all ▸",
+                                if n == 1 { "" } else { "s" }
+                            )))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.standup_portfolio_open = !this.standup_portfolio_open;
-                                if let Ok(store) = this.store.lock() {
-                                    let _ = store.set_setting(
-                                        "standup_portfolio_open",
-                                        if this.standup_portfolio_open { "1" } else { "0" },
-                                    );
-                                }
+                                this.standup_updates_all = true;
                                 cx.notify();
                             })),
                     );
-                if open {
-                    for (slug, name, line, _ts) in rest {
-                        tier = tier.child(self.portfolio_row(slug, name, line, None, cx));
-                    }
                 }
                 feed = feed.child(tier);
             }
+        }
+
+        // ── ● LIVE — ambient, and deliberately BELOW the updates.
+        //
+        // "Eleven things are running and fine" is a sentence, not eleven rows.
+        // The per-session list is still here, one click away — collapsed, not
+        // deleted. Uncollapsed it grew without limit, and thirty sessions
+        // pushed everything worth reading off the screen.
+        let summary = {
+            let projects: std::collections::HashSet<&str> = working
+                .iter()
+                .chain(idle.iter())
+                .map(|(_, i)| i.project_slug.as_str())
+                .collect();
+            crate::standup_plan::LiveSummary {
+                working: work_n,
+                idle: idle_n,
+                projects: projects.len(),
+            }
+        };
+        // the summary already knows the count and whether there is anything to
+        // show — asking `work_n + idle_n` again here is the same sum written
+        // twice, and two places to get it wrong.
+        if !summary.is_empty() {
+            // materialised BEFORE the row loop consumes `working` / `idle`
+            let dots: Vec<bool> = working
+                .iter()
+                .map(|_| true)
+                .chain(idle.iter().map(|_| false))
+                .collect();
+            let open = self.standup_live_open;
+            let mut tier = div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .pt(px(14.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(7.))
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(MUTED2))
+                        .child("● LIVE")
+                        .child(
+                            div()
+                                .text_color(rgb(MUTED2))
+                                .child(SharedString::from(summary.total().to_string())),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("live-strip")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(12.))
+                        .py(px(7.))
+                        .rounded(px(9.))
+                        .bg(rgb(0x12161D))
+                        .border_1()
+                        .border_color(rgb(HAIR_SOFT))
+                        .cursor_pointer()
+                        .hover(|h| h.border_color(rgb(HAIR)))
+                        .child({
+                            let mut row = div().flex().flex_row().flex_none().gap(px(3.));
+                            for busy in &dots {
+                                row = row.child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(6.))
+                                        .rounded(px(3.))
+                                        .bg(rgb(if *busy { GREEN } else { 0x3A424E })),
+                                );
+                            }
+                            row
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(MUTED))
+                                .child(SharedString::from(summary.line())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .text_size(px(10.5))
+                                .text_color(rgb(MUTED2))
+                                .child(if open { "hide ▾" } else { "show ▸" }),
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.standup_live_open = !this.standup_live_open;
+                            cx.notify();
+                        })),
+                );
+            if open {
+                for (busy, (name, info)) in working
+                    .into_iter()
+                    .map(|r| (true, r))
+                    .chain(idle.into_iter().map(|r| (false, r)))
+                {
+                    let (glyph, gcol): (&str, u32) = if busy { ("●", GREEN) } else { ("◌", MUTED2) };
+                    let doing = {
+                        let m = info.last_message.trim();
+                        if m.is_empty() {
+                            (if busy { "working…" } else { "idle" }).to_string()
+                        } else {
+                            termview::trim(m, 80)
+                        }
+                    };
+                    let (jslug, jid) = (info.project_slug.clone(), info.id);
+                    tier = tier.child(
+                        div()
+                            .id(SharedString::from(format!("live-{}", jid.0)))
+                            .flex().flex_row().items_center().gap(px(10.))
+                            .px(px(12.)).py(px(7.)).rounded(px(9.))
+                            .bg(rgb(PANEL)).border_1().border_color(rgb(HAIR))
+                            .cursor_pointer().hover(|h| h.border_color(rgb(0x36404A)))
+                            .child(div().flex_none().whitespace_nowrap().w(px(14.)).text_size(px(11.)).text_color(rgb(gcol)).child(glyph))
+                            .child(div().flex_none().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
+                                .child(SharedString::from(termview::session_label(&info))))
+                            .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(rgb(MUTED2)).bg(rgb(CARD)).rounded(px(5.)).px(px(6.)).py(px(1.))
+                                .child(SharedString::from(termview::trim(&name, 20))))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(rgb(MUTED)).child(SharedString::from(doing)))
+                            .when_some(info.usage_limit.clone(), |c, u| c.child(crate::render_sidebar::usage_chip(&u)))
+                            .child(div().flex_none().whitespace_nowrap().text_size(px(10.5)).text_color(rgb(MUTED2)).child("open ▸"))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.focus_session(&jslug, jid, window, cx)
+                            })),
+                    );
+                }
+            }
+            feed = feed.child(tier);
         }
         // ── ▲ MAP UPDATES — the morning checkmarks (docs/011 slice 3): every
         // pending proposal op across projects (sessions, break-downs, drift),
@@ -558,11 +702,13 @@ impl Orchestrator {
                 memo.1.clone()
             };
             if !rows.is_empty() {
+                // NO .px() here: the scroll container already applies px(26).
+                // Every tier used to add its own 18 on top, so four of six sat
+                // inset from ⛔ BLOCKED and ⚠ NEEDS YOU, which add none.
                 let mut tier = div()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .px(px(18.))
                     .pt(px(14.))
                     .child(
                         div()
@@ -707,22 +853,18 @@ impl Orchestrator {
             // standup — so failure gets a surface, not just a count buried on
             // the Map screen with its error text thrown away.
             let day_ago = now_ms.saturating_sub(returnchannel::FAILURE_WINDOW_SECS * 1000);
-            let (events, failed) = {
+            // The ▲ WHAT HAPPENED tier above already read the timeline; reuse
+            // that exact Vec. Two reads would be two locks, and worse, two views
+            // of one screen that could disagree about what happened.
+            let events = timeline.clone();
+            let failed: Vec<(String, String)> = {
                 let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-                let failed: Vec<(String, String)> = store
+                store
                     .dead_summary_jobs()
                     .into_iter()
                     .filter(|(_, _, _, _, died_ms)| *died_ms >= day_ago)
                     .map(|(_, cid, _, err, _)| (cid, err))
-                    .collect();
-                (store.timeline(120), failed)
-            };
-            let pname = |key: &str| {
-                self.projects
-                    .iter()
-                    .find(|p| p.slug == key)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| key.rsplit(['/', ':']).next().unwrap_or(key).to_string())
+                    .collect()
             };
             let divider_ms = self.standup_divider_ms;
             let mut thread = div().flex().flex_col().gap(px(1.)).pt(px(4.));
@@ -1238,58 +1380,6 @@ pub(crate) fn standup_thread_hint(summaries_on: bool, _thread_empty: bool) -> Op
 /// always yields the same line. `working` is derived-building over stored link
 /// recency (the alive-stamp is a live-view concern); `drifted` is a live-only
 /// signal, so it stays 0 here (the map view carries it). `None` = no parts yet.
-fn deterministic_project_rollup(
-    store: &Store,
-    slug: &str,
-    now_secs: u64,
-) -> Option<cockpit::Rollup> {
-    use std::collections::{HashMap, HashSet};
-    let parts = store.load_tree(slug).unwrap_or_default();
-    if parts.is_empty() {
-        return None;
-    }
-    let tree = orchestrator_store::build_tree(&parts);
-    let activity = store.part_activity(slug);
-    // derived building from STORED link recency (dispatch/declared, <48h) — no
-    // alive stamping, so the count is a deterministic snapshot.
-    let mut links: HashMap<PartId, Vec<(returnchannel::LinkRole, u64)>> = HashMap::new();
-    for r in store.session_parts(slug) {
-        let role = returnchannel::LinkRole::from_str(&r.role);
-        if role.is_declared_intent() {
-            let last = r.last_touch_secs.unwrap_or(r.at_secs);
-            links.entry(r.part_id).or_default().push((role, last));
-        }
-    }
-    let building_ids: Vec<PartId> = links
-        .iter()
-        .filter_map(|(pid, l)| returnchannel::derived_building(l, now_secs).map(|_| *pid))
-        .collect();
-    let stars: Vec<PartId> = store
-        .get_setting(&format!("map_stars:{slug}"))
-        .map(|v| {
-            v.split(',')
-                .filter_map(|t| t.trim().parse::<PartId>().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let attention: HashSet<PartId> = store
-        .needs_you_flags(slug)
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect();
-    let blocked: HashSet<PartId> = HashSet::new();
-    let ready = cockpit::next_up(&parts, &activity, &stars, &attention, &blocked, usize::MAX);
-    let stale: HashSet<PartId> = parts.iter().filter(|p| p.stale).map(|p| p.id).collect();
-    let anchor_counts: HashMap<PartId, usize> = HashMap::new();
-    let gaps = cockpit::gap_findings(&parts, &activity, now_secs, &stale, &anchor_counts);
-    Some(cockpit::rollup(
-        &tree,
-        &building_ids,
-        &[],
-        &ready,
-        gaps.len(),
-    ))
-}
 
 /// The standup's one grey line (pure — no store, no window).
 #[cfg(test)]

@@ -365,6 +365,8 @@ pub(crate) fn run() {
                         root_focus: cx.focus_handle(),
                         active_session: std::collections::HashMap::new(),
                         sess_unreviewed: std::collections::HashSet::new(),
+                        standup_updates_all: false,
+                        standup_live_open: false,
                         infos_cache: std::collections::HashMap::new(),
                         map_drag: None,
                         map_drop_deny: std::collections::HashSet::new(),
@@ -392,10 +394,6 @@ pub(crate) fn run() {
                         standup_updates: std::cell::RefCell::new((u64::MAX, Vec::new())),
                         proj_updates: std::cell::RefCell::new((u64::MAX, std::collections::HashMap::new())),
                         proj_seen: std::cell::RefCell::new(std::collections::HashMap::new()),
-                        standup_rollups: std::cell::RefCell::new((
-                            (u64::MAX, u64::MAX),
-                            Vec::new(),
-                        )),
                         breakdown_inflight: Arc::new(std::sync::Mutex::new(
                             std::collections::HashSet::new(),
                         )),
@@ -436,12 +434,6 @@ pub(crate) fn run() {
                         sidebar_drag: None,
                         win_bounds: WinBoundsWatch::new(MAIN_WIN_BOUNDS_KEY),
                         settings_win_bounds: WinBoundsWatch::new(SETTINGS_WIN_BOUNDS_KEY),
-                        standup_portfolio_open: setting_flag(
-                            store
-                                .lock()
-                                .ok()
-                                .and_then(|s| s.get_setting("standup_portfolio_open")),
-                        ),
                         ime_preedit: String::new(),
                         term_error: None,
                         last_resize: None,
