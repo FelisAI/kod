@@ -49,11 +49,20 @@ case "$SANDBOX" in
 esac
 
 MODE=seeded
+SNAPSHOT=0
 BUNDLE=0
 NOTIFY=0
 for a in "$@"; do
   case "$a" in
     --empty)     MODE=empty;;
+    # Boot against a SNAPSHOT of your real store, so Standup renders your actual
+    # history instead of invented rows. Implies --empty: seeded demo projects
+    # mixed with real ones is a confusing hybrid that is neither.
+    #
+    # SAFETY: this READS your store and writes only into the sandbox. It uses
+    # sqlite3 .backup rather than cp — a plain copy misses whatever is still in
+    # the -wal file, which is exactly the most recent activity you want to see.
+    --snapshot)  SNAPSHOT=1; MODE=empty;;
     --no-daemon) MODE=nodaemon;;
     --stop)      MODE=stop;;
     # Run from Kod.app instead of the bare binary. This is what gives the real
@@ -116,6 +125,25 @@ chmod 700 "$RUNTIME"
 
 if [ "$MODE" = seeded ]; then
   python3 "$APP/scripts/seed-demo-home.py" "$SANDBOX" >/dev/null
+fi
+
+if [ "$SNAPSHOT" = 1 ]; then
+  REAL_STORE="$HOME/Library/Application Support/orchestrator/store.db"
+  SBOX_STORE="$SANDBOX/Library/Application Support/orchestrator/store.db"
+  if [ ! -f "$REAL_STORE" ]; then
+    echo "ERROR: no store at $REAL_STORE — nothing to snapshot." >&2
+    exit 1
+  fi
+  command -v sqlite3 >/dev/null || { echo "ERROR: sqlite3 not found." >&2; exit 1; }
+  # .backup, not cp: it checkpoints the WAL into the copy, so the newest events
+  # (the ones you actually want to look at) are present. It only reads the source.
+  sqlite3 "$REAL_STORE" ".backup '$SBOX_STORE'" || {
+    echo "ERROR: snapshot failed" >&2; exit 1; }
+  echo "==> snapshotted your real store -> sandbox ($(du -h "$SBOX_STORE" | cut -f1))"
+  # Prove the copy is readable and carries history, before the app opens it.
+  sqlite3 "$SBOX_STORE" \
+    "SELECT '    ' || COUNT(*) || ' summaries across ' || COUNT(DISTINCT project_key)
+     || ' projects' FROM session_summary;" 2>/dev/null || true
 fi
 
 cargo build -p orchestrator-gui -p orchestrator-daemon

@@ -266,6 +266,13 @@ struct Orchestrator {
     /// the collapsed strip is the point, and a persisted 'expanded' would
     /// restore the wall of rows every morning.
     standup_live_open: bool,
+    /// Project blocks in ▲ WHAT HAPPENED whose "+N more" has been opened.
+    /// Transient: an expanded block is an answer to one question, not a setting.
+    standup_block_open: std::collections::HashSet<String>,
+    /// The EARLIER group in ▲ WHAT HAPPENED is expanded. Collapsed by default
+    /// whenever there IS something new — already-read projects are context, and
+    /// context does not get to push the news off the screen.
+    standup_earlier_open: bool,
     /// Sessions that finished a turn you have not opened since (#13). A LEDGER,
     /// not a phase: phase is whatever the agent is doing now, this is whether
     /// YOU have caught up with it. Set in `persist_events` on a TurnEnd whose

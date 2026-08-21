@@ -4,21 +4,6 @@ use crate::*;
 
 
 impl Orchestrator {
-    /// A section rule inside a tier: LABEL, then a hairline to the right edge.
-    /// Used for the new/earlier split in ▲ WHAT HAPPENED.
-    fn section_bar(label: SharedString, colour: u32) -> Div {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(9.))
-            .pt(px(6.))
-            .text_size(px(10.))
-            .text_color(rgb(colour))
-            .child(label)
-            .child(div().flex_1().h(px(1.)).bg(rgb(HAIR_SOFT)))
-    }
-
     /// One project's report in ▲ WHAT HAPPENED.
     ///
     /// ONE builder for both densities on purpose: they share the freshness dot,
@@ -34,7 +19,10 @@ impl Orchestrator {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let digest = matches!(density, crate::standup_plan::Density::Digest);
-        let age = crate::timefmt::age_ms_since(p.newest_ms, now_ms);
+        // ago_label, NOT the raw age: age_ms_since returns MILLISECONDS, so
+        // interpolating it directly printed a nine-digit number where "12m ago"
+        // belonged.
+        let age = crate::timefmt::ago_label(crate::timefmt::age_ms_since(p.newest_ms, now_ms));
         let (fresh, count, hidden) = (p.fresh, p.total, p.hidden_lines);
         let jslug = p.key.clone();
         let lead = p
@@ -42,15 +30,15 @@ impl Orchestrator {
             .first()
             .map(|l| termview::trim(&l.text, 90))
             .unwrap_or_default();
-        let lines: Vec<(&'static str, u32, String)> = if digest {
+        // No kind glyph. ☁/▶/■/◆ marked EVERY line — overwhelmingly ☁, since
+        // summaries are the spine — so it was a column of noise that told you
+        // nothing you would act on differently.
+        let lines: Vec<String> = if digest {
             Vec::new()
         } else {
             p.lines
                 .iter()
-                .map(|l| {
-                    let (g, gc) = crate::standup_plan::kind_glyph(&l.kind);
-                    (g, gc, termview::trim(&l.text, 120))
-                })
+                .map(|l| termview::trim(&l.text, 120))
                 .collect()
         };
 
@@ -129,39 +117,44 @@ impl Orchestrator {
             .cursor_pointer()
             .hover(|h| h.border_color(rgb(0x36404A)))
             .child(head);
-        for (glyph, gcol, text) in lines {
+        for text in lines {
             card = card.child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(8.))
                     .pl(px(15.))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(13.))
-                            .text_size(px(10.5))
-                            .text_color(rgb(gcol))
-                            .child(glyph),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.))
-                            .text_color(rgb(TEXT))
-                            .child(SharedString::from(text)),
-                    ),
+                    // NO min_w_0() — and this is the SECOND time that mistake has
+                    // shipped here. min-width:0 is what lets a flex-ROW child
+                    // shrink below its content. `card` is a flex COLUMN, so on
+                    // its children min_w_0 removes the width floor entirely, the
+                    // box collapses to zero, and truncate() renders nothing but
+                    // the ellipsis. Every line became "…". Same bug, same fix, as
+                    // the settings rows.
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(SharedString::from(text)),
             );
         }
         if !digest && hidden > 0 {
+            // CLICKABLE. A count you cannot open is a complaint, not a control —
+            // "+53 more" told you what you were missing and gave you no way to
+            // see it. `stop_propagation` so opening the block does not also
+            // navigate to the project.
+            let ekey = p.key.clone();
             card = card.child(
                 div()
+                    .id(SharedString::from(format!("upd-more-{}", p.key)))
                     .pl(px(15.))
+                    .py(px(2.))
+                    .cursor_pointer()
                     .text_size(px(11.))
                     .text_color(rgb(MUTED2))
-                    .child(SharedString::from(format!("+{hidden} more"))),
+                    .hover(|h| h.text_color(rgb(ACCENT)))
+                    .child(SharedString::from(format!("+{hidden} more — show ▸")))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.standup_block_open.insert(ekey.clone());
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
             );
         }
         card.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -420,16 +413,21 @@ impl Orchestrator {
         };
         let now_ms = crate::timefmt::now_ms();
         if self.scanned {
+            let floor = crate::standup_plan::update_floor_ms(self.standup_divider_ms, now_ms);
+            // NEW vs EARLIER comes from the PER-PROJECT ledger, so this tier and
+            // the rail (which bolds unread titles the same way, #50) can never
+            // disagree on screen about whether you have read something. The
+            // global stamp still sets `floor` above — how far back to look.
+            let is_fresh = |k: &str| self.project_unread(k);
+            let is_expanded = |k: &str| self.standup_block_open.contains(k);
             let plan = crate::standup_plan::plan_updates(
                 &timeline,
-                self.standup_divider_ms,
+                &is_fresh,
+                &is_expanded,
+                floor,
                 self.standup_updates_all,
             );
             if !plan.is_empty() {
-                // The bars exist to SEPARATE two groups. With only one group
-                // they label nothing, so they are suppressed — which is also
-                // the first-ever visit, where everything is new by definition.
-                let bars = !plan.fresh.is_empty() && !plan.earlier.is_empty();
                 let mut tier = div()
                     .flex()
                     .flex_col()
@@ -445,27 +443,73 @@ impl Orchestrator {
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(ACCENT))
                             .child("▲ WHAT HAPPENED")
-                            .child(
+                            // Lead with the SPLIT, not the window. "what happened"
+                            // means "since I last looked" to the reader, and that
+                            // is the fresh group — the window is only how far back
+                            // we reach for CONTEXT so a recent check does not hand
+                            // you an empty screen. Naming the window here answered
+                            // a question nobody asked.
+                            .child({
+                                let seen = crate::timefmt::ago_label(
+                                    crate::timefmt::age_ms_since(self.standup_divider_ms, now_ms),
+                                );
+                                let n = plan.fresh.len();
                                 div()
-                                    .text_color(rgb(MUTED2))
-                                    .child(SharedString::from(plan.reporting.to_string())),
-                            ),
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(if n > 0 { ACCENT } else { MUTED2 }))
+                                    .child(SharedString::from(if self.standup_divider_ms == 0 {
+                                        "· first look".to_string()
+                                    } else if n > 0 {
+                                        format!("· {n} new since you last looked, {seen}")
+                                    } else {
+                                        format!("· nothing new since you last looked, {seen}")
+                                    }))
+                            }),
                     );
-                if bars {
-                    let since = crate::timefmt::age_ms_since(self.standup_divider_ms, now_ms);
-                    tier = tier.child(Self::section_bar(
-                        SharedString::from(format!("NEW SINCE YOU LAST LOOKED · {since}")),
-                        ACCENT,
-                    ));
-                }
+                // No NEW bar: the header already says "{n} new since you last
+                // looked", and a heading that repeats the line above it is chrome.
                 for pp in &plan.fresh {
                     tier = tier.child(self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx));
                 }
-                if bars {
-                    tier = tier.child(Self::section_bar("EARLIER".into(), MUTED2));
-                }
-                for pp in &plan.earlier {
-                    tier = tier.child(self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx));
+                // EARLIER is CONTEXT, and context does not get to push the news
+                // off the screen: it collapses whenever anything is new. With
+                // nothing new it opens by default, because the alternative is a
+                // header saying "nothing new" above an empty screen.
+                if !plan.earlier.is_empty() {
+                    let open = self.standup_earlier_open || plan.fresh.is_empty();
+                    let n = plan.earlier.len();
+                    let win = crate::standup_plan::window_label(self.standup_divider_ms, now_ms);
+                    tier = tier.child(
+                        div()
+                            .id("upd-earlier")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(9.))
+                            .pt(px(8.))
+                            .cursor_pointer()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED2))
+                            .hover(|h| h.text_color(rgb(MUTED)))
+                            .child(if open { "▾" } else { "▸" })
+                            .child(SharedString::from(format!(
+                                "EARLIER — {n} project{} you have already read, within {win}",
+                                if n == 1 { "" } else { "s" }
+                            )))
+                            .child(div().flex_1().h(px(1.)).bg(rgb(HAIR_SOFT)))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.standup_earlier_open = !this.standup_earlier_open;
+                                cx.notify();
+                            })),
+                    );
+                    if open {
+                        for pp in &plan.earlier {
+                            tier = tier.child(
+                                self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx),
+                            );
+                        }
+                    }
                 }
                 if plan.hidden_projects > 0 {
                     let n = plan.hidden_projects;
@@ -965,9 +1009,27 @@ impl Orchestrator {
                         .child(SharedString::from(msg)),
                 );
             }
+            // Fold consecutive same-project rows into runs, so a burst stops
+            // repeating "atlas · " down twelve lines. The timeline is NOT
+            // reordered or collapsed — a run only ever covers rows that were
+            // already adjacent, and group_runs breaks on a day boundary or the
+            // divider so a heading can never straddle one.
+            let runs = crate::standup_plan::group_runs(&events, &|ts| local_day(ts), divider_ms);
+            let mut head_len: Vec<usize> = vec![0; events.len()];
+            let mut in_run: Vec<bool> = vec![false; events.len()];
+            // EVERY run gets a heading, including a run of one. Two styles —
+            // inline for singles, heading for bursts — read as a rendering bug
+            // rather than a distinction, because the reader has no idea why one
+            // row looks different from the row above it.
+            for r in &runs {
+                head_len[r.at] = r.len;
+                for k in r.at..r.at + r.len {
+                    in_run[k] = true;
+                }
+            }
             let mut last_day: i64 = i64::MIN;
             let mut divider_done = divider_ms == 0;
-            for ev in events.iter() {
+            for (evi, ev) in events.iter().enumerate() {
                 use orchestrator_store::TimelineKind as K;
                 // day header FIRST so a day boundary that coincides with the
                 // divider reads "YESTERDAY" then the divider, not the reverse.
@@ -1031,19 +1093,38 @@ impl Orchestrator {
                 // everything is fresh (review: the flag flip dimmed the whole
                 // first-look timeline as read history).
                 let old = divider_done && divider_ms > 0;
+                // AFTER the day header and the divider, so a heading always sits
+                // under the rules that bound it rather than above them.
+                if head_len[evi] > 0 {
+                    let n = head_len[evi];
+                    thread = thread.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .pl(px(53.))
+                            .mt(px(7.))
+                            .when(old, |d| d.opacity(0.45))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(MUTED))
+                                    .child(SharedString::from(pname(&ev.project_key))),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED2))
+                                    .child(SharedString::from(format!(
+                                        "{n} update{}",
+                                        if n == 1 { "" } else { "s" }
+                                    ))),
+                            ),
+                    );
+                }
                 let key = ev.ts_ms ^ ((ev.kind.clone() as u64) << 1) ^ (ev.count as u64);
-                let (glyph, gcol): (&str, u32) = match ev.kind {
-                    K::Summary => ("☁", ACCENT),
-                    K::Trail => {
-                        if ev.text.starts_with('■') {
-                            ("■", MUTED2)
-                        } else {
-                            ("▶", GREEN)
-                        }
-                    }
-                    K::Decision => ("◆", AMBER),
-                    K::Map => ("🗺", 0x9A7FD1),
-                };
                 let line: String = match ev.kind {
                     K::Summary => ev.text.clone(),
                     K::Trail => {
@@ -1077,7 +1158,11 @@ impl Orchestrator {
                         .gap(px(8.))
                         .flex_wrap()
                         .child(div().text_size(px(12.5)).text_color(rgb(TEXT)).child(
-                            SharedString::from(format!("{} · {}", pname(&ev.project_key), line)),
+                            SharedString::from(if in_run[evi] {
+                                line.clone()
+                            } else {
+                                format!("{} · {}", pname(&ev.project_key), line)
+                            }),
                         ));
                     if !ev.next.is_empty() {
                         l = l.child(
@@ -1183,14 +1268,10 @@ impl Orchestrator {
                             .text_color(rgb(MUTED2))
                             .child(SharedString::from(hhmm)),
                     )
-                    .child(
-                        div()
-                            .w(px(16.))
-                            .flex_none()
-                            .text_size(px(11.))
-                            .text_color(rgb(gcol))
-                            .child(glyph),
-                    )
+                    // No kind glyph. ☁ sat before EVERY row — summaries are the
+                    // spine, so it marked almost everything and distinguished
+                    // almost nothing. The time and the project heading carry the
+                    // scan; a column of weather was noise.
                     .child(body);
                 if let Some(j) = jump {
                     row = row.child(j);
