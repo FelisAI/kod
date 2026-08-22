@@ -1008,6 +1008,7 @@ impl Orchestrator {
                             config_dir: None,
                             model: String::new(),
                             extra_args: String::new(),
+                            env: String::new(),
                             editing: Some(DraftSlot::Label),
                         });
                         // never two inline editors at once.
@@ -1151,6 +1152,7 @@ impl Orchestrator {
         // stored `["--append-system-prompt", "be terse"]` doesn't reopen as three
         // separate arguments the moment the user saves again.
         let e_extra = fmt_extra_args(&p.extra_args);
+        let e_env = fmt_profile_env(&p.env);
 
         div()
             .flex()
@@ -1223,6 +1225,7 @@ impl Orchestrator {
                             config_dir: e_dir.clone(),
                             model: e_model.clone(),
                             extra_args: e_extra.clone(),
+                            env: e_env.clone(),
                             editing: None,
                         });
                         this.setting_edit = None;
@@ -1394,6 +1397,43 @@ impl Orchestrator {
             ));
         }
 
+        // ── env — free text, parsed into KEY=value pairs on Save ──
+        //
+        // The store and the spawn path have carried profile.env since the
+        // beginning (env_json -> spec.env, spawn.rs); the editor simply never
+        // showed it, and Save preserved whatever was already there. It is a real
+        // field now, so Save writes what you typed.
+        let env_pairs = parse_profile_env(&draft.env);
+        let env_preview = if env_pairs.is_empty() {
+            "nothing exported — sessions under this profile inherit Kod's environment only"
+                .to_string()
+        } else {
+            let mut keys: Vec<&str> = env_pairs.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            format!(
+                "exports {} variable{}: {}",
+                keys.len(),
+                if keys.len() == 1 { "" } else { "s" },
+                keys.join(" · ")
+            )
+        };
+        let env_row = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(self.render_draft_text_row(DraftSlot::Env, &draft.env, "(none)", cx))
+            // KEYS only, never the values: a profile's env is where an API key
+            // ends up, and echoing secrets into a settings pane that anyone can
+            // screen-share is a bad trade for confirmation you already have from
+            // the count. Whether a pair PARSED is the thing you can get wrong,
+            // and the key list shows that.
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(MUTED2))
+                    .child(SharedString::from(env_preview)),
+            );
+
         // ── extra args — free text, split into argv on Save (#61) ──
         let parsed = parse_extra_args(&draft.extra_args);
         let preview = if parsed.is_empty() {
@@ -1476,6 +1516,7 @@ impl Orchestrator {
             .child(labeled_field("Account folder", config_dir.into_any_element()))
             .child(labeled_field("Model", models.into_any_element()))
             .child(labeled_field("Extra args", extra_args.into_any_element()))
+            .child(labeled_field("Env", env_row.into_any_element()))
             .child(actions);
 
         settings_section(
@@ -1506,13 +1547,14 @@ impl Orchestrator {
         let Some(draft) = self.profile_draft.take() else {
             return;
         };
-        // preserve the advanced fields this editor still doesn't show (env,
-        // color) on an EDIT; a NEW profile folds to empty via unwrap_or_default.
-        let (env, color) = draft
+        // `color` is the only advanced field this editor still doesn't show, so
+        // it is preserved on an EDIT; a NEW profile folds to None. `env` USED to
+        // be preserved the same way — it is edited directly now, so preserving
+        // it here would silently discard whatever was just typed.
+        let color = draft
             .editing_id
             .and_then(|id| self.store.lock().ok().and_then(|s| s.profile(id)))
-            .map(|r| (r.env, r.color))
-            .unwrap_or_default();
+            .and_then(|r| r.color);
         let label = draft.label.trim();
         let cli_kind = draft.cli_kind.label();
         let config_dir = draft.config_dir.as_deref().filter(|s| !s.is_empty());
@@ -1523,6 +1565,7 @@ impl Orchestrator {
         // prompt, so a profile nobody typed flags into would start every session
         // with a blank turn.
         let extra = parse_extra_args(&draft.extra_args);
+        let env = parse_profile_env(&draft.env);
         if let Ok(store) = self.store.lock() {
             match draft.editing_id {
                 Some(id) => {
@@ -1684,6 +1727,7 @@ impl DraftSlot {
             Self::Label => "label",
             Self::Model => "model id",
             Self::ExtraArgs => "extra args",
+            Self::Env => "env",
         }
     }
 
@@ -1694,6 +1738,7 @@ impl DraftSlot {
             Self::Label => "label",
             Self::Model => "model",
             Self::ExtraArgs => "extra-args",
+            Self::Env => "env",
         }
     }
 }
@@ -1744,6 +1789,44 @@ fn selected_model_row(model: &str, presets: &[&str], editing: bool) -> ModelRow 
 /// one: `[""]` would reach the CLI as a bare `""`, which codex reads as the
 /// prompt. An explicitly quoted `""` is still honoured — that one the user asked
 /// for, out loud.
+/// `KEY=value KEY2="a b"` -> the env map a spawn exports.
+///
+/// Deliberately built ON TOP of `parse_extra_args` rather than beside it: the
+/// quoting rules are already implemented and tested there, and a second parser
+/// would drift. That function already yields `--foo=a b` from `--foo="a b"`,
+/// which is exactly the shape an env pair needs.
+///
+/// A token with no `=`, or an illegal variable name, is DROPPED. Env names are
+/// `[A-Za-z_][A-Za-z0-9_]*` — anything else is not something a process can
+/// receive, so keeping it would only produce a setting that silently never
+/// applies.
+fn parse_profile_env(s: &str) -> std::collections::HashMap<String, String> {
+    let legal = |k: &str| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    parse_extra_args(s)
+        .into_iter()
+        .filter_map(|tok| {
+            let (k, v) = tok.split_once('=')?;
+            legal(k).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// The inverse, so opening a profile and pressing Save without touching
+/// anything is a no-op.
+///
+/// SORTED BY KEY, which is not cosmetic: a HashMap iterates in a random order,
+/// so without this the field would reshuffle itself every time the editor
+/// opened and a Save would look like an edit.
+fn fmt_profile_env(env: &std::collections::HashMap<String, String>) -> String {
+    let mut pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    fmt_extra_args(&pairs)
+}
+
 fn parse_extra_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -2165,7 +2248,8 @@ fn settings_group_header(label: impl Into<SharedString>) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        belongs_to_other_provider, cli_kind_from_str, fmt_extra_args, model_presets,
+        belongs_to_other_provider, cli_kind_from_str, fmt_extra_args, fmt_profile_env,
+        model_presets, parse_profile_env,
         parse_extra_args, selected_model_row, ModelRow, SettingsSection, CLAUDE_MODEL_IDS,
         CODEX_MODEL_IDS, DEFAULT_PROFILE_CLIS,
     };
@@ -2322,8 +2406,90 @@ mod tests {
     /// must yield NO arguments — a one-element `[""]` reaches the CLI as a bare
     /// `""`, which codex reads as the prompt, so every session under an
     /// untouched profile would open with a blank turn.
+    fn env_of(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn an_empty_extra_args_field_is_no_arguments_at_all() {
+    fn env_pairs_parse_and_quoted_values_keep_their_spaces() {
+        assert_eq!(
+            parse_profile_env("FOO=bar BAZ=qux"),
+            env_of(&[("FOO", "bar"), ("BAZ", "qux")])
+        );
+        // the case a naive space-split gets wrong
+        assert_eq!(
+            parse_profile_env(r#"GREETING="hello world""#),
+            env_of(&[("GREETING", "hello world")])
+        );
+        // a value may contain '=' — only the FIRST one separates
+        assert_eq!(
+            parse_profile_env("URL=https://x/y?a=b"),
+            env_of(&[("URL", "https://x/y?a=b")])
+        );
+        // and an empty value is a legal, meaningful setting
+        assert_eq!(parse_profile_env("QUIET="), env_of(&[("QUIET", "")]));
+    }
+
+    #[test]
+    fn an_empty_env_field_exports_nothing() {
+        for blank in ["", "   ", "\t"] {
+            assert!(parse_profile_env(blank).is_empty(), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn tokens_that_could_never_reach_a_process_are_dropped() {
+        // No '=' at all, an empty name, and names a process cannot receive.
+        // Keeping these would produce a setting that silently never applies.
+        assert!(parse_profile_env("JUSTAWORD").is_empty());
+        assert!(parse_profile_env("=novalue").is_empty());
+        assert!(parse_profile_env("2FOO=bar").is_empty(), "cannot start with a digit");
+        assert!(parse_profile_env("has-dash=bar").is_empty(), "dashes are illegal");
+        assert!(parse_profile_env(r#""has space=bar""#).is_empty());
+        // ...while the legal ones alongside them still survive
+        assert_eq!(
+            parse_profile_env("JUSTAWORD OK_1=yes 2BAD=no"),
+            env_of(&[("OK_1", "yes")])
+        );
+    }
+
+    #[test]
+    fn env_round_trips_so_opening_and_saving_changes_nothing() {
+        for pairs in [
+            vec![("FOO", "bar")],
+            vec![("A", "1"), ("B", "2"), ("C", "3")],
+            vec![("GREETING", "hello world")],
+            vec![("EMPTY", "")],
+            vec![("QUOTED", "it's")],
+            vec![("BOTH", "it's \"quoted\"")],
+        ] {
+            let map = env_of(&pairs);
+            assert_eq!(
+                parse_profile_env(&fmt_profile_env(&map)),
+                map,
+                "round trip broke for {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_env_field_is_stable_across_renders() {
+        // A HashMap iterates in a RANDOM order. Without sorting, the field would
+        // reshuffle every time the editor opened and an untouched Save would look
+        // like an edit.
+        let map = env_of(&[("Z", "1"), ("A", "2"), ("M", "3")]);
+        let first = fmt_profile_env(&map);
+        for _ in 0..20 {
+            assert_eq!(fmt_profile_env(&map), first);
+        }
+        assert!(first.starts_with("A="), "sorted by key: {first}");
+    }
+
+    #[test]
+        fn an_empty_extra_args_field_is_no_arguments_at_all() {
         for blank in ["", "   ", "\t", "\n  \t "] {
             assert!(parse_extra_args(blank).is_empty(), "{blank:?}");
         }
@@ -2465,7 +2631,12 @@ mod tests {
     /// route both clicks to the same field.
     #[test]
     fn draft_slot_ids_and_labels_are_unique() {
-        let slots = [DraftSlot::Label, DraftSlot::Model, DraftSlot::ExtraArgs];
+        let slots = [
+            DraftSlot::Label,
+            DraftSlot::Model,
+            DraftSlot::ExtraArgs,
+            DraftSlot::Env,
+        ];
         let mut keys: Vec<&str> = slots.iter().map(|s| s.key()).collect();
         keys.sort_unstable();
         keys.dedup();

@@ -130,6 +130,10 @@ pub(crate) enum DraftSlot {
     Model,
     /// free-text argv appended to every spawn under this profile (#61).
     ExtraArgs,
+    /// `KEY=value` pairs exported into every spawn under this profile. The
+    /// store and the spawn path have carried these since the beginning
+    /// (profile.env_json -> spec.env); only the editor was missing.
+    Env,
 }
 
 /// An in-progress add/edit of a per-CLI account ("profile", Phase 5). `editing_id`
@@ -152,6 +156,10 @@ pub(crate) struct ProfileDraft {
     /// it. Split into real argv by `parse_extra_args` on Save — the stored shape
     /// is a JSON array, and a shell-ish string is what a human can actually edit.
     extra_args: String,
+    /// `KEY=value` pairs exported into every spawn, as the user typed them.
+    /// Parsed by `parse_profile_env` on Save. Same shell-ish string as
+    /// extra_args on purpose: one editing convention, one quoting rule.
+    env: String,
     editing: Option<DraftSlot>,
 }
 

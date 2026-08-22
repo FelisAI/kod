@@ -684,6 +684,7 @@ impl Orchestrator {
             InlineTarget::ProfileField => self.profile_draft.as_ref().map(|d| match d.editing {
                 Some(DraftSlot::Model) => d.model.as_str(),
                 Some(DraftSlot::ExtraArgs) => d.extra_args.as_str(),
+                Some(DraftSlot::Env) => d.env.as_str(),
                 _ => d.label.as_str(),
             }),
             InlineTarget::SettingText => self.setting_edit.as_ref().map(|e| e.buf.as_str()),
@@ -717,6 +718,7 @@ impl Orchestrator {
                 match d.editing {
                     Some(DraftSlot::Model) => &mut d.model,
                     Some(DraftSlot::ExtraArgs) => &mut d.extra_args,
+                    Some(DraftSlot::Env) => &mut d.env,
                     _ => &mut d.label,
                 }
             }
