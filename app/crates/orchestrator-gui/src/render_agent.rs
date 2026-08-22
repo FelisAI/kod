@@ -4,6 +4,32 @@ use crate::*;
 
 
 impl Orchestrator {
+    /// Write a pasted image to $TMPDIR and return its path, or None if the
+    /// paste was refused or the write failed.
+    ///
+    /// $TMPDIR, matching Ghostty: a pasted screenshot is scratch, and the OS
+    /// already knows how to clean it up. The bytes go out in the format they
+    /// arrived in rather than transcoded to PNG — lossless, and no image
+    /// encoder in the dependency tree.
+    ///
+    /// NOTE this types a LOCAL path. Kod's sessions run locally, so that is the
+    /// right answer here; it is the one thing Ghostty gets bitten by over SSH,
+    /// where the path means nothing on the far side.
+    fn write_pasted_image(&mut self, img: &gpui::Image) -> Option<String> {
+        if !crate::pastedrop::image_paste_ok(img.bytes.len()) {
+            return None;
+        }
+        self.paste_seq = self.paste_seq.wrapping_add(1);
+        let name = crate::pastedrop::image_filename(
+            crate::timefmt::now_ms(),
+            self.paste_seq,
+            &img.format,
+        );
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, &img.bytes).ok()?;
+        Some(path.to_string_lossy().into_owned())
+    }
+
 
     /// The AGENT stage (#9 slice 2): the focused session's pane — a subhead with
     /// the Stream|Terminal toggle + the body (curated stream / raw terminal). The
@@ -292,6 +318,24 @@ impl Orchestrator {
                             .flex()
                             .flex_col()
                             .track_focus(&self.term_focus)
+                            // Drop a file from Finder -> its escaped path is typed
+                            // at the cursor, the way every other terminal behaves.
+                            // ON THE TERMINAL SURFACE ONLY: a drop anywhere else in
+                            // the window is ignored rather than guessed at.
+                            .on_drop(cx.listener(
+                                move |this, paths: &ExternalPaths, _, cx| {
+                                    let strs: Vec<String> = paths
+                                        .paths()
+                                        .iter()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .collect();
+                                    let text = crate::pastedrop::drop_text(&strs);
+                                    if !text.is_empty() {
+                                        this.host.send_key(id, &KeyInput::Paste(text));
+                                    }
+                                    cx.notify();
+                                },
+                            ))
                             // send to the session ACTUALLY ON SCREEN (captured `id`);
                             // PageUp/Down scroll the VIEW (scrollback), not the PTY.
                             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
@@ -398,6 +442,40 @@ impl Orchestrator {
                                 // ⌘V pastes the clipboard into the PTY — KeyInput::Paste gets
                                 // bracketed-paste framing when the app enabled it (multi-line safe).
                                 if ev.keystroke.modifiers.secondary() && k == "v" {
+                                    // IMAGE FIRST, text second. A PTY carries
+                                    // bytes, so no terminal can be handed an
+                                    // image — what Ghostty and iTerm2 actually
+                                    // do is write it to a temp file and type the
+                                    // PATH. Kod only ever asked for .text(),
+                                    // which is why a screenshot did nothing.
+                                    let img = cx.read_from_clipboard().and_then(|c| {
+                                        c.entries().iter().find_map(|e| match e {
+                                            ClipboardEntry::Image(i) => Some(i.clone()),
+                                            _ => None,
+                                        })
+                                    });
+                                    if let Some(img) = img {
+                                        match this.write_pasted_image(&img) {
+                                            Some(path) => this.host.send_key(
+                                                id,
+                                                &KeyInput::Paste(crate::pastedrop::drop_text(&[
+                                                    path,
+                                                ])),
+                                            ),
+                                            // refused (empty or >10MB) or the
+                                            // write failed — say so rather than
+                                            // swallowing a paste that looked like
+                                            // it worked.
+                                            None => {
+                                                this.term_error = Some(
+                                                    "couldn't paste that image — it is empty, over 10MB, or the temp dir is not writable".into(),
+                                                )
+                                            }
+                                        }
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                        return;
+                                    }
                                     if let Some(text) =
                                         cx.read_from_clipboard().and_then(|c| c.text())
                                     {

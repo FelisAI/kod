@@ -369,6 +369,7 @@ pub(crate) fn run() {
                         standup_live_open: false,
                         standup_block_open: std::collections::HashSet::new(),
                         standup_earlier_open: false,
+                        paste_seq: 0,
                         infos_cache: std::collections::HashMap::new(),
                         map_drag: None,
                         map_drop_deny: std::collections::HashSet::new(),

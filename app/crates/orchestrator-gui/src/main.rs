@@ -42,6 +42,7 @@ mod macnotify;
 mod mapview;
 mod outline_edit;
 mod outlinepane;
+mod pastedrop;
 mod palette;
 mod palette_ops;
 mod projdir;
@@ -273,6 +274,9 @@ struct Orchestrator {
     /// whenever there IS something new — already-read projects are context, and
     /// context does not get to push the news off the screen.
     standup_earlier_open: bool,
+    /// Bumped per pasted image so two pastes in the same millisecond cannot
+    /// land on the same temp filename and silently overwrite each other.
+    paste_seq: u64,
     /// Sessions that finished a turn you have not opened since (#13). A LEDGER,
     /// not a phase: phase is whatever the agent is doing now, this is whether
     /// YOU have caught up with it. Set in `persist_events` on a TurnEnd whose
