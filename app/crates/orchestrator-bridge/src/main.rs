@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use orchestrator_bridge::client::{retire_risk, Client, RetireRisk};
 use orchestrator_bridge::mirror::{Change, Mirror};
-use orchestrator_host::protocol::ServerMsg;
+use orchestrator_host::protocol::{ClientRole, ServerMsg};
 
 /// The socket `orchestrator-daemon` would pick for this user — i.e. the daemon
 /// that is probably running RIGHT NOW with real work in it.
@@ -117,7 +117,7 @@ fn main() -> ExitCode {
 }
 
 fn probe(path: &Path) -> Result<(), String> {
-    let (mut client, welcome) = Client::attach(path).map_err(|e| e.to_string())?;
+    let (mut client, welcome) = Client::attach(path, ClientRole::Phone).map_err(|e| e.to_string())?;
     let mut mirror = Mirror::default();
     mirror.apply(&welcome);
     if let ServerMsg::Welcome { wire_version, .. } = &welcome {

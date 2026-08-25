@@ -23,7 +23,7 @@ use crate::session::{CliKind, SessionId};
 /// Bumped by hand whenever any wire type below changes shape. The client sends
 /// it in `Hello`; the daemon rejects a mismatch so a freshly-rebuilt GUI never
 /// talks to an incompatible older daemon (docs/018 §13).
-pub const WIRE_VERSION: u32 = 23; // …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge
+pub const WIRE_VERSION: u32 = 24; // …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey
 
 /// Reject absurd frame lengths (a corrupt/foreign peer) before allocating.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -32,8 +32,53 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
-    Hello { wire_version: u32 },
+    Hello {
+        wire_version: u32,
+        /// What this connection is allowed to ask for. Declared ONCE, at attach,
+        /// and never re-negotiated — a connection cannot talk its way up.
+        role: ClientRole,
+    },
     Request { request_id: u64, command: Command },
+}
+
+/// The capability a connection holds for its whole life.
+///
+/// This exists because the mobile bridge is a SEPARATE PROCESS that a phone talks
+/// to over a network. Putting the "phones may not type into shells" rule inside
+/// the bridge would make it a convention: anything that compromised the bridge —
+/// or any future refactor of it — could send `SendKey` to a shell and get
+/// arbitrary command execution as the user. Declaring the role at attach moves
+/// the rule to the far side of a process boundary, where the daemon enforces it
+/// against its OWN view of what each session is.
+///
+/// The phone never sends this. The bridge sets it, and even if the bridge lied it
+/// could only ever claim FEWER rights than `Full` — the daemon decides what each
+/// role may do, and a `Phone` connection is refused everything but typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientRole {
+    /// The desktop app. Every command.
+    Full,
+    /// The mobile bridge: typing into agent sessions, and nothing else.
+    Phone,
+}
+
+impl ClientRole {
+    /// Whether a connection holding this role may issue `cmd`.
+    ///
+    /// A allowlist, not a denylist: a command added later is refused for phones
+    /// until someone deliberately lists it. The opposite default would mean every
+    /// new capability silently reaches the network.
+    pub fn may(self, cmd: &Command) -> bool {
+        match self {
+            ClientRole::Full => true,
+            ClientRole::Phone => matches!(
+                cmd,
+                Command::PhoneInput { .. }
+                    | Command::PhoneKey { .. }
+                    | Command::PhoneClients { .. }
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +181,38 @@ pub enum Command {
     /// Poll the daemon-hosted bridge (the settings pane's live line) — request/
     /// reply. Trailing variant (positional wire): a safe add.
     BridgeStatus,
+    /// Type `text` into an AGENT session, from a phone.
+    ///
+    /// Deliberately NOT `SendKey`: a separate command is what lets
+    /// `ClientRole::may` allowlist typing without also handing a network peer the
+    /// key path the desktop uses for everything else. The daemon resolves the
+    /// session's `CliKind` ITSELF and refuses a shell — the phone sends only an
+    /// id, so it cannot misrepresent what it is typing into.
+    PhoneInput { id: SessionId, text: String },
+    /// One control key into an AGENT session, from a phone. Enough to answer a
+    /// permission prompt (arrow to a choice, Enter) without giving the phone a
+    /// general keyboard.
+    PhoneKey { id: SessionId, key: PhoneKey },
+    /// The bridge telling the daemon how many phones are connected.
+    ///
+    /// Moving the bridge out of this process cost the daemon its direct view of
+    /// the connection table, and the settings line would otherwise have to guess.
+    /// Allowed for `Phone` because it carries no capability at all — it is a
+    /// number the daemon displays, and the worst a lying bridge achieves is a
+    /// wrong count on its owner's own screen.
+    PhoneClients { n: u32 },
+}
+
+/// The only keys a phone may press. An explicit, tiny set rather than the
+/// desktop's `KeyInput`: everything here is navigating a prompt an agent is
+/// already showing, and nothing here can start work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneKey {
+    Enter,
+    Escape,
+    Up,
+    Down,
+    Tab,
 }
 
 /// The daemon-hosted mobile bridge's live state — the whole answer to "how is it
@@ -622,6 +699,7 @@ mod tests {
         let cmds: Vec<ClientMsg> = vec![
             ClientMsg::Hello {
                 wire_version: WIRE_VERSION,
+                role: ClientRole::Full,
             },
             ClientMsg::Request {
                 request_id: 1,
@@ -750,6 +828,30 @@ mod tests {
                 request_id: 21,
                 command: Command::BridgeStatus,
             },
+            // A NEW COMMAND MUST BE ADDED HERE. This corpus is hand-maintained,
+            // so the guard only sees what it is given: adding a variant and not
+            // listing it leaves the hash unchanged and the "wire protocol
+            // changed" alarm silent. Found exactly that way — PhoneInput and
+            // PhoneKey initially slipped through, and the hash only moved because
+            // Hello gained a field in the same edit.
+            ClientMsg::Request {
+                request_id: 22,
+                command: Command::PhoneInput {
+                    id: SessionId(1),
+                    text: "hello".into(),
+                },
+            },
+            ClientMsg::Request {
+                request_id: 23,
+                command: Command::PhoneKey {
+                    id: SessionId(1),
+                    key: PhoneKey::Enter,
+                },
+            },
+            ClientMsg::Request {
+                request_id: 24,
+                command: Command::PhoneClients { n: 2 },
+            },
         ];
         let mut bytes = bincode::serialize(&msgs).unwrap();
         bytes.extend(bincode::serialize(&cmds).unwrap());
@@ -769,7 +871,7 @@ mod tests {
     /// the change must be a CONSCIOUS act paired with a WIRE_VERSION bump.
     #[test]
     fn protocol_hash_is_stable() {
-        const PROTOCOL_HASH: u64 = 0xf6fb7b92b02b6c54; // WIRE_VERSION 23
+        const PROTOCOL_HASH: u64 = 0xe642d8051151782d; // WIRE_VERSION 24
         let got = fnv1a(&protocol_corpus());
         assert_eq!(
             got, PROTOCOL_HASH,
@@ -782,6 +884,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let hello = ClientMsg::Hello {
             wire_version: WIRE_VERSION,
+            role: ClientRole::Phone,
         };
         let welcome = ServerMsg::Welcome {
             wire_version: WIRE_VERSION,
@@ -794,7 +897,9 @@ mod tests {
         let got_hello: ClientMsg = read_frame(&mut r).unwrap();
         let got_welcome: ServerMsg = read_frame(&mut r).unwrap();
         assert!(
-            matches!(got_hello, ClientMsg::Hello { wire_version } if wire_version == WIRE_VERSION)
+            matches!(got_hello, ClientMsg::Hello { wire_version, role }
+                     if wire_version == WIRE_VERSION && role == ClientRole::Phone),
+            "the role must survive the socket — it is the whole access-control decision"
         );
         match got_welcome {
             ServerMsg::Welcome { infos, .. } => {
@@ -953,5 +1058,60 @@ mod tests {
             }
             _ => panic!("wrong msg"),
         }
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    fn sid() -> SessionId {
+        SessionId(1)
+    }
+
+    #[test]
+    fn a_phone_may_type_and_may_do_nothing_else() {
+        let phone = ClientRole::Phone;
+        assert!(phone.may(&Command::PhoneInput { id: sid(), text: "hi".into() }));
+        assert!(phone.may(&Command::PhoneKey { id: sid(), key: PhoneKey::Enter }));
+
+        // The ones that matter. SendKey is arbitrary keystrokes into ANY session
+        // including a shell — that is remote command execution, and it is exactly
+        // what a compromised bridge would reach for.
+        assert!(!phone.may(&Command::SendKey {
+            id: sid(),
+            key: KeyInput::Paste("rm -rf /".into()),
+        }));
+        assert!(!phone.may(&Command::SpawnShell {
+            project_slug: "p".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+        }));
+        assert!(!phone.may(&Command::SetBridge {
+            on: false,
+            port: 1,
+            bind: String::new(),
+            token: String::new(),
+        }));
+    }
+
+    #[test]
+    fn the_desktop_keeps_every_capability() {
+        let full = ClientRole::Full;
+        assert!(full.may(&Command::SendKey { id: sid(), key: KeyInput::Paste("x".into()) }));
+        assert!(full.may(&Command::SpawnShell {
+            project_slug: "p".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+        }));
+        assert!(full.may(&Command::PhoneInput { id: sid(), text: "x".into() }));
+    }
+
+    /// The allowlist must stay an ALLOWLIST. If someone adds a command and this
+    /// test still passes without them touching `may`, the new capability is
+    /// already refused for phones — which is the safe direction. This test exists
+    /// to state that intent so nobody "fixes" it into a denylist.
+    #[test]
+    fn an_unlisted_command_is_refused_rather_than_allowed() {
+        assert!(!ClientRole::Phone.may(&Command::BridgeStatus));
+        assert!(!ClientRole::Phone.may(&Command::Scroll { id: sid(), delta: 1 }));
     }
 }

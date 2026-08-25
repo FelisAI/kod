@@ -30,6 +30,32 @@
 //! turns the blocking read into "check for a frame", and the outbound queue is
 //! drained on every turn of the same loop.
 //!
+//! ## Getting a phone's typing to the daemon
+//!
+//! A connection thread has a `Hub` and a token and no way to reach the daemon at
+//! all, and it must not simply be handed the daemon connection: that is one
+//! request/reply stream, and two threads writing to it interleave frames into
+//! something neither end can parse. So the path is one-way per thread:
+//!
+//!   * every CONNECTION thread holds a clone of `Sender<PhoneRequest>`. It posts
+//!     a [`Command`] plus a one-shot and waits on that one-shot. It never touches
+//!     the daemon socket.
+//!   * the SENDER thread owns the WRITE half and blocks on the channel — never on
+//!     the daemon stream. Input therefore leaves the instant it is posted, no
+//!     matter how quiet the daemon is.
+//!   * the PUMP thread owns the READ half and blocks on it — never on the
+//!     channel. Session updates keep flowing while any number of inputs are in
+//!     flight, so a phone that spams input competes for the SENDER's attention
+//!     and not the pump's.
+//!
+//! The single-threaded version fails whichever way you point it. Drain the
+//! channel after each daemon message and a keystroke sits unsent until the daemon
+//! happens to speak — and an all-idle daemon says NOTHING, which is precisely the
+//! moment someone picks up their phone and types. Wait on the channel instead and
+//! the session stream stops. Splitting the socket is what removes the choice; it
+//! is also why the daemon connection is opened here rather than through
+//! [`crate::client::Client`] — see [`attach_split`].
+//!
 //! ## Binding
 //!
 //! Loopback always; a Tailscale address as an explicit opt-in; nothing else,
@@ -58,10 +84,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -69,9 +96,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
-use orchestrator_host::protocol::ServerMsg;
+use orchestrator_host::protocol::{
+    read_frame, write_frame, ClientMsg, ClientRole, Command, CommandReply, PhoneKey, ServerMsg,
+    WIRE_VERSION,
+};
+use orchestrator_host::session::SessionId;
 
-use crate::client::Client;
+use crate::client::AttachError;
 use crate::mirror::{Change, Mirror};
 use crate::wire::{
     decode_frame, BridgeMsg, Caps, PhoneMsg, WireSession, MAX_FRAME, PROTO,
@@ -361,6 +392,38 @@ pub enum Step {
     /// itself because it has neither the clock nor the session view, and that is
     /// what keeps it pure.
     Accept,
+    /// Ask the daemon, then answer the phone with what it said.
+    ///
+    /// [`Protocol`] stops here on purpose: it has no channel and no socket, so it
+    /// decides only that this is a well-formed ask and hands over the two things
+    /// the daemon needs. Whether the ask is ALLOWED is not answered anywhere in
+    /// this file — the daemon resolves the session's kind from its own state and
+    /// refuses shells, dead sessions and unknown ids.
+    Ask { rid: u64, sid: u64, ask: PhoneAsk },
+}
+
+/// The two things a phone may ask for, after the wire layer has vetted the shape.
+///
+/// Separate from [`Command`] so [`Step`] can stay comparable in tests (`Command`
+/// is a serde wire type and derives no `PartialEq`), and so the sid → `SessionId`
+/// step happens in exactly one place: [`command_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhoneAsk {
+    Input(String),
+    Key(PhoneKey),
+}
+
+/// The daemon command one ask becomes.
+///
+/// A `sid` and a verb, and nothing describing the session. That is the shape the
+/// whole security story rests on: the phone cannot claim a shell is a claude
+/// session, because it is never asked what the session is.
+pub fn command_for(sid: u64, ask: PhoneAsk) -> Command {
+    let id = SessionId(sid);
+    match ask {
+        PhoneAsk::Input(text) => Command::PhoneInput { id, text },
+        PhoneAsk::Key(key) => Command::PhoneKey { id, key },
+    }
 }
 
 /// The per-connection state machine.
@@ -412,6 +475,22 @@ impl Protocol {
                 "already_hello",
                 "this connection already completed its handshake",
             )]),
+            (true, PhoneMsg::Input { sid, text, rid }) => {
+                Step::Ask { rid, sid, ask: PhoneAsk::Input(text) }
+            }
+            (true, PhoneMsg::Key { sid, key, rid }) => match key.to_daemon() {
+                Some(key) => Step::Ask { rid, sid, ask: PhoneAsk::Key(key) },
+                // Answered HERE rather than forwarded: the daemon has no word for
+                // a key this build does not know, and mapping it to the nearest
+                // one it does would press something the user never pressed. It is
+                // an `input_result`, not an `err`, because the phone is waiting
+                // for the fate of a specific sid.
+                None => Step::Send(vec![BridgeMsg::input_refused(
+                    rid,
+                    sid,
+                    "this bridge does not know that key",
+                )]),
+            },
             // The no-lockstep rule: answer, do NOT hang up. A phone one version
             // ahead sending a message this build has never heard of is a normal
             // event, not a protocol violation.
@@ -681,6 +760,197 @@ pub fn mint_epoch() -> String {
     b.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+// ----------------------------------------------------------- the daemon link
+
+/// How long a connection thread waits for the daemon's answer to one ask.
+///
+/// The daemon answers `PhoneInput` in microseconds — a unix socket, one scan of
+/// `infos()`, one write to a PTY — so this is a HANG DETECTOR, not a budget. It
+/// is bounded at all because the alternative is a thread parked forever on a
+/// daemon that stopped answering, holding one of [`MAX_CONNS`] slots and a phone
+/// that is being told nothing.
+const DAEMON_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One phone's ask, on its way to the daemon, carrying the channel it will be
+/// answered on.
+pub struct PhoneRequest {
+    pub command: Command,
+    /// The ONE answer. A `sync_channel(1)` rather than a `channel()` so that
+    /// delivering it can never block the sender thread: the buffer always has
+    /// room for the single message, and a phone that has already given up shows
+    /// up as a send error rather than as a wait.
+    pub reply: SyncSender<PhoneOutcome>,
+}
+
+/// What came back — the daemon's verdict, or the reason there isn't one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhoneOutcome {
+    Ok,
+    /// Refused, or never answered. The string is shown to a user, and where the
+    /// daemon supplied one it is the daemon's OWN sentence: this process did not
+    /// make the decision and must not paraphrase it.
+    Refused(String),
+}
+
+impl PhoneOutcome {
+    fn from_reply(reply: CommandReply) -> Self {
+        match reply {
+            CommandReply::Ok => Self::Ok,
+            CommandReply::Error(e) => Self::Refused(e),
+            // `PhoneInput`/`PhoneKey` answer only `Ok` or `Error`, so anything
+            // else means this bridge and the daemon disagree about what was
+            // asked. Reporting that beats reading an unknown shape as success.
+            _ => Self::Refused("Kod answered something this bridge does not understand".into()),
+        }
+    }
+}
+
+/// The asks that have been written to the daemon and not yet answered, keyed by
+/// the `request_id` they went out under.
+///
+/// Small in every case that matters. The daemon answers every request it reads
+/// (`dispatch_checked` always produces a `CommandReply`, a panicking command
+/// included), and a connection thread waits for its own answer before reading
+/// another frame — so this normally holds at most one entry per connected phone,
+/// [`MAX_CONNS`] of them. It can grow past that only against a daemon that
+/// accepts requests and answers none, at one abandoned entry per phone per
+/// [`DAEMON_REPLY_TIMEOUT`], and `fail_all` empties it the moment that link
+/// actually breaks.
+#[derive(Default)]
+pub struct Pending {
+    /// Poisoning is ignored here for the same reason it is on [`Hub`]: every
+    /// mutation is one map insert or remove, so there is no half-updated
+    /// invariant for the poison to protect, and propagating it would let one
+    /// panicking connection thread silently stop every phone's input from ever
+    /// being answered again.
+    waiting: Mutex<HashMap<u64, SyncSender<PhoneOutcome>>>,
+}
+
+impl Pending {
+    fn register(&self, request_id: u64, reply: SyncSender<PhoneOutcome>) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id, reply);
+    }
+
+    /// Hand one answer to whoever is waiting on it. A send error means that phone
+    /// already gave up (or hung up), which is not an error here — the entry is
+    /// gone either way, which is what keeps the map from growing.
+    fn answer(&self, request_id: u64, outcome: PhoneOutcome) {
+        let waiter = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_id);
+        if let Some(tx) = waiter {
+            let _ = tx.send(outcome);
+        }
+    }
+
+    /// Tell everyone still waiting at once, when the link they were waiting on
+    /// dies. Without this each of them sits out the whole [`DAEMON_REPLY_TIMEOUT`]
+    /// to learn something already known.
+    fn fail_all(&self, why: &str) {
+        let waiters: Vec<_> = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, tx)| tx)
+            .collect();
+        for tx in waiters {
+            let _ = tx.send(PhoneOutcome::Refused(why.to_string()));
+        }
+    }
+}
+
+/// Post one ask and wait for its answer. Called on a CONNECTION thread, which is
+/// the only thread allowed to block on a phone's behalf.
+fn ask_daemon(input: &Sender<PhoneRequest>, command: Command) -> PhoneOutcome {
+    let (tx, rx) = mpsc::sync_channel(1);
+    if input.send(PhoneRequest { command, reply: tx }).is_err() {
+        return PhoneOutcome::Refused("the bridge is not connected to Kod".into());
+    }
+    match rx.recv_timeout(DAEMON_REPLY_TIMEOUT) {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Timeout) => PhoneOutcome::Refused("Kod did not answer".into()),
+        Err(RecvTimeoutError::Disconnected) => {
+            PhoneOutcome::Refused("the bridge is not connected to Kod".into())
+        }
+    }
+}
+
+/// The ONLY thread that ever writes to the daemon socket.
+///
+/// It blocks on the phone channel and never on the daemon stream, which is what
+/// makes an ask leave immediately even when the daemon has been silent for an
+/// hour. Its answers come back on the read half, to [`pump`].
+fn send_loop(mut writer: UnixStream, requests: Receiver<PhoneRequest>, pending: &Pending) {
+    let mut next_request_id: u64 = 1;
+    for req in requests {
+        let request_id = next_request_id;
+        next_request_id += 1;
+        // Registered BEFORE the write. The daemon is a local socket and the pump
+        // is a separate thread, so the reply can be read back before `write_frame`
+        // has even returned; registering afterwards would drop that reply on the
+        // floor and leave the phone waiting out its whole timeout.
+        pending.register(request_id, req.reply);
+        if write_frame(
+            &mut writer,
+            &ClientMsg::Request { request_id, command: req.command },
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
+    // Either the link broke or the last phone went away. Anyone still waiting is
+    // told now rather than one timeout at a time.
+    pending.fail_all("the bridge lost its connection to Kod");
+}
+
+/// Attach to the daemon and split the connection into a read half and a write
+/// half.
+///
+/// WHY THIS IS NOT `Client::attach`. [`crate::client::Client`] owns its
+/// `UnixStream` privately, and its only blocking primitive is `next()`, which has
+/// no timeout — so a thread holding a `Client` can block on the daemon stream or
+/// watch the phone input channel, never both, and there is no way from here to
+/// obtain a second handle on the same connection. Everything that made this file
+/// safe is unchanged: the same `WIRE_VERSION` from the same linked crate, the
+/// same `ClientRole::Phone`, the same [`AttachError`] vocabulary and its wording,
+/// and `main`'s retire pre-flight still runs before `serve` is ever called. The
+/// one duplicated thing is the handshake, and it is duplicated where the compiler
+/// notices: `ClientMsg::Hello` is a struct variant, so a field added to it fails
+/// to build here as well as there.
+fn attach_split(socket: &Path) -> Result<(UnixStream, UnixStream, ServerMsg), AttachError> {
+    let mut stream = UnixStream::connect(socket)?;
+    write_frame(
+        &mut stream,
+        &ClientMsg::Hello {
+            wire_version: WIRE_VERSION,
+            // PHONE, not Full. This process is the one a network peer talks to, so
+            // it holds the smallest capability that still does the job: the daemon
+            // refuses it anything but typing into an agent session, whatever this
+            // process is later persuaded to ask for.
+            role: ClientRole::Phone,
+        },
+    )?;
+    let first: ServerMsg = read_frame(&mut stream)?;
+    match first {
+        ServerMsg::Welcome { .. } => {
+            let writer = stream.try_clone()?;
+            Ok((stream, writer, first))
+        }
+        ServerMsg::VersionMismatch { daemon_version } => Err(AttachError::VersionMismatch {
+            ours: WIRE_VERSION,
+            daemon: daemon_version,
+        }),
+        other => Err(AttachError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 // ---------------------------------------------------------------- the sockets
 
 /// A running listener set: what it is reachable on, and the threads that must be
@@ -716,8 +986,18 @@ impl Started {
 /// rather than attaching to anything — so starting and stopping the phone
 /// listener from a settings toggle can never retire a daemon (`client.rs`).
 ///
+/// `input` is how a connection thread reaches the daemon: it is CLONED per
+/// connection, never shared, because a `Sender` clone is the only handle in this
+/// design that two threads may hold at once. The daemon socket itself is on the
+/// far end, touched by exactly one thread (see the module note).
+///
 /// Stopping: set `stop`, then [`Started::join`].
-pub fn serve_with(cfg: &Config, hub: Arc<Hub>, stop: Arc<AtomicBool>) -> Result<Started, String> {
+pub fn serve_with(
+    cfg: &Config,
+    hub: Arc<Hub>,
+    stop: Arc<AtomicBool>,
+    input: Sender<PhoneRequest>,
+) -> Result<Started, String> {
     // Loopback is always bound, even when a tailnet address is configured: the
     // simulator and an SSH tunnel both arrive on 127.0.0.1, and losing them the
     // moment the phone is set up would be a bad trade.
@@ -756,6 +1036,7 @@ pub fn serve_with(cfg: &Config, hub: Arc<Hub>, stop: Arc<AtomicBool>) -> Result<
         let token = Arc::clone(&token);
         let stop = Arc::clone(&stop);
         let conns = Arc::clone(&conns);
+        let input = input.clone();
         accept_threads.push(std::thread::spawn(move || {
             // Leaving this loop DROPS the listener, and that — not the flag — is
             // what frees the port.
@@ -806,13 +1087,16 @@ pub fn serve_with(cfg: &Config, hub: Arc<Hub>, stop: Arc<AtomicBool>) -> Result<
                 let token = Arc::clone(&token);
                 let stop = Arc::clone(&stop);
                 let conns = Arc::clone(&conns);
+                let input = input.clone();
                 std::thread::spawn(move || {
                     // The slot must come back even if `conn` panics, or every
                     // panic would ratchet MAX_CONNS down by one until the bridge
                     // refuses everything. `conn` owns its stream and its handle
                     // outright, so there is nothing an unwind can leave visibly
                     // half-built — hence AssertUnwindSafe rather than a redesign.
-                    let _ = catch_unwind(AssertUnwindSafe(|| conn(stream, &hub, &token, &stop)));
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        conn(stream, &hub, &token, &stop, &input)
+                    }));
                     conns.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -835,14 +1119,18 @@ pub fn serve(socket: &Path) -> Result<(), String> {
     // ever set on the way out, to retire the listeners with the daemon they
     // were serving.
     let stop = Arc::new(AtomicBool::new(false));
-    let started = serve_with(&cfg, Arc::clone(&hub), Arc::clone(&stop))?;
+    // Unbounded, and it does not need a bound: a connection thread waits for its
+    // own answer before reading another frame, so at most MAX_CONNS asks can be
+    // in flight no matter how hard the phones type.
+    let (input_tx, input_rx) = mpsc::channel::<PhoneRequest>();
+    let started = serve_with(&cfg, Arc::clone(&hub), Arc::clone(&stop), input_tx)?;
 
     // `?` here would return with the accept threads still looping and still
     // holding the port — and, worse, still ACCEPTING phones and serving them an
     // empty Hub for a daemon we never reached. Every exit from this function past
     // the bind has to go through the same teardown, so the fallible part is
     // wrapped and the teardown runs once at the end.
-    let outcome = serve_attached(socket, &cfg, &hub);
+    let outcome = serve_attached(socket, &cfg, &hub, input_rx);
     stop.store(true, Ordering::Relaxed);
     started.join();
     outcome
@@ -850,8 +1138,13 @@ pub fn serve(socket: &Path) -> Result<(), String> {
 
 /// The part of `serve` that can fail after the listeners are up. Split out so its
 /// error path cannot skip the caller's stop-and-join.
-fn serve_attached(socket: &Path, cfg: &Config, hub: &Arc<Hub>) -> Result<(), String> {
-    let (mut client, welcome) = Client::attach(socket).map_err(|e| e.to_string())?;
+fn serve_attached(
+    socket: &Path,
+    cfg: &Config,
+    hub: &Arc<Hub>,
+    requests: Receiver<PhoneRequest>,
+) -> Result<(), String> {
+    let (mut reader, writer, welcome) = attach_split(socket).map_err(|e| e.to_string())?;
     let mut mirror = Mirror::default();
     mirror.apply(&welcome);
 
@@ -873,17 +1166,43 @@ fn serve_attached(socket: &Path, cfg: &Config, hub: &Arc<Hub>) -> Result<(), Str
         );
     }
 
-    pump(&mut client, &mut mirror, hub)
+    // The write half goes to its own thread and never comes back here. It ends
+    // when the link breaks or when the last `Sender` clone is dropped — which
+    // `Started::join` guarantees, since every clone lives on an accept or
+    // connection thread.
+    let pending = Arc::new(Pending::default());
+    {
+        let pending = Arc::clone(&pending);
+        std::thread::spawn(move || send_loop(writer, requests, &pending));
+    }
+
+    pump(&mut reader, &mut mirror, hub, &pending)
 }
 
-/// Fold daemon messages into the mirror and publish what moved.
+/// Fold daemon messages into the mirror, publish what moved, and hand each reply
+/// to the phone waiting on it.
 ///
-/// Grid frames and timeline events are deliberately dropped: v0 shows no
-/// terminal, and forwarding a viewport per tick to a phone would be the entire
-/// bandwidth budget spent on something it cannot render.
-pub fn pump(client: &mut Client, mirror: &mut Mirror, hub: &Hub) -> Result<(), String> {
+/// This thread blocks on the daemon stream and on NOTHING else — no channel, no
+/// phone, no lock held across a read. That is what makes "a phone that spams
+/// input cannot stall session updates" true rather than hoped for: input never
+/// reaches this loop at all, it goes out on [`send_loop`], and all that arrives
+/// here is a reply frame to be routed.
+///
+/// Grid frames and timeline events are deliberately dropped: the phone shows no
+/// terminal, and forwarding a viewport per tick would be the entire bandwidth
+/// budget spent on something it cannot render.
+pub fn pump(
+    reader: &mut UnixStream,
+    mirror: &mut Mirror,
+    hub: &Hub,
+    pending: &Pending,
+) -> Result<(), String> {
     loop {
-        let msg = client.next().map_err(|e| e.to_string())?;
+        let msg: ServerMsg = read_frame(reader).map_err(|e| e.to_string())?;
+        if let ServerMsg::Reply { request_id, reply } = msg {
+            pending.answer(request_id, PhoneOutcome::from_reply(reply));
+            continue;
+        }
         match mirror.apply(&msg) {
             Some(Change::Reset) => hub.reset(wire_sessions(mirror)),
             Some(Change::Info(id)) => {
@@ -908,7 +1227,13 @@ fn ws_config() -> WebSocketConfig {
 }
 
 /// One connection, start to finish.
-fn conn(stream: TcpStream, hub: &Hub, token: &str, stop: &AtomicBool) {
+fn conn(
+    stream: TcpStream,
+    hub: &Hub,
+    token: &str,
+    stop: &AtomicBool,
+    input: &Sender<PhoneRequest>,
+) {
     let _ = stream.set_nodelay(true);
     // The HTTP upgrade gets a bounded blocking read: a socket that connects and
     // then says nothing must not pin a thread forever. A real client sends the
@@ -946,6 +1271,16 @@ fn conn(stream: TcpStream, hub: &Hub, token: &str, stop: &AtomicBool) {
                     // subscription are taken under one lock, so a delta that
                     // lands mid-handshake is queued rather than lost.
                     let h = hub.attach_client();
+                    // Tell the daemon the count changed. It lost its direct view
+                    // of this table when the bridge became a child process, and a
+                    // settings line that reads "no phone connected" while one is
+                    // connected is the kind of quiet lie this whole feature is
+                    // built to avoid. Fire-and-forget: a failure here must never
+                    // cost the phone its connection.
+                    let _ = ask_daemon(
+                        input,
+                        Command::PhoneClients { n: hub.sub_count() as u32 },
+                    );
                     let mut frames = vec![hub.hello_ok()];
                     frames.push(hub.snapshot_msg(h.snapshot.clone()));
                     if !send_all(&mut ws, &frames) {
@@ -960,6 +1295,12 @@ fn conn(stream: TcpStream, hub: &Hub, token: &str, stop: &AtomicBool) {
                     let _ = ws.flush();
                     return;
                 }
+                // Unreachable while `Protocol` answers everything pre-hello with
+                // `Fail`, and it stays a hang-up rather than a fallthrough on
+                // purpose: this is the arm a future `Step::Ask` would land in if
+                // the handshake gate were ever loosened, and the safe reading of
+                // "a command from a connection that never authenticated" is to
+                // drop the socket, not to carry the command to the daemon.
                 _ => return,
             },
             Ok(Message::Binary(_)) => {
@@ -1012,6 +1353,22 @@ fn conn(stream: TcpStream, hub: &Hub, token: &str, stop: &AtomicBool) {
                     let _ = send_all(&mut ws, &frames);
                     break;
                 }
+                // The round trip to the daemon happens on THIS thread, so this
+                // phone's own deltas queue in the hub (bounded by MAX_BACKLOG)
+                // for as long as it takes. Nothing else waits: other phones have
+                // their own threads, and the daemon stream has the pump's. The
+                // alternative — carrying on reading while an answer is
+                // outstanding — would let a phone stack up asks whose replies it
+                // then has to match by hand, for a wait measured in microseconds.
+                Step::Ask { rid, sid, ask } => {
+                    let frame = match ask_daemon(input, command_for(sid, ask)) {
+                        PhoneOutcome::Ok => BridgeMsg::input_ok(rid, sid),
+                        PhoneOutcome::Refused(why) => BridgeMsg::input_refused(rid, sid, why),
+                    };
+                    if !send_all(&mut ws, &[frame]) {
+                        break;
+                    }
+                }
                 _ => {}
             },
             Ok(Message::Binary(_)) => {
@@ -1045,6 +1402,7 @@ fn conn(stream: TcpStream, hub: &Hub, token: &str, stop: &AtomicBool) {
     }
 
     hub.detach_client(handle.id);
+    let _ = ask_daemon(input, Command::PhoneClients { n: hub.sub_count() as u32 });
     let _ = ws.close(None);
     let _ = ws.flush();
 }
@@ -1072,6 +1430,9 @@ fn send_all(ws: &mut WebSocket<TcpStream>, frames: &[BridgeMsg]) -> bool {
 mod tests {
     use super::*;
     use crate::wire::{Cli, WirePhase};
+    use orchestrator_host::host::SessionInfo;
+    use orchestrator_host::protocol::{EventKind, ServerEvent};
+    use orchestrator_host::session::{CliKind, Phase};
 
     fn session(sid: u64, phase: WirePhase) -> WireSession {
         WireSession {
@@ -1082,6 +1443,7 @@ mod tests {
             phase,
             phase_since: 1,
             alive: true,
+            can_input: true,
             last_message: String::new(),
             pending_headline: None,
             trouble: None,
@@ -1092,7 +1454,15 @@ mod tests {
     }
 
     fn hello(token: &str) -> Vec<u8> {
-        format!(r#"{{"t":"hello","proto":1,"token":"{token}"}}"#).into_bytes()
+        format!(r#"{{"t":"hello","proto":2,"token":"{token}"}}"#).into_bytes()
+    }
+
+    /// A phone-input channel with nothing on the far end — for the tests that
+    /// are about the listener rather than about typing. Dropping the receiver
+    /// here is deliberate: any ask would take the "not connected to Kod" path,
+    /// and none of those tests type.
+    fn no_daemon() -> Sender<PhoneRequest> {
+        mpsc::channel().0
     }
 
     fn code(m: &BridgeMsg) -> &str {
@@ -1249,10 +1619,29 @@ mod tests {
 
     #[test]
     fn a_wrong_proto_is_rejected() {
+        for wrong in [0u32, 3, 9] {
+            let mut p = Protocol::new("k");
+            let frame = format!(r#"{{"t":"hello","proto":{wrong},"token":"k"}}"#);
+            let step = p.on_text(frame.as_bytes());
+            let Step::Fail(frames) = &step else { panic!("proto {wrong} was accepted") };
+            assert_eq!(code(&frames[0]), "bad_proto");
+        }
+    }
+
+    #[test]
+    fn a_proto_1_phone_is_turned_away_rather_than_half_understood() {
+        // The cost of the PROTO bump, pinned rather than left to be discovered in
+        // the field. proto 1 WAS the read-only contract — `caps.input` documented
+        // as permanently false, no `input_result` on the wire — so a phone built
+        // against it has no code that could read the answer to an input attempt.
+        // It gets `bad_proto`, i.e. one clear "update the app", instead of a
+        // session in which this bridge advertises a composer whose answers that
+        // phone would silently drop.
         let mut p = Protocol::new("k");
-        let step = p.on_text(br#"{"t":"hello","proto":2,"token":"k"}"#);
-        let Step::Fail(frames) = &step else { panic!("expected a close") };
+        let step = p.on_text(br#"{"t":"hello","proto":1,"token":"k"}"#);
+        let Step::Fail(frames) = &step else { panic!("a proto-1 phone was admitted") };
         assert_eq!(code(&frames[0]), "bad_proto");
+        assert!(!p.established());
     }
 
     #[test]
@@ -1266,6 +1655,13 @@ mod tests {
             br#"{"t":"hello","proto":9,"token":"k"}"#.to_vec(),
             hello("wrong"),
             vec![b'{'; MAX_FRAME + 1],
+            // THE TWO NEW VERBS BELONG IN THIS SWEEP. They are the first
+            // messages that can reach a PTY, so "the first message must be
+            // hello" has to hold for them exactly as it does for a ping — an
+            // unauthenticated socket that could type would make the token
+            // decorative.
+            br#"{"t":"input","sid":1,"text":"rm -rf /"}"#.to_vec(),
+            br#"{"t":"key","sid":1,"key":"enter"}"#.to_vec(),
         ];
         for frame in junk {
             let mut p = Protocol::new("right");
@@ -1312,7 +1708,7 @@ mod tests {
     #[test]
     fn an_unknown_type_gets_err_and_does_not_close() {
         let mut p = established();
-        let step = p.on_text(br#"{"t":"input","text":"rm -rf /"}"#);
+        let step = p.on_text(br#"{"t":"approve","sid":1}"#);
         let Step::Send(frames) = &step else {
             panic!("an unknown type must NOT close the connection, got {step:?}")
         };
@@ -1321,6 +1717,82 @@ mod tests {
         // Still usable afterwards — that is the whole point.
         assert!(p.established());
         assert_eq!(p.on_text(br#"{"t":"ping"}"#), Step::Send(vec![BridgeMsg::Pong]));
+    }
+
+    // ---- established: typing ----
+
+    #[test]
+    fn an_input_frame_becomes_the_daemons_phone_command() {
+        let mut p = established();
+        assert_eq!(
+            p.on_text(br#"{"t":"input","sid":7,"text":"run the tests"}"#),
+            Step::Ask { rid: 0, sid: 7, ask: PhoneAsk::Input("run the tests".into()) }
+        );
+        // …and the command that carries it names the session and NOTHING about
+        // what kind of session it is. That omission is the security property:
+        // the daemon resolves the kind from its own state, so a phone cannot
+        // dress a shell up as a claude session.
+        let cmd = command_for(7, PhoneAsk::Input("run the tests".into()));
+        let Command::PhoneInput { id, text } = cmd else { panic!("wrong command: {cmd:?}") };
+        assert_eq!(id, SessionId(7));
+        assert_eq!(text, "run the tests");
+    }
+
+    #[test]
+    fn a_key_frame_becomes_the_daemons_phone_key() {
+        let mut p = established();
+        assert_eq!(
+            p.on_text(br#"{"t":"key","sid":4,"key":"escape"}"#),
+            Step::Ask { rid: 0, sid: 4, ask: PhoneAsk::Key(PhoneKey::Escape) }
+        );
+        let cmd = command_for(4, PhoneAsk::Key(PhoneKey::Escape));
+        let Command::PhoneKey { id, key } = cmd else { panic!("wrong command: {cmd:?}") };
+        assert_eq!(id, SessionId(4));
+        assert_eq!(key, PhoneKey::Escape);
+    }
+
+    #[test]
+    fn an_unknown_key_name_is_answered_and_never_reaches_the_daemon() {
+        // A phone one version ahead pressing a key this build has no word for.
+        // It must be an ANSWER — the phone is waiting on a specific sid — and it
+        // must not become `Ask`, because there is no daemon key to ask for and
+        // the nearest one is still a key the user did not press.
+        let mut p = established();
+        let step = p.on_text(br#"{"t":"key","sid":4,"key":"f7"}"#);
+        let Step::Send(frames) = &step else {
+            panic!("an unknown key must not close the connection or reach the daemon: {step:?}")
+        };
+        assert_eq!(frames.len(), 1);
+        assert!(
+            matches!(&frames[0], BridgeMsg::InputResult { sid: 4, ok: false, reason: Some(_), .. }),
+            "expected a refused input_result for sid 4, got {:?}",
+            frames[0]
+        );
+        // Still a usable connection afterwards.
+        assert!(p.established());
+        assert_eq!(p.on_text(br#"{"t":"ping"}"#), Step::Send(vec![BridgeMsg::Pong]));
+    }
+
+    #[test]
+    fn typing_before_hello_is_refused_and_does_not_establish() {
+        // The pre-hello rule, stated once more against the two verbs that can
+        // reach a PTY. `nothing_but_hello_err_is_ever_sent_before_a_successful_hello`
+        // sweeps the same frames; this one names the code, so a regression that
+        // turned input into a keep-alive `err` — and therefore into a message an
+        // unauthenticated socket could keep sending — is legible.
+        for frame in [
+            &br#"{"t":"input","sid":1,"text":"rm -rf /"}"#[..],
+            &br#"{"t":"key","sid":1,"key":"enter"}"#[..],
+        ] {
+            let mut p = Protocol::new("k");
+            let step = p.on_text(frame);
+            let Step::Fail(frames) = &step else {
+                panic!("input before hello must close, got {step:?}")
+            };
+            assert_eq!(code(&frames[0]), "expected_hello");
+            assert!(matches!(frames[0], BridgeMsg::HelloErr { .. }));
+            assert!(!p.established());
+        }
     }
 
     #[test]
@@ -1739,7 +2211,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
         hub.upsert(session(1, WirePhase::Idle));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop)).unwrap();
+        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
         assert_eq!(started.endpoints, vec![format!("127.0.0.1:{port}")]);
 
         let mut ws = dial(port).expect("the websocket handshake never completed");
@@ -1769,7 +2241,7 @@ mod tests {
         // would get EADDRINUSE from a server it had just stopped.
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
-        let first = serve_with(&cfg_on(port), Arc::new(Hub::new("e1")), Arc::clone(&stop)).unwrap();
+        let first = serve_with(&cfg_on(port), Arc::new(Hub::new("e1")), Arc::clone(&stop), no_daemon()).unwrap();
         // Prove it is really serving, so a rebind below cannot pass because the
         // first start quietly failed.
         establish(&mut dial(port).expect("the first server must accept"));
@@ -1778,7 +2250,7 @@ mod tests {
         first.join();
 
         let stop2 = Arc::new(AtomicBool::new(false));
-        let second = serve_with(&cfg_on(port), Arc::new(Hub::new("e2")), Arc::clone(&stop2))
+        let second = serve_with(&cfg_on(port), Arc::new(Hub::new("e2")), Arc::clone(&stop2), no_daemon())
             .expect("rebinding the same port after a clean stop must work");
         establish(&mut dial(port).expect("the second server must accept"));
         stop2.store(true, Ordering::Relaxed);
@@ -1790,7 +2262,7 @@ mod tests {
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop)).unwrap();
+        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
         let mut ws = dial(port).unwrap();
         establish(&mut ws);
         assert!(within(Duration::from_secs(2), || hub.sub_count() == 1));
@@ -1850,7 +2322,7 @@ mod tests {
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop)).unwrap();
+        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
         let mut ws = dial(port).unwrap();
         establish(&mut ws);
         assert!(within(Duration::from_secs(2), || hub.sub_count() == 1));
@@ -1884,7 +2356,7 @@ mod tests {
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop)).unwrap();
+        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
 
         let mut live: Vec<WebSocket<TcpStream>> = Vec::new();
         for i in 0..MAX_CONNS {
@@ -1911,6 +2383,303 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         started.join();
+    }
+
+    // ---- the daemon link: a real socket, a stand-in daemon on the far end ----
+
+    fn info(sid: u64) -> SessionInfo {
+        SessionInfo {
+            id: SessionId(sid),
+            kind: CliKind::Claude,
+            project_slug: "kod".into(),
+            title: "kod — main".into(),
+            phase: Phase::Idle,
+            alive: true,
+            pending: None,
+            dirty: 0,
+            cli_session_id: None,
+            last_message: String::new(),
+            phase_since_ms: 1,
+            trouble: None,
+            usage_limit: None,
+        }
+    }
+
+    /// Wire up the two halves of a socketpair exactly as `serve_attached` does:
+    /// a sender thread on the write half, a pump thread on the read half.
+    ///
+    /// The `Arc<Pending>` is handed back because `serve_attached` holds one too
+    /// (it keeps `pending` alive for the whole life of `pump`). A test that let
+    /// it drop would be testing a different arrangement: with the last `Arc`
+    /// gone, every waiting `SyncSender` is dropped along with the map and the
+    /// waiters wake on `Disconnected` — which would quietly stand in for the
+    /// answers `fail_all` is supposed to send.
+    fn linked(hub: &Arc<Hub>) -> (Sender<PhoneRequest>, UnixStream, Arc<Pending>) {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let reader = ours.try_clone().expect("clone the read half");
+        let (tx, rx) = mpsc::channel::<PhoneRequest>();
+        let pending = Arc::new(Pending::default());
+        {
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || send_loop(ours, rx, &pending));
+        }
+        {
+            let hub = Arc::clone(hub);
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || {
+                let mut reader = reader;
+                let mut mirror = Mirror::default();
+                let _ = pump(&mut reader, &mut mirror, &hub, &pending);
+            });
+        }
+        (tx, theirs, pending)
+    }
+
+    #[test]
+    fn the_daemon_link_round_trips_asks_from_several_phones_over_one_socket() {
+        // THE PLUMBING, end to end, on a real socket. Three connection threads
+        // post at once; one sender thread does every write; one pump thread does
+        // every read; each answer finds the phone that asked for it.
+        //
+        // That only ONE thread writes the socket is proved structurally rather
+        // than asserted: the daemon wire is length-prefixed bincode, so two
+        // threads writing concurrently would interleave halves of two frames and
+        // the far end's `read_frame` would fail or decode garbage. Three intact
+        // requests arriving is that not happening.
+        let hub = Arc::new(Hub::new("e1"));
+        let (tx, sock, _pending) = linked(&hub);
+
+        // The stand-in daemon says NOTHING until the asks arrive, which is the
+        // other half of the design under test: a sender that waited for daemon
+        // traffic before draining the channel would never get these out, and
+        // every phone below would come back "Kod did not answer".
+        //
+        // It then answers IN REVERSE, so a reply matched by arrival order instead
+        // of by request_id would go to the wrong phone.
+        let daemon = std::thread::spawn(move || {
+            let mut sock = sock;
+            let mut asked = Vec::new();
+            for _ in 0..3 {
+                let msg: ClientMsg = read_frame(&mut sock).expect("a corrupt frame reached Kod");
+                let ClientMsg::Request { request_id, command } = msg else {
+                    panic!("the bridge sent something that was not a request")
+                };
+                let sid = match &command {
+                    Command::PhoneInput { id, .. } | Command::PhoneKey { id, .. } => id.0,
+                    other => panic!("a phone reached a command it may not send: {other:?}"),
+                };
+                asked.push((sid, request_id));
+            }
+            for (sid, request_id) in asked.iter().rev() {
+                let reply = if *sid == 2 {
+                    CommandReply::Error("that session has ended".into())
+                } else {
+                    CommandReply::Ok
+                };
+                write_frame(&mut sock, &ServerMsg::Reply { request_id: *request_id, reply })
+                    .expect("reply");
+            }
+            asked.iter().map(|(sid, _)| *sid).collect::<Vec<_>>()
+        });
+
+        let phones: Vec<_> = [1u64, 2, 3]
+            .into_iter()
+            .map(|sid| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    (sid, ask_daemon(&tx, command_for(sid, PhoneAsk::Input(format!("hi {sid}")))))
+                })
+            })
+            .collect();
+        let mut got: Vec<(u64, PhoneOutcome)> =
+            phones.into_iter().map(|h| h.join().expect("a phone thread panicked")).collect();
+        got.sort_by_key(|(sid, _)| *sid);
+
+        assert_eq!(got[0], (1, PhoneOutcome::Ok));
+        assert_eq!(
+            got[1],
+            (2, PhoneOutcome::Refused("that session has ended".into())),
+            "a refusal reached the wrong phone, or lost the daemon's own words"
+        );
+        assert_eq!(got[2], (3, PhoneOutcome::Ok));
+
+        let mut asked = daemon.join().expect("the stand-in daemon panicked");
+        asked.sort_unstable();
+        assert_eq!(asked, vec![1, 2, 3], "an ask was lost or duplicated on the way to the daemon");
+    }
+
+    #[test]
+    fn an_ask_the_daemon_never_answers_does_not_stall_session_updates() {
+        // THE PROPERTY THE SPLIT EXISTS FOR. One input is outstanding and will
+        // never be answered; session updates must keep arriving anyway, because
+        // the pump thread blocks on the daemon socket and on nothing else. The
+        // naive one-threaded pump — drain the channel, then read — fails this the
+        // other way round: it would be the INPUT that waits, forever, on an idle
+        // daemon that has nothing to say.
+        let hub = Arc::new(Hub::new("e1"));
+        let (tx, mut sock, _pending) = linked(&hub);
+
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        tx.send(PhoneRequest {
+            command: command_for(9, PhoneAsk::Input("are you there".into())),
+            reply: reply_tx,
+        })
+        .expect("the sender thread is gone");
+
+        // The stand-in daemon takes the ask, says nothing about it, and publishes
+        // a session change instead.
+        let msg: ClientMsg = read_frame(&mut sock).expect("the ask never arrived");
+        assert!(matches!(msg, ClientMsg::Request { .. }));
+        write_frame(
+            &mut sock,
+            &ServerMsg::Event(ServerEvent {
+                seq: 1,
+                session_id: SessionId(1),
+                kind: EventKind::Info(info(1)),
+            }),
+        )
+        .expect("event");
+
+        assert!(
+            within(Duration::from_secs(2), || hub.sessions().len() == 1),
+            "the session stream stopped while an input was outstanding — the pump is \
+             waiting on something other than the daemon socket"
+        );
+        // …and the phone is still waiting rather than being told something untrue.
+        assert_eq!(reply_rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn a_dead_daemon_link_answers_everyone_waiting_instead_of_leaving_them_to_time_out() {
+        let hub = Arc::new(Hub::new("e1"));
+        // `_pending` is HELD for the whole test on purpose — see `linked`. Let it
+        // drop and the waiter below wakes on a disconnected channel instead, so
+        // the test would pass with `fail_all` deleted.
+        let (tx, sock, _pending) = linked(&hub);
+        // Reading one ask proves the link was live; dropping the far end then
+        // breaks it under a phone that is already waiting.
+        let asker = {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                ask_daemon(&tx, command_for(1, PhoneAsk::Input("hello".into())))
+            })
+        };
+        let mut sock = sock;
+        let _: ClientMsg = read_frame(&mut sock).expect("the ask never arrived");
+        drop(sock);
+        // The next write fails, `send_loop` gives up and tells everyone at once.
+        // Without `fail_all` this returns only after DAEMON_REPLY_TIMEOUT, so the
+        // assertion is really about promptness.
+        let started = Instant::now();
+        tx.send(PhoneRequest {
+            command: command_for(2, PhoneAsk::Input("anyone".into())),
+            reply: mpsc::sync_channel(1).0,
+        })
+        .expect("the sender thread is gone");
+        let outcome = asker.join().expect("the phone thread panicked");
+        assert!(
+            matches!(outcome, PhoneOutcome::Refused(_)),
+            "a phone waiting on a dead link was told {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < DAEMON_REPLY_TIMEOUT,
+            "the waiter sat out the whole timeout instead of being told: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_phone_that_types_is_told_what_the_daemon_said() {
+        // The whole path a keystroke takes, over a real websocket: phone → conn
+        // thread → channel → (here) the daemon → back to that same phone.
+        let port = free_port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let hub = Arc::new(Hub::new("e1"));
+        let (tx, rx) = mpsc::channel::<PhoneRequest>();
+        let started =
+            serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), tx).unwrap();
+
+        // Stands in for the daemon, on one thread, exactly where `send_loop`
+        // would be. It refuses sid 2 in the daemon's own words.
+        let daemon = std::thread::spawn(move || {
+            let mut seen: Vec<(u64, String)> = Vec::new();
+            for req in rx {
+                let outcome = match &req.command {
+                    Command::PhoneInput { id, text } => {
+                        seen.push((id.0, text.clone()));
+                        if id.0 == 2 {
+                            PhoneOutcome::Refused(
+                                "Kod does not let a phone type into a shell".into(),
+                            )
+                        } else {
+                            PhoneOutcome::Ok
+                        }
+                    }
+                    // Bookkeeping, not a capability: the bridge tells the daemon
+                    // how many phones are connected so the desktop settings line
+                    // can say so. Allowlisted for `Phone` in the daemon for the
+                    // same reason it is accepted here — the worst a lying bridge
+                    // achieves is a wrong number on its owner's own screen.
+                    Command::PhoneClients { .. } => PhoneOutcome::Ok,
+                    // Anything ELSE reaching the daemon would mean this bridge
+                    // built a command out of something the wire layer vetted as
+                    // input — the one thing it must never do. Notably SendKey and
+                    // SpawnShell, which are arbitrary execution.
+                    other => panic!("a phone reached a command it may not send: {other:?}"),
+                };
+                let _ = req.reply.send(outcome);
+            }
+            seen
+        });
+
+        let mut ws = dial(port).unwrap();
+        establish(&mut ws);
+        let say = |ws: &mut WebSocket<TcpStream>, s: &str| {
+            ws.send(Message::Text(s.to_string().into())).unwrap();
+        };
+        let answer = |ws: &mut WebSocket<TcpStream>| -> serde_json::Value {
+            match ws.read().expect("the bridge hung up on an input") {
+                Message::Text(s) => serde_json::from_str(&s).unwrap(),
+                other => panic!("expected a text frame, got {other:?}"),
+            }
+        };
+
+        say(&mut ws, r#"{"t":"input","sid":1,"text":"run the tests"}"#);
+        let v = answer(&mut ws);
+        assert_eq!(v["t"], "input_result");
+        assert_eq!(v["sid"], 1);
+        assert_eq!(v["ok"], true);
+
+        say(&mut ws, r#"{"t":"input","sid":2,"text":"rm -rf /"}"#);
+        let v = answer(&mut ws);
+        assert_eq!(v["sid"], 2);
+        assert_eq!(v["ok"], false);
+        assert_eq!(
+            v["reason"], "Kod does not let a phone type into a shell",
+            "the phone must be shown the DAEMON's reason, not this bridge's paraphrase"
+        );
+
+        // An unknown key is answered here and never posted — the stand-in daemon
+        // would panic on a command it did not expect, and `seen` below proves it
+        // was never asked.
+        say(&mut ws, r#"{"t":"key","sid":1,"key":"f7"}"#);
+        let v = answer(&mut ws);
+        assert_eq!(v["t"], "input_result");
+        assert_eq!(v["ok"], false);
+
+        // …and the connection is perfectly usable afterwards.
+        say(&mut ws, r#"{"t":"ping"}"#);
+        assert_eq!(answer(&mut ws)["t"], "pong");
+
+        stop.store(true, Ordering::Relaxed);
+        started.join();
+        drop(ws);
+        let seen = daemon.join().expect("the stand-in daemon panicked");
+        assert_eq!(
+            seen,
+            vec![(1, "run the tests".to_string()), (2, "rm -rf /".to_string())],
+            "the bridge dropped an input, invented one, or forwarded the unknown key"
+        );
     }
 }
 

@@ -94,14 +94,22 @@ fi
 
 # --- 2. Sign INSIDE-OUT: nested daemon Mach-O FIRST, then the bundle --------
 # Contents/MacOS/ holds TWO Mach-Os: the main exe 'kod' (signed when the bundle
-# is signed) and the sibling 'orchestrator-daemon' (the GUI resolves it next to
-# current_exe(); codesign does NOT auto-sign it, so sign it explicitly first).
+# is signed) and the siblings 'orchestrator-daemon' and 'kod-bridge' (each is
+# resolved next to the current_exe() of whatever starts it; codesign does NOT
+# auto-sign them, so sign them explicitly first). An UNSIGNED nested Mach-O is
+# SIGKILLed by Gatekeeper with an empty stderr — the least diagnosable failure
+# there is, so missing one here is not a cosmetic omission.
 # --timestamp is MANDATORY for notarization (secure timestamp). We apply
 # signatures explicitly rather than with the deprecated `--deep`.
 echo "==> signing nested helper: orchestrator-daemon"
 codesign --force --timestamp --options runtime \
   --entitlements "$ENT" --sign "$SIGN_IDENTITY" \
   "$APP/Contents/MacOS/orchestrator-daemon"
+
+echo "==> signing nested helper: kod-bridge (the mobile bridge)"
+codesign --force --timestamp --options runtime \
+  --entitlements "$ENT" --sign "$SIGN_IDENTITY" \
+  "$APP/Contents/MacOS/kod-bridge"
 
 echo "==> signing the bundle (main exe 'kod' + seal)"
 codesign --force --timestamp --options runtime \

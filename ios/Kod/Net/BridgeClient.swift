@@ -11,6 +11,10 @@
 //    * Every receive has a deadline. The keepalive ping means silence longer than
 //      the deadline is a dead link, not a quiet one — TCP alone would hold a
 //      half-open socket open for minutes on a phone that changed networks.
+//
+//  `send` is the one thing that pushes the other way. It reports its own failure
+//  instead of swallowing it: what it carries is text a person typed, and text
+//  that silently never left the phone is the worst outcome this file can produce.
 
 import Foundation
 
@@ -41,6 +45,10 @@ final class BridgeClient {
     var onState: (ConnectionState) -> Void = { _ in }
     /// Told about every well-formed frame, in arrival order.
     var onMessage: (ServerMessage) -> Void = { _ in }
+    /// Told what the Mac did with something this phone sent. Separate from
+    /// `onMessage` because it is not news about a session — it is the answer the
+    /// person who typed is waiting for.
+    var onInputResult: (InputResult) -> Void = { _ in }
     /// Fired when a connection drops, so the cache can stop pretending it is live.
     var onDisconnect: () -> Void = {}
 
@@ -50,6 +58,10 @@ final class BridgeClient {
     /// stays true after the loop returns on a terminal unauthorized.
     private var running = false
     private var socket: URLSessionWebSocketTask?
+    /// True only between `hello_ok` and the end of that same connection. `socket`
+    /// alone is not enough: it is set the instant the task is created, and a frame
+    /// written before the handshake finishes is answered with `err` and dropped.
+    private var ready = false
 
     private let urlSession: URLSession = {
         let c = URLSessionConfiguration.ephemeral
@@ -88,6 +100,7 @@ final class BridgeClient {
         loop?.cancel()
         loop = nil
         running = false
+        ready = false
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
     }
@@ -95,6 +108,22 @@ final class BridgeClient {
     /// Explicit user retry — also the way out of the terminal unauthorized state.
     func retry() {
         if let s = settings { start(s) }
+    }
+
+    /// Put one message on the live socket. Returns nil when the socket accepted
+    /// it, or the reason it could not.
+    ///
+    /// Handing it to the socket is NOT delivery — the daemon's answer arrives
+    /// later as `input_result`, and that is what says whether anything was typed.
+    /// This return value only covers the half the phone can see.
+    func send(_ msg: ClientMessage) async -> String? {
+        guard let ws = socket, ready else { return "not connected to your Mac" }
+        do {
+            try await ws.send(.string(msg.json))
+            return nil
+        } catch {
+            return Self.describe(error)
+        }
     }
 
     // MARK: - The loop
@@ -145,6 +174,7 @@ final class BridgeClient {
         ws.resume()
         defer {
             ws.cancel(with: .goingAway, reason: nil)
+            ready = false
             if socket === ws { socket = nil }
         }
 
@@ -153,6 +183,7 @@ final class BridgeClient {
         switch try Wire.parse(frame: try await receive(ws, timeout: Self.helloTimeout)) {
         case .helloOk(let proto, let epoch, let serverTime, let input):
             onMessage(.helloOk(proto: proto, epoch: epoch, serverTime: serverTime, inputAllowed: input))
+            ready = true
             onState(.connected)
         case .helloErr(let code, let message):
             if code == "unauthorized" { throw BridgeError.unauthorized(message) }
@@ -173,6 +204,12 @@ final class BridgeClient {
 
         while !Task.isCancelled {
             let frame = try await receive(ws, timeout: Self.idleTimeout)
+            // Checked before parsing, because this answer belongs to the sender
+            // and not to the session cache.
+            if let answer = Wire.inputResult(frame: frame) {
+                onInputResult(answer)
+                continue
+            }
             do {
                 let msg = try Wire.parse(frame: frame)
                 if case .ignored = msg { continue }  // unknown "t": drop it, stay connected

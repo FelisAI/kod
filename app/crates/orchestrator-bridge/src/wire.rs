@@ -1,5 +1,5 @@
-//! The PHONE-facing protocol (v0). Plain JSON, one message per WebSocket text
-//! frame, deliberately nothing like the daemon's bincode wire.
+//! The PHONE-facing protocol. Plain JSON, one message per WebSocket text frame,
+//! deliberately nothing like the daemon's bincode wire.
 //!
 //! WHY A SECOND PROTOCOL AT ALL: `orchestrator_host::protocol` is a *frozen*,
 //! version-locked wire whose whole point is that a rebuilt client must never
@@ -17,18 +17,33 @@
 //! Everything here is pure data + pure functions — no socket, no clock, no hub —
 //! so the entire shape of the wire is unit-tested against literal JSON.
 //!
-//! v0 IS READ-ONLY. `caps.input` is `false` and there is no input message. Do not
-//! add one here without adding the authorization story that would have to come
-//! with it.
+//! THE PHONE CAN NOW TYPE, AND THE AUTHORIZATION STORY IS NOT IN THIS FILE.
+//! `input` and `key` carry a `sid` and nothing else — the phone never says what
+//! KIND of session it is typing into, so it cannot claim a shell is a claude
+//! session. The daemon resolves the kind from its own state and refuses shells,
+//! dead sessions and ids it has never heard of (`ClientRole::Phone` +
+//! `dispatch_checked`). Everything here is the COURIER for that decision and
+//! never the decision: `caps.input` and `can_input` exist so a phone can grey a
+//! composer out early, and neither one grants anything.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use orchestrator_host::host::SessionInfo;
+use orchestrator_host::protocol::PhoneKey;
 use orchestrator_host::session::{CliKind, Phase, TroubleKind};
 
-/// The only protocol version v0 speaks. A phone announcing anything else is
-/// refused at hello rather than half-understood.
-pub const PROTO: u32 = 1;
+/// The only protocol version this bridge speaks. A phone announcing anything else
+/// is refused at hello rather than half-understood.
+///
+/// BUMPED 1 → 2 FOR INPUT, and that bump is a deliberate hard cut rather than a
+/// consequence of the two rules above. Those rules cover MESSAGES; they do not
+/// cover a promise. proto 1 shipped with `caps.input` documented as permanently
+/// false and no `input_result` on the wire at all, so a proto-1 phone has no code
+/// that could read the answer to an input attempt. Refusing it at hello costs one
+/// `bad_proto` and an "update the app"; admitting it means a phone told
+/// `caps.input: true` by a bridge whose answers it will silently drop. The cost is
+/// real: a read-only phone built against proto 1 must update before it reconnects.
+pub const PROTO: u32 = 2;
 
 /// Hard cap on one inbound frame, enforced BEFORE any parsing (see
 /// [`decode_frame`]). A phone has no business sending 64 KiB, so anything larger
@@ -45,11 +60,70 @@ pub const MAX_FRAME: usize = 65536;
 pub enum PhoneMsg {
     Hello { proto: u32, token: String },
     Ping,
+    /// Type a whole composed prompt into a session. `sid` and text: no session
+    /// KIND, because the phone does not get to describe what it is typing into.
+    Input { sid: u64, text: String, #[serde(default)] rid: u64 },
+    /// One control key, for answering a prompt an agent is already showing.
+    Key { sid: u64, key: PhoneKeyName, #[serde(default)] rid: u64 },
     /// Any `t` this build does not know. This variant is what makes rule 2
     /// above *structural*: an unrecognized type is a value we can answer, not a
     /// parse failure that would tempt the loop into dropping the socket.
     #[serde(other)]
     Unknown,
+}
+
+/// The keys a phone may press, as the phone spells them.
+///
+/// A separate enum from the daemon's [`PhoneKey`] for the same reason [`Cli`] is
+/// separate from `CliKind`: this one is a shape a shipped app encodes, and
+/// renaming a variant in the host crate must not silently change what that app
+/// has to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhoneKeyName {
+    Enter,
+    Escape,
+    Up,
+    Down,
+    Tab,
+    /// A key name this build has never heard of — rule 2, one level down. A
+    /// newer phone's key must be a VALUE the loop can answer, not a deserialize
+    /// error that costs the whole frame (and, before the handshake, the socket).
+    Unknown,
+}
+
+/// Hand-written because `#[serde(other)]` is not available here: serde allows it
+/// only on a unit variant of an internally- or adjacently-tagged enum, and this
+/// one is deserialized from a bare string. Deserialize-only, like [`PhoneMsg`] —
+/// the bridge reads keys, it never mints one.
+impl<'de> Deserialize<'de> for PhoneKeyName {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "enter" => Self::Enter,
+            "escape" => Self::Escape,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "tab" => Self::Tab,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+impl PhoneKeyName {
+    /// The daemon's word for this key, or `None` when there is not one.
+    ///
+    /// `None` is answered by the connection loop with a refusal; it must never
+    /// become a guess, because the nearest key to one the phone did not name is
+    /// still a key the user did not press.
+    pub fn to_daemon(self) -> Option<PhoneKey> {
+        Some(match self {
+            Self::Enter => PhoneKey::Enter,
+            Self::Escape => PhoneKey::Escape,
+            Self::Up => PhoneKey::Up,
+            Self::Down => PhoneKey::Down,
+            Self::Tab => PhoneKey::Tab,
+            Self::Unknown => return None,
+        })
+    }
 }
 
 /// Why a frame never became a [`PhoneMsg`].
@@ -93,18 +167,21 @@ pub fn decode_frame(bytes: &[u8]) -> Result<PhoneMsg, FrameError> {
 
 // ---------------------------------------------------------------- bridge → phone
 
-/// What the bridge announces it can do. v0 is read-only, so `input` is `false`
-/// — it is a field rather than an omission so the phone can grey out its
-/// composer on the ANSWER instead of on its own build number.
+/// What the bridge announces it can do. It is a field rather than an omission so
+/// the phone can decide on the ANSWER instead of on its own build number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Caps {
+    /// THE FLAG THE iOS APP READS TO DECIDE WHETHER TO SHOW A COMPOSER AT ALL.
+    /// It says this bridge understands `input`/`key` and will answer them — not
+    /// that any particular session will accept one. That is per-session
+    /// ([`WireSession::can_input`]) and, for real, the daemon's call.
     pub input: bool,
 }
 
 impl Caps {
-    /// The only caps v0 ever sends.
+    /// The only caps this bridge ever sends.
     pub fn v0() -> Self {
-        Self { input: false }
+        Self { input: true }
     }
 }
 
@@ -140,6 +217,27 @@ pub enum BridgeMsg {
         sid: u64,
     },
     Pong,
+    /// The answer to exactly one `input` or `key`, ok or not.
+    ///
+    /// ALWAYS sent, including on success: an input whose fate the phone cannot
+    /// see is an input the user retypes. `reason` carries the DAEMON's own
+    /// sentence wherever there is one ("Kod does not let a phone type into a
+    /// shell…"), because this bridge is not what decided and must not paraphrase
+    /// a refusal it did not make.
+    InputResult {
+        /// Echoes the `rid` the phone sent.
+        ///
+        /// Without it a result can only be matched by session, and a LATE answer
+        /// to one send settles a DIFFERENT, newer one — dispatching an Enter
+        /// against a paste that never landed, i.e. submitting the wrong text at
+        /// an agent. `sid` alone cannot tell those apart; a phone that is
+        /// backgrounded mid-send hits it on ordinary use.
+        #[serde(default)]
+        rid: u64,
+        sid: u64,
+        ok: bool,
+        reason: Option<String>,
+    },
     Err {
         code: String,
         message: String,
@@ -149,6 +247,14 @@ pub enum BridgeMsg {
 impl BridgeMsg {
     pub fn err(code: &str, message: impl Into<String>) -> Self {
         Self::Err { code: code.to_string(), message: message.into() }
+    }
+
+    pub fn input_ok(rid: u64, sid: u64) -> Self {
+        Self::InputResult { rid, sid, ok: true, reason: None }
+    }
+
+    pub fn input_refused(rid: u64, sid: u64, reason: impl Into<String>) -> Self {
+        Self::InputResult { rid, sid, ok: false, reason: Some(reason.into()) }
     }
 
     pub fn hello_err(code: &str, message: impl Into<String>) -> Self {
@@ -251,6 +357,18 @@ pub struct WireSession {
     /// locally rather than being told "3m ago" once and then lying about it.
     pub phase_since: u64,
     pub alive: bool,
+    /// Whether the phone should offer a composer for this session — true for
+    /// claude and codex, false for a shell.
+    ///
+    /// A COURTESY, NOT THE ENFORCEMENT. It exists so the composer is greyed out
+    /// BEFORE the user types a paragraph into a session that was never going to
+    /// take it. THIS VALUE BEING TRUE DOES NOT MAKE AN INPUT LEGAL: the daemon
+    /// re-decides on every single one, against its own view of the session, and a
+    /// phone that ignores this field is refused there rather than here. `alive`
+    /// stays a separate field for the same reason — the daemon refuses dead
+    /// sessions too, and the phone can combine the two without either one
+    /// pretending to be the whole rule.
+    pub can_input: bool,
     /// May be `""` — a session that has not finished a turn has no last message,
     /// and an empty string is honest where a null would tempt a placeholder.
     pub last_message: String,
@@ -275,6 +393,7 @@ impl From<&SessionInfo> for WireSession {
             phase: i.phase.into(),
             phase_since: i.phase_since_ms,
             alive: i.alive,
+            can_input: i.kind != CliKind::Shell,
             last_message: i.last_message.clone(),
             pending_headline: i.pending.as_ref().map(|p| p.view.summary()),
             trouble: i.trouble.map(|t| trouble_slug(t.kind).to_string()),
@@ -333,7 +452,7 @@ mod tests {
         };
         assert_eq!(
             v(&m),
-            json!({"t":"hello_ok","proto":1,"epoch":"e1","server_time":1234,"caps":{"input":false}})
+            json!({"t":"hello_ok","proto":2,"epoch":"e1","server_time":1234,"caps":{"input":true}})
         );
     }
 
@@ -370,6 +489,7 @@ mod tests {
                     "phase": "idle",
                     "phase_since": 1_700_000_000_000u64,
                     "alive": true,
+                    "can_input": true,
                     "last_message": "",
                     "pending_headline": null,
                     "trouble": null,
@@ -397,11 +517,45 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_types_are_exactly_the_contract_and_none_of_them_is_input() {
+    fn input_result_json_shape() {
+        // `rid` echoes what the phone sent. It is the field that lets a LATE
+        // answer be discarded instead of settling a newer send — matching on sid
+        // alone dispatches an Enter against a paste that never landed.
+        assert_eq!(
+            v(&BridgeMsg::input_ok(11, 7)),
+            json!({"t":"input_result","rid":11,"sid":7,"ok":true,"reason":null})
+        );
+        assert_eq!(
+            v(&BridgeMsg::input_refused(11, 7, "that session has ended")),
+            json!({"t":"input_result","rid":11,"sid":7,"ok":false,
+                   "reason":"that session has ended"})
+        );
+    }
+
+    /// The rid must survive the round trip in BOTH directions, since a mismatch
+    /// in either one silently reintroduces the bug it exists to prevent.
+    #[test]
+    fn the_request_id_round_trips() {
+        let decoded = decode_frame(br#"{"t":"input","sid":3,"text":"hi","rid":99}"#);
+        assert_eq!(decoded, Ok(PhoneMsg::Input { sid: 3, text: "hi".into(), rid: 99 }));
+        // Absent rid is 0, so an older phone still works — it simply cannot tell
+        // two answers apart, which is what it does today anyway.
+        let decoded = decode_frame(br#"{"t":"input","sid":3,"text":"hi"}"#);
+        assert_eq!(decoded, Ok(PhoneMsg::Input { sid: 3, text: "hi".into(), rid: 0 }));
+        assert_eq!(v(&BridgeMsg::input_ok(99, 3))["rid"], json!(99));
+    }
+
+    #[test]
+    fn the_wire_types_are_exactly_the_contract() {
         // The EXHAUSTIVE match is the guard: adding a bridge→phone message type
-        // stops this test compiling, so v0's read-only promise cannot be broken
-        // by quietly growing the enum. It also pins every serde tag at once — a
-        // `rename_all` surprise on any variant lands here rather than on a phone.
+        // stops this test compiling, so the set a phone must handle cannot grow
+        // by accident. It also pins every serde tag at once — a `rename_all`
+        // surprise on any variant lands here rather than on a phone.
+        //
+        // UPDATED DELIBERATELY when `input_result` was added: this is the answer
+        // to an input attempt, and it is listed because a phone that can type has
+        // to be told what happened. Adding one here is a protocol decision, which
+        // is exactly why it has to be typed out by hand.
         fn tag(m: &BridgeMsg) -> &'static str {
             match m {
                 BridgeMsg::HelloOk { .. } => "hello_ok",
@@ -410,6 +564,7 @@ mod tests {
                 BridgeMsg::Session { .. } => "session",
                 BridgeMsg::Gone { .. } => "gone",
                 BridgeMsg::Pong => "pong",
+                BridgeMsg::InputResult { .. } => "input_result",
                 BridgeMsg::Err { .. } => "err",
             }
         }
@@ -429,6 +584,7 @@ mod tests {
             },
             BridgeMsg::Gone { epoch: "e".into(), sid: 1 },
             BridgeMsg::Pong,
+            BridgeMsg::input_ok(1, 1),
             BridgeMsg::err("c", "m"),
         ];
         let mut seen: Vec<&str> = Vec::new();
@@ -439,27 +595,39 @@ mod tests {
         seen.sort_unstable();
         assert_eq!(
             seen,
-            ["err", "gone", "hello_err", "hello_ok", "pong", "session", "sessions"]
+            [
+                "err",
+                "gone",
+                "hello_err",
+                "hello_ok",
+                "input_result",
+                "pong",
+                "session",
+                "sessions"
+            ]
         );
-        assert!(!Caps::v0().input, "v0 advertises no input channel…");
+        assert!(Caps::v0().input, "the composer flag the iOS app reads went dark");
     }
 
     #[test]
-    fn the_phone_can_say_exactly_two_things() {
-        // …and there is no inbound type for it to use if it tried. Same
-        // exhaustive-match guard, pointed the other way down the wire.
+    fn the_phone_can_say_exactly_these_things() {
+        // The same exhaustive-match guard, pointed the other way down the wire.
         fn tag(m: &PhoneMsg) -> &'static str {
             match m {
                 PhoneMsg::Hello { .. } => "hello",
                 PhoneMsg::Ping => "ping",
+                PhoneMsg::Input { .. } => "input",
+                PhoneMsg::Key { .. } => "key",
                 PhoneMsg::Unknown => "<unknown>",
             }
         }
-        assert_eq!(tag(&decode_frame(br#"{"t":"hello","proto":1,"token":"k"}"#).unwrap()), "hello");
+        assert_eq!(tag(&decode_frame(br#"{"t":"hello","proto":2,"token":"k"}"#).unwrap()), "hello");
         assert_eq!(tag(&decode_frame(br#"{"t":"ping"}"#).unwrap()), "ping");
-        // Anything a future phone invents — including an input message — lands
-        // in `Unknown`, which the server answers with `err`. It is never a verb.
-        assert_eq!(tag(&decode_frame(br#"{"t":"input","text":"hi"}"#).unwrap()), "<unknown>");
+        assert_eq!(tag(&decode_frame(br#"{"t":"input","sid":1,"text":"hi"}"#).unwrap()), "input");
+        assert_eq!(tag(&decode_frame(br#"{"t":"key","sid":1,"key":"enter"}"#).unwrap()), "key");
+        // Anything a future phone invents still lands in `Unknown`, which the
+        // server answers with `err` rather than a disconnect.
+        assert_eq!(tag(&decode_frame(br#"{"t":"approve","sid":1}"#).unwrap()), "<unknown>");
     }
 
     // ---- phone → bridge parsing ----
@@ -477,8 +645,61 @@ mod tests {
     fn an_unknown_type_parses_as_unknown_rather_than_failing() {
         // The whole no-lockstep story: a `t` from a NEWER phone is a value we can
         // answer, not a parse error that would look like a broken client.
-        assert_eq!(decode_frame(br#"{"t":"input","text":"hi"}"#), Ok(PhoneMsg::Unknown));
+        assert_eq!(decode_frame(br#"{"t":"approve","sid":1}"#), Ok(PhoneMsg::Unknown));
         assert_eq!(decode_frame(br#"{"t":"whatever"}"#), Ok(PhoneMsg::Unknown));
+    }
+
+    #[test]
+    fn an_input_frame_parses() {
+        assert_eq!(
+            decode_frame(br#"{"t":"input","sid":7,"text":"run the tests"}"#),
+            Ok(PhoneMsg::Input { sid: 7, text: "run the tests".into(), rid: 0 })
+        );
+        // Text is carried verbatim — newlines and all. Nothing here decides that
+        // a newline means "submit"; `key` is how a phone submits, so a pasted
+        // paragraph cannot become N accidental turns.
+        assert_eq!(
+            decode_frame(br#"{"t":"input","sid":7,"text":"a\nb"}"#),
+            Ok(PhoneMsg::Input { sid: 7, text: "a\nb".into(), rid: 0 })
+        );
+    }
+
+    #[test]
+    fn every_key_name_parses_to_the_daemons_word_for_it() {
+        for (name, daemon) in [
+            ("enter", PhoneKey::Enter),
+            ("escape", PhoneKey::Escape),
+            ("up", PhoneKey::Up),
+            ("down", PhoneKey::Down),
+            ("tab", PhoneKey::Tab),
+        ] {
+            let frame = format!(r#"{{"t":"key","sid":3,"key":"{name}"}}"#);
+            let Ok(PhoneMsg::Key { sid, key, .. }) = decode_frame(frame.as_bytes()) else {
+                panic!("{name} did not parse as a key frame");
+            };
+            assert_eq!(sid, 3);
+            assert_eq!(key.to_daemon(), Some(daemon), "{name} maps to the wrong key");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_key_name_is_a_value_not_a_parse_failure() {
+        // Rule 2, one level down. A phone one version ahead sending a key this
+        // build has never heard of must leave the loop something to ANSWER: a
+        // deserialize error here would cost the whole frame, and before the
+        // handshake it costs the socket.
+        assert_eq!(
+            decode_frame(br#"{"t":"key","sid":3,"key":"f7"}"#),
+            Ok(PhoneMsg::Key { sid: 3, key: PhoneKeyName::Unknown, rid: 0 })
+        );
+        assert_eq!(PhoneKeyName::Unknown.to_daemon(), None, "an unknown key must not be guessed");
+        // …and it must not be silently coerced to the nearest real key, which
+        // would press something the user never pressed.
+        assert_eq!(
+            decode_frame(br#"{"t":"key","sid":3,"key":"ENTER"}"#),
+            Ok(PhoneMsg::Key { sid: 3, key: PhoneKeyName::Unknown, rid: 0 }),
+            "key names are exact; a case-folded match would be a guess"
+        );
     }
 
     #[test]
@@ -561,6 +782,22 @@ mod tests {
             i.kind = kind;
             let s = WireSession::from(&i);
             assert_eq!(serde_json::to_value(s.cli).unwrap(), json!(expect));
+        }
+    }
+
+    #[test]
+    fn can_input_is_false_for_a_shell_and_true_for_the_agents() {
+        // The courtesy flag, pinned against the rule the DAEMON enforces: a shell
+        // is arbitrary command execution, so typing into one from a phone is
+        // remote code execution as the user. This value only greys the composer
+        // out early — but if it ever said `true` for a shell, every phone would
+        // offer a box for exactly the input that is about to be refused.
+        for (kind, expect) in
+            [(CliKind::Claude, true), (CliKind::Codex, true), (CliKind::Shell, false)]
+        {
+            let mut i = bare_info();
+            i.kind = kind;
+            assert_eq!(WireSession::from(&i).can_input, expect, "wrong can_input for {kind:?}");
         }
     }
 

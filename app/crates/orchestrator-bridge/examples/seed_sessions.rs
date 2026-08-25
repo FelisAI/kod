@@ -8,7 +8,7 @@
 //!   cargo run -p orchestrator-bridge --example seed_sessions -- <socket>
 
 use orchestrator_bridge::client::Client;
-use orchestrator_host::protocol::Command;
+use orchestrator_host::protocol::{ClientRole, Command};
 use std::path::PathBuf;
 
 fn main() {
@@ -24,7 +24,7 @@ fn main() {
         std::process::exit(3);
     }
 
-    let (mut c, _hello) = Client::attach(&sock).expect("attach");
+    let (mut c, _hello) = Client::attach(&sock, ClientRole::Full).expect("attach");
     // Spread across a few project keys so the Projects tab has real categories to
     // group. Keys are synthetic on purpose — a sandbox daemon has no registry to
     // agree with, and hardcoding anyone's actual project paths here would put a

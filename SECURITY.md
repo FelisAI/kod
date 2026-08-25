@@ -61,8 +61,8 @@ stored **in plaintext** in the local store (see below), not the macOS Keychain �
 so don't put long-lived secrets in a profile's env if your disk or backups aren't
 trusted.
 
-**The mobile bridge and its token.** Kod can serve a read-only view of your
-session list to a phone (Settings → Mobile). It is **off by default** and does
+**The mobile bridge and its token.** Kod can serve your session list to a phone,
+and let you answer an agent from it (Settings → Mobile). It is **off by default** and does
 nothing until you turn it on. When you do, Kod mints a 32-byte random bearer
 token — this is the first credential Kod creates *on your behalf* rather than one
 you typed, and it is stored **in plaintext** in the same local store described
@@ -74,11 +74,29 @@ address (100.64.0.0/10) if you choose that. It refuses every other bind — LAN
 addresses and `0.0.0.0` included — because this version authenticates with a
 shared bearer token and has **no TLS**, so any other interface would put that
 token in the clear. Over Tailscale, WireGuard already authenticates the device and
-encrypts the hop. The phone is a **reader**: the protocol carries no input, and
-the server cannot be asked to type into a session.
+encrypts the hop.
 
-One consequence worth stating plainly: the bridge is hosted by Kod's session
-daemon, which outlives the app window. **Closing or quitting Kod does not stop it**
+The phone can **type into claude and codex sessions, never into a shell.** That
+rule is enforced by the daemon, not by the phone and not by the bridge: the phone
+sends only a session id, and the daemon resolves that session's kind from its own
+state before doing anything. It is an allowlist — a session kind added later is
+refused until someone deliberately lists it.
+
+Two further limits sit on top. The bridge runs as a **separate process** that
+attaches to the daemon holding a restricted capability, so it is refused every
+other command outright — including the arbitrary-keystroke path the desktop uses.
+And the text a phone sends is stripped of control characters before it reaches a
+terminal, so the deliberately tiny set of pressable keys (enter, escape, up, down,
+tab) cannot be bypassed by smuggling an escape sequence inside a message.
+
+Shells are excluded because a shell *is* arbitrary command execution: typing into
+one from a phone would be remote code execution as you. claude and codex ask
+before they run anything dangerous, so typing into them is bounded by their own
+gate — the phone can answer a prompt, it cannot start work.
+
+One consequence worth stating plainly: the bridge is a helper process started by
+Kod's session daemon, which outlives the app window. **Closing or quitting Kod
+does not stop it**
 — that is deliberate, since the point is checking your sessions while you are away
 from the Mac, but it means the listener keeps running until you turn it off or the
 daemon exits.

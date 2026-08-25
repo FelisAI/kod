@@ -14,7 +14,7 @@ use std::time::Duration;
 use orchestrator_host::decision::PendingDecision;
 use orchestrator_host::emulator::GridSnapshot;
 use orchestrator_host::input::KeyInput;
-use orchestrator_host::protocol::{
+use orchestrator_host::protocol::{ClientRole, 
     read_frame, write_frame, BridgeStatus, ClientMsg, Command, CommandReply, EventKind,
     ServerEvent, ServerMsg, WIRE_VERSION,
 };
@@ -60,6 +60,10 @@ impl RemoteHost {
             &mut wh,
             &ClientMsg::Hello {
                 wire_version: WIRE_VERSION,
+                // The desktop app. It spawns, closes and types into shells, so it
+                // holds every capability — and it reaches the daemon over a unix
+                // socket in a 0700 directory, not over a network.
+                role: ClientRole::Full,
             },
         )?;
 

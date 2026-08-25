@@ -1,9 +1,13 @@
 # Kod Remote (iOS)
 
-A mini Kod for the phone: **Standup · Projects · Session**. It answers "does
-anything need me?" — it is not a terminal. `caps.input` is `false` in v0 and the
-Session tab is a reader, because an 80x24 grid on a 390pt screen is unreadable
-and a PTY is the wrong thing to put behind a lock screen.
+A mini Kod for the phone: **Standup · Projects · Session**. It answers "does anything need me?", and lets you answer back.
+
+It is still not a terminal: an 80x24 grid on a 390pt screen is unreadable, and a
+PTY is the wrong thing to put behind a lock screen. The Session tab is a reader
+with a composer — you can type into **claude and codex** sessions and press
+enter/escape/up/down/tab, which is what answering a permission prompt needs. You
+cannot type into a **shell**, cannot spawn anything, and cannot close anything.
+The daemon enforces all of that; see SECURITY.md.
 
 ## Shape
 

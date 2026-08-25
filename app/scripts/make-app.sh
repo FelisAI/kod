@@ -1,17 +1,22 @@
 #!/bin/sh
 # Assemble Kod.app (dev bundle) so macOS shows the app icon in the dock.
-# Copies BOTH binaries: the GUI resolves orchestrator-daemon as a SIBLING
-# of its own executable (daemon lib.rs daemon_binary()).
+# Copies ALL THREE binaries. Both helpers are resolved as SIBLINGS of the
+# executable that starts them: the GUI finds orchestrator-daemon next to itself,
+# and the daemon finds kod-bridge next to ITSELF (daemon bridge.rs
+# bridge_binary()). Miss kod-bridge and Settings -> Mobile fails only on a real
+# install, never in a dev build, which is the worst way to find out.
 set -e
 cd "$(dirname "$0")/.."
 PROFILE="${1:-debug}"
-if [ "$PROFILE" = "release" ]; then cargo build --release -p orchestrator-gui -p orchestrator-daemon
-else cargo build -p orchestrator-gui -p orchestrator-daemon; fi
+BINS="-p orchestrator-gui -p orchestrator-daemon -p orchestrator-bridge"
+if [ "$PROFILE" = "release" ]; then cargo build --release $BINS
+else cargo build $BINS; fi
 APP="../Kod.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/$PROFILE/orchestrator" "$APP/Contents/MacOS/kod"
 cp "target/$PROFILE/orchestrator-daemon" "$APP/Contents/MacOS/orchestrator-daemon"
+cp "target/$PROFILE/kod-bridge" "$APP/Contents/MacOS/kod-bridge"
 if [ -f assets/kod.icns ]; then
   cp assets/kod.icns "$APP/Contents/Resources/kod.icns"
 else

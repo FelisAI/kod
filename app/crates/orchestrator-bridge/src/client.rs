@@ -40,7 +40,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::SystemTime;
 
-use orchestrator_host::protocol::{
+use orchestrator_host::protocol::{ClientRole, 
     read_frame, write_frame, ClientMsg, Command, ServerMsg, WIRE_VERSION,
 };
 
@@ -88,13 +88,20 @@ impl Client {
     /// Returns the initial session list from `Welcome`. The caller should then
     /// pump [`Client::next`] until `ReplayDone` to receive the opening grid per
     /// session, exactly as the desktop GUI does.
-    pub fn attach(path: &Path) -> Result<(Self, ServerMsg), AttachError> {
+    /// `role` is REQUIRED rather than defaulted, because the safe value and the
+    /// convenient value are different ones. A default of `Full` would silently
+    /// hand every future caller — including the network-facing bridge — the
+    /// ability to spawn shells and inject arbitrary keystrokes; a default of
+    /// `Phone` would quietly break the desktop. Making the caller say it means
+    /// the decision is visible at every attach site in the tree.
+    pub fn attach(path: &Path, role: ClientRole) -> Result<(Self, ServerMsg), AttachError> {
         let mut stream = UnixStream::connect(path)?;
         // The ONLY version we ever announce. See the module note.
         write_frame(
             &mut stream,
             &ClientMsg::Hello {
                 wire_version: WIRE_VERSION,
+                role,
             },
         )?;
         let first: ServerMsg = read_frame(&mut stream)?;

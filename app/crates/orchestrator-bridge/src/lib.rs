@@ -16,7 +16,12 @@
 //! one that attaches to a real daemon, and a wrong attach RETIRES it (see
 //! [`client`]).
 //!
-//! v0 is READ-ONLY end to end. The phone can watch; it cannot type.
+//! The phone can watch every session, and can TYPE into claude and codex
+//! sessions — never into a shell. That last rule is not enforced here and must
+//! not be: this process is the one a network peer talks to, so it attaches as
+//! [`orchestrator_host::protocol::ClientRole::Phone`] and the daemon refuses it
+//! anything else, resolving each session's kind from its own state. Nothing in
+//! this crate can grant a capability; it can only ask, and be told no.
 
 pub mod client;
 pub mod mirror;

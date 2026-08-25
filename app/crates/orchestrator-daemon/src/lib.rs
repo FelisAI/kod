@@ -14,11 +14,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use orchestrator_host::protocol::{
+use orchestrator_host::protocol::{ClientRole, PhoneKey as WirePhoneKey,
     read_frame, write_frame, ClientMsg, Command, CommandReply, EventKind, ServerEvent, ServerMsg,
     WIRE_VERSION,
 };
-use orchestrator_host::session::SessionId;
+use orchestrator_host::input::KeyInput;
+use orchestrator_host::session::{CliKind, SessionId};
 use orchestrator_host::{SessionBackend, SessionHost};
 
 pub mod bridge;
@@ -256,10 +257,11 @@ pub fn run_default() -> io::Result<()> {
     let _ = std::fs::remove_file(&path); // reclaim a stale socket (we hold the lock)
     let listener = UnixListener::bind(&path)?;
     let host = SessionHost::new();
-    // Hand the bridge its feed source. Installed HERE and not in `run()` so the
-    // unit-test entry points never grow a network listener as a side effect.
-    // Nothing starts listening until a GUI pushes a config with `on = true`.
-    bridge::install(Arc::clone(&host));
+    // Tell the bridge supervisor which socket its child should attach back to.
+    // Installed HERE and not in `run()` so the unit-test entry points never grow a
+    // network listener as a side effect. Nothing spawns until a GUI pushes a
+    // config with `on = true`.
+    bridge::install(path.clone());
     // Detached sweep (1s): with no client attached, nothing else observes the
     // sessions — this keeps phase_since stamps TRUE across walk-away gaps
     // (design critique #4) and runs the dirty-gated reconcile/trouble scans.
@@ -346,11 +348,32 @@ pub fn serve_client(stream: UnixStream, host: Arc<SessionHost>) -> io::Result<bo
             return Ok(false);
         }
     };
-    let client_wire = match &hello {
-        ClientMsg::Hello { wire_version } => *wire_version,
-        _ => 0, // first frame wasn't a Hello → incompatible; reject + keep serving
+    let (client_wire, role) = match &hello {
+        ClientMsg::Hello { wire_version, role } => (*wire_version, *role),
+        // First frame wasn't a Hello → incompatible; reject + keep serving. The
+        // role here is never used (the gate below rejects), but it must be the
+        // LEAST privileged value regardless: "we could not understand you" must
+        // never be a path to full capability.
+        _ => (0, ClientRole::Phone),
     };
-    match attach_gate(client_wire, WIRE_VERSION, binary_was_rebuilt()) {
+    // A PHONE connection must never be able to retire this daemon.
+    //
+    // Retiring exists so a NEWER desktop app can replace an outdated daemon and
+    // respawn it. The mobile bridge is not that: it is a child this daemon starts,
+    // pointed at this daemon's own socket. Leave the general rule in place and the
+    // daemon kills itself the moment it launches its own bridge, because
+    // `binary_was_rebuilt()` is true for the whole life of any daemon whose binary
+    // was rebuilt under it — which in development is most of them. Every live PTY
+    // dies with it, caused by nothing but turning the feature on.
+    //
+    // A mismatched phone is refused instead: it gets VersionMismatch, its socket
+    // closes, and the daemon keeps serving. Downgrade, not bypass — the version
+    // check still runs, only the CONSEQUENCE changes.
+    let gate = match attach_gate(client_wire, WIRE_VERSION, binary_was_rebuilt()) {
+        AttachGate::Retire if role == ClientRole::Phone => AttachGate::Reject,
+        g => g,
+    };
+    match gate {
         AttachGate::Accept => {}
         gate => {
             let _ = tx.send(ServerMsg::VersionMismatch {
@@ -408,7 +431,9 @@ pub fn serve_client(stream: UnixStream, host: Arc<SessionHost>) -> io::Result<bo
             // isolate a panicking verb so one bad command can't crash the daemon
             // and kill every other session (review #5).
             let reply =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&host, command)))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch_checked(&host, role, command)
+                }))
                     .unwrap_or_else(|_| CommandReply::Error("command panicked".into()));
             let _ = tx.send(ServerMsg::Reply { request_id, reply });
             if is_quit {
@@ -559,6 +584,85 @@ fn send_event(
     }));
 }
 
+/// The capability gate. EVERY command from EVERY connection passes through here.
+///
+/// Two independent checks, in this order:
+///
+/// 1. Does this connection's role permit the command at all? `ClientRole::may` is
+///    an allowlist, so a command added later is refused to phones until someone
+///    deliberately lists it.
+/// 2. For the two phone commands, is the target actually an agent session? The
+///    phone sends only a `SessionId`; the KIND is resolved here, from the
+///    daemon's own `infos()`. That is the point — a phone cannot claim a shell is
+///    a claude session, because it never gets to say what the session is.
+///
+/// Shells are refused because a shell IS arbitrary command execution: typing into
+/// one is remote code execution as the user. claude and codex ask before they run
+/// anything dangerous, so typing into them is bounded by their own gate.
+fn dispatch_checked(host: &SessionHost, role: ClientRole, cmd: Command) -> CommandReply {
+    if !role.may(&cmd) {
+        return CommandReply::Error("this connection is not permitted that command".into());
+    }
+    if let Command::PhoneInput { id, .. } | Command::PhoneKey { id, .. } = &cmd {
+        match host.infos().iter().find(|i| i.id == *id) {
+            None => return CommandReply::Error("that session is gone".into()),
+            Some(i) if !i.alive => {
+                return CommandReply::Error("that session has ended".into())
+            }
+            // ALLOWLIST, matching the role gate above. `!= Shell` would mean a
+            // CliKind added later is typeable from a phone by default, which is
+            // exactly the wrong direction for the one rule this feature promises.
+            Some(i) if !matches!(i.kind, CliKind::Claude | CliKind::Codex) => {
+                return CommandReply::Error(
+                    "Kod only lets a phone type into claude and codex sessions, never into \
+                     a shell."
+                        .into(),
+                )
+            }
+            Some(_) => {}
+        }
+    }
+    dispatch(host, cmd)
+}
+
+/// The longest thing a phone may type at once.
+///
+/// Not a guess about typing speed — a bound on what one WebSocket frame can push
+/// into a PTY. Without it a peer holding the token can shove megabytes at a
+/// terminal emulator in a single ask.
+const PHONE_TEXT_MAX: usize = 8 * 1024;
+
+/// Reduce a phone's text to TEXT.
+///
+/// This is the other half of the key allowlist, and without it that allowlist is
+/// decorative. `PhoneKey` deliberately offers exactly five keys — but the text
+/// verb was handing its bytes straight to `KeyInput::Paste`, so a peer could put
+/// `\x1b` (escape, hence any CSI sequence), `\x03` (interrupt) or `\r` inside
+/// `text` and press whatever it liked. Found in review, not by the tests.
+///
+/// So: control characters are removed, and that includes newlines. A newline in a
+/// terminal is not text, it is SUBMIT — a multi-line paste into an agent that has
+/// not enabled bracketed paste becomes N submissions rather than one. Submitting
+/// is `PhoneKey::Enter`, which is explicit, allowlisted, and visible in the phone
+/// UI as its own control. Keeping the two verbs from doing each other's job is
+/// what makes either of them reviewable.
+fn phone_text(text: &str) -> Result<String, String> {
+    if text.len() > PHONE_TEXT_MAX {
+        return Err(format!(
+            "that message is too long to send from a phone ({} characters; the limit is {}).",
+            text.chars().count(),
+            PHONE_TEXT_MAX
+        ));
+    }
+    // `char::is_control` covers C0, DEL and C1 — everything a keyboard cannot
+    // produce but a crafted frame can.
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.trim().is_empty() && !text.is_empty() {
+        return Err("that message was only control characters, so there was nothing to type.".into());
+    }
+    Ok(clean)
+}
+
 fn dispatch(host: &SessionHost, cmd: Command) -> CommandReply {
     match cmd {
         // The bridge supervisor is a process global installed by `run_default`,
@@ -573,6 +677,35 @@ fn dispatch(host: &SessionHost, cmd: Command) -> CommandReply {
             token,
         } => CommandReply::Bridge(bridge::apply(on, port, &bind, &token)),
         Command::BridgeStatus => CommandReply::Bridge(bridge::status()),
+        // Reached ONLY through `dispatch_checked`, which has already proved the
+        // role may type and the target is a live agent session. Paste, not a
+        // per-character loop: a phone sends a whole composed prompt, and claude's
+        // TUI treats a bracketed paste as one edit rather than N keystrokes that
+        // could each trigger its own autocomplete.
+        Command::PhoneInput { id, text } => match phone_text(&text) {
+            Ok(clean) => {
+                host.send_key(id, &KeyInput::Paste(clean));
+                CommandReply::Ok
+            }
+            Err(e) => CommandReply::Error(e),
+        },
+        Command::PhoneClients { n } => {
+            bridge::note_clients(n);
+            CommandReply::Ok
+        }
+        Command::PhoneKey { id, key } => {
+            host.send_key(
+                id,
+                &match key {
+                    WirePhoneKey::Enter => KeyInput::Enter,
+                    WirePhoneKey::Escape => KeyInput::Escape,
+                    WirePhoneKey::Up => KeyInput::Up,
+                    WirePhoneKey::Down => KeyInput::Down,
+                    WirePhoneKey::Tab => KeyInput::Tab,
+                },
+            );
+            CommandReply::Ok
+        }
         Command::SpawnClaude { project_slug, spec } => {
             match host.spawn_claude(project_slug, spec) {
                 Ok((id, cli)) => CommandReply::Spawned {
@@ -717,6 +850,7 @@ mod tests {
             &mut c,
             &ClientMsg::Hello {
                 wire_version: WIRE_VERSION,
+                role: ClientRole::Full,
             },
         )
         .unwrap();
@@ -835,6 +969,7 @@ mod tests {
             &mut c,
             &ClientMsg::Hello {
                 wire_version: WIRE_VERSION + 1,
+                role: ClientRole::Full,
             },
         )
         .unwrap();
@@ -858,6 +993,7 @@ mod tests {
             &mut c,
             &ClientMsg::Hello {
                 wire_version: WIRE_VERSION - 1,
+                role: ClientRole::Full,
             },
         )
         .unwrap();
@@ -884,6 +1020,7 @@ mod tests {
             &mut c,
             &ClientMsg::Hello {
                 wire_version: WIRE_VERSION,
+                role: ClientRole::Full,
             },
         )
         .unwrap();
@@ -897,5 +1034,222 @@ mod tests {
         .unwrap();
         let quit = st.join().unwrap();
         assert!(quit, "Quit did not signal shutdown");
+    }
+}
+
+#[cfg(test)]
+mod phone_capability_tests {
+    use super::*;
+
+    fn err_text(r: &CommandReply) -> String {
+        match r {
+            CommandReply::Error(e) => e.clone(),
+            other => panic!("expected an Error reply, got {other:?}"),
+        }
+    }
+
+    /// THE security property of the whole mobile feature.
+    ///
+    /// A shell is arbitrary command execution; typing into one from a phone is
+    /// remote code execution as the user. The refusal is made HERE, against the
+    /// daemon's own view of the session, precisely because the phone supplies only
+    /// an id — it never gets to say what kind of session it is typing into, so it
+    /// cannot lie its way past this.
+    #[test]
+    fn a_phone_cannot_type_into_a_shell() {
+        let host = SessionHost::new();
+        let id = host.spawn_shell("t", std::env::temp_dir()).expect("spawn");
+
+        let reply = dispatch_checked(
+            &host,
+            ClientRole::Phone,
+            Command::PhoneInput { id, text: "rm -rf /".into() },
+        );
+        let e = err_text(&reply);
+        assert!(e.contains("shell"), "the refusal must say why: {e}");
+
+        // …and neither can a key press, which is the same hole with a smaller
+        // payload (Enter alone submits whatever is already on the command line).
+        let reply = dispatch_checked(
+            &host,
+            ClientRole::Phone,
+            Command::PhoneKey { id, key: WirePhoneKey::Enter },
+        );
+        assert!(err_text(&reply).contains("shell"));
+    }
+
+    /// The role gate is the OUTER wall: even a bridge that constructed the
+    /// desktop's own command must not get through, so the shell check is never
+    /// the only thing standing between a network peer and a PTY.
+    #[test]
+    fn a_phone_cannot_reach_the_desktops_commands_at_all() {
+        let host = SessionHost::new();
+        let id = host.spawn_shell("t", std::env::temp_dir()).expect("spawn");
+
+        let reply = dispatch_checked(
+            &host,
+            ClientRole::Phone,
+            Command::SendKey { id, key: KeyInput::Paste("rm -rf /".into()) },
+        );
+        assert!(err_text(&reply).contains("not permitted"));
+
+        let reply = dispatch_checked(
+            &host,
+            ClientRole::Phone,
+            Command::SpawnShell {
+                project_slug: "t".into(),
+                cwd: std::env::temp_dir(),
+            },
+        );
+        assert!(err_text(&reply).contains("not permitted"));
+    }
+
+    /// The desktop must be completely unaffected by all of the above — it types
+    /// into shells constantly, and that is the normal case.
+    #[test]
+    fn the_desktop_still_types_into_shells() {
+        let host = SessionHost::new();
+        let id = host.spawn_shell("t", std::env::temp_dir()).expect("spawn");
+        let reply = dispatch_checked(
+            &host,
+            ClientRole::Full,
+            Command::SendKey { id, key: KeyInput::Paste("echo hi".into()) },
+        );
+        assert!(
+            !matches!(reply, CommandReply::Error(_)),
+            "the desktop lost a capability it had before: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn typing_at_a_session_that_is_gone_says_so_rather_than_panicking() {
+        let host = SessionHost::new();
+        let reply = dispatch_checked(
+            &host,
+            ClientRole::Phone,
+            Command::PhoneInput { id: SessionId(9999), text: "hi".into() },
+        );
+        assert!(err_text(&reply).contains("gone"));
+    }
+}
+
+#[cfg(test)]
+mod phone_never_retires_tests {
+    use super::*;
+
+    /// The daemon spawns the mobile bridge as its own child, pointed at its own
+    /// socket. If a phone-role attach could retire, enabling the feature would be
+    /// a way to kill every live session — and in development, where the binary is
+    /// rebuilt under a running daemon constantly, it would do so every time.
+    #[test]
+    fn a_rebuilt_binary_retires_for_the_desktop_but_not_for_a_phone() {
+        // Same inputs, same version, same rebuilt flag: only the role differs.
+        let raw = attach_gate(WIRE_VERSION, WIRE_VERSION, true);
+        assert_eq!(raw, AttachGate::Retire, "precondition: this case DOES retire");
+
+        let for_phone = match raw {
+            AttachGate::Retire => AttachGate::Reject,
+            g => g,
+        };
+        assert_eq!(
+            for_phone,
+            AttachGate::Reject,
+            "a phone must be turned away, never allowed to take the daemon down with it"
+        );
+    }
+
+    /// The downgrade must not become a bypass: a phone on the wrong wire version
+    /// still gets refused, it just does not take the daemon with it.
+    #[test]
+    fn a_mismatched_phone_is_still_refused() {
+        assert_ne!(
+            attach_gate(WIRE_VERSION - 1, WIRE_VERSION, false),
+            AttachGate::Accept,
+            "an outdated client of any role must not be accepted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phone_text_tests {
+    use super::{phone_text, PHONE_TEXT_MAX};
+
+    /// The allowlist of five keys is only meaningful if the TEXT verb cannot
+    /// press keys. Every one of these is a control sequence a phone keyboard
+    /// cannot produce and a crafted frame can.
+    #[test]
+    fn control_characters_never_reach_the_terminal() {
+        // ESC opens every CSI sequence there is — arrow keys, mode switches,
+        // anything the emulator understands.
+        assert_eq!(phone_text("a\x1b[Db").unwrap(), "a[Db");
+        // Ctrl-C.
+        assert_eq!(phone_text("run\x03").unwrap(), "run");
+        // CR and LF are SUBMIT in a terminal, not text: a three-line paste would
+        // otherwise be three submissions.
+        assert_eq!(phone_text("one\ntwo\r\nthree").unwrap(), "onetwothree");
+        assert_eq!(phone_text("tab\there").unwrap(), "tabhere");
+    }
+
+    #[test]
+    fn ordinary_prose_including_non_ascii_is_untouched() {
+        for s in ["fix the flaky test", "let's ship it — 今天", "emoji 🐈 fine", ""] {
+            assert_eq!(phone_text(s).unwrap(), s, "mangled ordinary text: {s:?}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_message_is_refused_rather_than_truncated() {
+        // Truncating would silently send something the user did not write.
+        let big = "x".repeat(PHONE_TEXT_MAX + 1);
+        let e = phone_text(&big).unwrap_err();
+        assert!(e.contains("too long"), "the refusal must say why: {e}");
+        assert!(phone_text(&"x".repeat(PHONE_TEXT_MAX)).is_ok(), "the limit itself must pass");
+    }
+
+    #[test]
+    fn a_message_that_was_only_control_characters_is_refused_not_silently_empty() {
+        // Sending "" to a PTY is a no-op, so without this the user would watch
+        // their input disappear with an OK.
+        assert!(phone_text("\x1b\x03\r\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod refusal_wording_tests {
+    use super::*;
+
+    /// Every one of these sentences is forwarded by the bridge and rendered on a
+    /// phone as-is, so a run of whitespace is a visible defect on someone's
+    /// screen. This exists because the shell refusal shipped with 22 literal
+    /// spaces in the middle of it: a multi-line Rust string keeps the newline AND
+    /// the source indentation unless the line ends in a backslash, and no test
+    /// that only checks `is_err()` can see that.
+    #[test]
+    fn what_the_phone_is_told_reads_as_a_sentence() {
+        let host = SessionHost::new();
+        let id = host.spawn_shell("t", std::env::temp_dir()).expect("spawn");
+
+        let mut seen = 0;
+        for cmd in [
+            Command::PhoneInput { id, text: "hi".into() },
+            Command::PhoneKey { id, key: WirePhoneKey::Enter },
+            Command::PhoneInput { id: SessionId(9999), text: "hi".into() },
+            Command::SendKey { id, key: KeyInput::Paste("x".into()) },
+            Command::PhoneInput { id, text: "\x1b\x03".into() },
+            Command::PhoneInput { id, text: "x".repeat(PHONE_TEXT_MAX + 1) },
+        ] {
+            if let CommandReply::Error(e) = dispatch_checked(&host, ClientRole::Phone, cmd) {
+                seen += 1;
+                assert!(!e.contains("  "), "double space in a phone-facing refusal: {e:?}");
+                assert!(!e.contains('\n'), "newline in a phone-facing refusal: {e:?}");
+                assert!(
+                    e.chars().next().is_some_and(|c| c.is_uppercase() || c == '"')
+                        || e.starts_with("that")
+                        || e.starts_with("this"),
+                    "refusal does not read as a sentence: {e:?}"
+                );
+            }
+        }
+        assert!(seen >= 4, "expected several refusals to inspect, saw {seen}");
     }
 }
