@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/orchestrator-core", "crates/orchestrator-host", "crates/orchestrator-store", "crates/orchestrator-daemon", "crates/orchestrator-gui"]
+members = ["crates/orchestrator-core", "crates/orchestrator-host", "crates/orchestrator-store", "crates/orchestrator-daemon", "crates/orchestrator-gui", "crates/orchestrator-bridge"]
 
 # The real app (not a spike). Native Rust + GPUI, Focused Dark.
 # Built on permissive primitives only (gpui Apache-2.0, alacritty Apache-2.0, portable-pty MIT).
@@ -14,6 +14,7 @@ repository = "https://github.com/FelisAI/kod"
 [workspace.dependencies]
 orchestrator-core = { path = "crates/orchestrator-core" }
 orchestrator-host = { path = "crates/orchestrator-host" }
+orchestrator-bridge = { path = "crates/orchestrator-bridge" }
 orchestrator-store = { path = "crates/orchestrator-store" }
 orchestrator-daemon = { path = "crates/orchestrator-daemon" }
 rusqlite = { version = "0.31", features = ["bundled"] }

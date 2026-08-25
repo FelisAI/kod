@@ -15,6 +15,7 @@ use crate::decision::PendingDecision;
 use crate::emulator::GridSnapshot;
 use crate::ingress::{HookIngress, HookMessage};
 use crate::input::KeyInput;
+use crate::protocol::BridgeStatus;
 use crate::pty::SpawnSpec;
 use crate::session::{CliKind, HostedSession, SessionId};
 
@@ -721,6 +722,22 @@ pub trait SessionBackend: Send + Sync {
     /// over the wire; the in-process `SessionHost` caches it. The daemon is
     /// storage-free, so the GUI is the source of truth and re-pushes on attach.
     fn set_auto_continue(&self, _on: bool, _fire_on_reset: bool) {}
+    /// Configure the mobile bridge and report what it did (docs/020 mobile).
+    /// DEFAULTED to `unavailable` — and `SessionHost` deliberately does NOT
+    /// override it. The bridge is an ordinary daemon CLIENT: it already depends on
+    /// this crate for the protocol types, so hosting it inside `SessionHost` would
+    /// mean orchestrator-host → bridge → orchestrator-host, a crate cycle rustc
+    /// rejects outright. Only the DAEMON can own the bridge; `RemoteHost` forwards
+    /// there over the socket, and a GUI running in-process (local mode) honestly
+    /// answers "no bridge here" rather than pretending.
+    fn set_bridge(&self, _on: bool, _port: u16, _bind: &str, _token: &str) -> BridgeStatus {
+        BridgeStatus::unavailable("no daemon: the bridge is hosted by the daemon, not in-process")
+    }
+    /// Poll the bridge. DEFAULTED for the same reason as
+    /// [`SessionBackend::set_bridge`] — an in-process backend has none to poll.
+    fn bridge_status(&self) -> BridgeStatus {
+        BridgeStatus::unavailable("no daemon: the bridge is hosted by the daemon, not in-process")
+    }
 }
 
 /// Local (in-process) backend — forwards to the inherent `SessionHost` verbs.

@@ -61,9 +61,35 @@ stored **in plaintext** in the local store (see below), not the macOS Keychain �
 so don't put long-lived secrets in a profile's env if your disk or backups aren't
 trusted.
 
+**The mobile bridge and its token.** Kod can serve a read-only view of your
+session list to a phone (Settings → Mobile). It is **off by default** and does
+nothing until you turn it on. When you do, Kod mints a 32-byte random bearer
+token — this is the first credential Kod creates *on your behalf* rather than one
+you typed, and it is stored **in plaintext** in the same local store described
+below. Anyone who can read that file, or read the token off your screen, can read
+every project name, session title and last-message line until you regenerate it.
+
+The listener always binds loopback, and additionally binds **one** Tailscale
+address (100.64.0.0/10) if you choose that. It refuses every other bind — LAN
+addresses and `0.0.0.0` included — because this version authenticates with a
+shared bearer token and has **no TLS**, so any other interface would put that
+token in the clear. Over Tailscale, WireGuard already authenticates the device and
+encrypts the hop. The phone is a **reader**: the protocol carries no input, and
+the server cannot be asked to type into a session.
+
+One consequence worth stating plainly: the bridge is hosted by Kod's session
+daemon, which outlives the app window. **Closing or quitting Kod does not stop it**
+— that is deliberate, since the point is checking your sessions while you are away
+from the Mac, but it means the listener keeps running until you turn it off or the
+daemon exits.
+
 **Local session data.** Kod keeps its own state in a SQLite database at
 `~/Library/Application Support/orchestrator/store.db` — projects, session records,
-profiles (including the plaintext profile `env` above), and an activity log. To
+profiles (including the plaintext profile `env` above), the mobile-bridge token
+if you enabled it, and an activity log. Kod tightens this directory to `0700` and
+the database and its `-wal`/`-shm` sidecars to `0600` every time it opens them —
+on older installs these were created world-readable, so the fix is applied on
+every launch rather than only at creation. To
 build summaries and to recover/resume sessions, Kod **reads** the agent CLIs'
 transcripts from their own homes (`~/.claude`, `~/.codex`, or a profile's config
 dir). This data stays on your machine; the only content that leaves is what

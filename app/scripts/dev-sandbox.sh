@@ -139,6 +139,17 @@ if [ "$SNAPSHOT" = 1 ]; then
   # (the ones you actually want to look at) are present. It only reads the source.
   sqlite3 "$REAL_STORE" ".backup '$SBOX_STORE'" || {
     echo "ERROR: snapshot failed" >&2; exit 1; }
+  # The sandbox lives under /Users/Shared by default, which is drwxrwxrwt — so this
+  # copy of your REAL store (every project name, session title and summary line) is
+  # readable by any other account on the Mac unless we lock it down. Measured before
+  # this landed: the copy was 0644 sitting in a world-writable directory.
+  chmod 0700 "$(dirname "$SBOX_STORE")" 2>/dev/null || true
+  chmod 0600 "$SBOX_STORE" "$SBOX_STORE-wal" "$SBOX_STORE-shm" 2>/dev/null || true
+  # Never let a sandbox serve the phone with your real credential. The bridge token
+  # grants remote read of every session, and a snapshot would otherwise clone it into
+  # a second listener you did not know you started.
+  sqlite3 "$SBOX_STORE" \
+    "DELETE FROM app_settings WHERE key IN ('bridge_token','bridge_on');" 2>/dev/null || true
   echo "==> snapshotted your real store -> sandbox ($(du -h "$SBOX_STORE" | cut -f1))"
   # Prove the copy is readable and carries history, before the app opens it.
   sqlite3 "$SBOX_STORE" \

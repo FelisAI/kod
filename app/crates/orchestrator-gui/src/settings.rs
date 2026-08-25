@@ -13,15 +13,17 @@ pub(crate) enum SettingsSection {
     Sessions,
     Automation,
     BackgroundAi,
+    Mobile,
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::General,
         Self::Profiles,
         Self::Sessions,
         Self::Automation,
         Self::BackgroundAi,
+        Self::Mobile,
     ];
 
     /// Stable element-id fragment — also the per-section scroll key, so each
@@ -33,6 +35,7 @@ impl SettingsSection {
             Self::Sessions => "sessions",
             Self::Automation => "automation",
             Self::BackgroundAi => "background-ai",
+            Self::Mobile => "mobile",
         }
     }
 
@@ -45,6 +48,7 @@ impl SettingsSection {
             Self::Sessions => "Sessions",
             Self::Automation => "Automation",
             Self::BackgroundAi => "Background AI",
+            Self::Mobile => "Mobile",
         }
     }
 
@@ -62,6 +66,7 @@ impl SettingsSection {
             Self::BackgroundAi => {
                 "The model Kod calls on its OWN behalf — summaries, Recover previews, map proposals. Never your sessions."
             }
+            Self::Mobile => "Read your sessions from your iPhone, over Tailscale.",
         }
     }
 }
@@ -477,6 +482,7 @@ impl Orchestrator {
             SettingsSection::Sessions => self.render_settings_sessions(cx).into_any_element(),
             SettingsSection::Automation => self.render_settings_automation(cx).into_any_element(),
             SettingsSection::BackgroundAi => self.render_settings_bg_ai(cx).into_any_element(),
+            SettingsSection::Mobile => self.render_settings_mobile(cx).into_any_element(),
         }
     }
 
@@ -862,10 +868,29 @@ impl Orchestrator {
     /// "account default" when empty) with an Edit affordance, OR — while this
     /// key's faux-input is active — the inline_input itself. Reusable: `key` is
     /// the store key, `slot` the inline-input's slot label.
-    fn render_text_setting_row(
+    pub(crate) fn render_text_setting_row(
         &self,
         key: &'static str,
         slot: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Every caller here is a model id, whose unset state genuinely is "whatever
+        // your account defaults to".
+        self.render_text_setting_row_with_empty(key, slot, "account default", cx)
+    }
+
+    /// As above, but the caller names what UNSET means.
+    ///
+    /// The fixed "account default" wording is wrong the moment a non-model key
+    /// reuses this row: the port field shipped reading `account default`, which
+    /// names a concept ports do not have and hides the only number the user needs
+    /// to type into their phone. Seen on the first runtime check of the Mobile
+    /// pane, not reasoned about.
+    pub(crate) fn render_text_setting_row_with_empty(
+        &self,
+        key: &'static str,
+        slot: &'static str,
+        empty_label: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // this key's faux-input is live → render the shared inline editor with
@@ -880,11 +905,7 @@ impl Orchestrator {
             .and_then(|s| s.get_setting(key))
             .unwrap_or_default();
         let is_default = cur.trim().is_empty();
-        let shown = if is_default {
-            "account default".to_string()
-        } else {
-            cur
-        };
+        let shown = if is_default { empty_label.to_string() } else { cur };
         // NOT a `flex_1().min_w_0().truncate()` row with Edit beside it. The value
         // here is a MODEL ID — the only place the stored id is ever shown, and the
         // part an ellipsis eats is the tail, which is the whole identity of a
@@ -929,10 +950,21 @@ impl Orchestrator {
             return;
         };
         let val = edit.buf.trim().to_string();
-        if let Ok(store) = self.store.lock() {
-            let _ = store.set_setting(edit.key, &val);
+        // Branch on the key. This function was written when every inline setting
+        // was a background-prompt model, so it wrote the store and then rebuilt
+        // the prompt config unconditionally. A new key reusing the same faux-input
+        // therefore SAVES correctly and APPLIES nothing: the port would show the
+        // new number while the bridge kept listening on the old one until the next
+        // launch, with nothing on screen to suggest it had not taken effect.
+        match edit.key {
+            "bridge_port" => self.commit_bridge_port(&val, cx),
+            _ => {
+                if let Ok(store) = self.store.lock() {
+                    let _ = store.set_setting(edit.key, &val);
+                }
+                self.reload_prompt_config();
+            }
         }
-        self.reload_prompt_config();
         cx.notify();
     }
 
@@ -1953,7 +1985,7 @@ fn model_presets(provider: extract::PromptProvider) -> &'static [(&'static str, 
 /// reading measure, centered by the window's scroller. 198 rail + 26+26 gutters
 /// + 640 body = 890, so the 900×640 default opens with the column exactly
 /// comfortable and the 720 minimum still shows the rail plus a readable card.
-fn settings_body() -> Div {
+pub(crate) fn settings_body() -> Div {
     div()
         .w_full()
         .max_w(px(640.))
@@ -2041,7 +2073,7 @@ fn cli_kind_from_str(s: &str) -> CliKind {
 /// blocks the modal duplicated (effort / provider / summaries).
 ///
 /// The `label` truncates and the `note` does not, deliberately — see each.
-fn setting_radio_row(
+pub(crate) fn setting_radio_row(
     id: impl Into<SharedString>,
     selected: bool,
     label: impl Into<SharedString>,
@@ -2123,7 +2155,7 @@ fn setting_radio_row(
 /// locked on", not "click to turn off". Toggles now draw a real track+knob
 /// switch, which is unmistakably flippable. Each caller wraps this in a
 /// `settings_section` that names the setting, so `label` carries the state word.
-fn setting_toggle_row(
+pub(crate) fn setting_toggle_row(
     id: impl Into<SharedString>,
     on: bool,
     label: impl Into<SharedString>,
@@ -2194,7 +2226,7 @@ fn setting_toggle_row(
 
 /// A grouped settings section card: a bold `title`, a muted `desc`, then `body`
 /// (the control rows), on a PANEL card so related settings read as one group.
-fn settings_section(
+pub(crate) fn settings_section(
     title: impl Into<SharedString>,
     desc: impl Into<SharedString>,
     body: impl IntoElement,

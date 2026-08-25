@@ -34,6 +34,35 @@ impl AssetSource for Assets {
     }
 }
 
+/// 0700 the store directory and 0600 the database and its WAL sidecars.
+///
+/// Best-effort by design: a store on a filesystem without unix permissions (or one
+/// we do not own) must not stop the app from starting. Failing to launch is a worse
+/// outcome than a permission we could not tighten, and the caller has no better
+/// recovery than we do.
+#[cfg(unix)]
+fn restrict_permissions(dir: &std::path::Path, db: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    for p in [db.to_path_buf(), sidecar(db, "-wal"), sidecar(db, "-shm")] {
+        if p.exists() {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_dir: &std::path::Path, _db: &std::path::Path) {}
+
+/// "…/store.db" + "-wal" -> "…/store.db-wal". Appends to the FILE NAME, which is
+/// how sqlite names them — `with_extension` would eat the ".db" and produce
+/// "store-wal", a file nothing ever writes.
+fn sidecar(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = db.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    db.with_file_name(name)
+}
+
 /// Open (or create) the DESIGN-tree store at the app-support path.
 fn open_store() -> Arc<std::sync::Mutex<Store>> {
     let dir = std::env::var("HOME")
@@ -57,6 +86,15 @@ fn open_store() -> Arc<std::sync::Mutex<Store>> {
     }
     let store =
         Store::open(&path).unwrap_or_else(|_| Store::open_in_memory().expect("in-memory store"));
+    // Tighten permissions on EVERY open, not just at create. Measured before this
+    // landed: the directory was 0755 and store.db 0644 — world-readable — so a
+    // chmod-only-on-create would have left every existing install exposed forever.
+    // The store holds every project name, session title and summary line, and once
+    // the mobile bridge is enabled it also holds a bearer token that grants remote
+    // read of all of it. The -wal/-shm sidecars carry the same pages (the rename
+    // migration above moves them for exactly that reason), so locking the main file
+    // alone would be theatre.
+    restrict_permissions(&dir, &path);
     Arc::new(std::sync::Mutex::new(store))
 }
 
@@ -340,6 +378,51 @@ pub(crate) fn run() {
                         store.lock().ok().and_then(|s| s.get_setting("ac_fire_on_reset")),
                     );
                     host.set_auto_continue(auto_continue, ac_fire_on_reset);
+                    // THE MOBILE BRIDGE (#74). Same contract as auto-continue
+                    // directly above, and load-bearing for the same reason: the
+                    // daemon is storage-free, so it learns the bridge config ONLY
+                    // from an attaching GUI. Without this re-push, a daemon that
+                    // was retired and respawned comes back with no bridge at all
+                    // and the phone goes quiet with nothing on either screen
+                    // saying why. `configured` in the reply is what lets Settings
+                    // tell "the user turned it off" apart from "never told yet".
+                    //
+                    // Absent → OFF. Read with `setting_flag`, NOT the `!= Some("0")`
+                    // idiom used for summaries: `get_setting` ends in `.ok()`, so a
+                    // locked or corrupt DB is indistinguishable from unset, and
+                    // "unset" must never be the state that opens a network listener.
+                    let bridge_on = setting_flag(
+                        store.lock().ok().and_then(|s| s.get_setting("bridge_on")),
+                    );
+                    let bridge_port: u16 = store
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.get_setting("bridge_port"))
+                        .and_then(|v| v.parse().ok())
+                        .filter(|p| *p != 0)
+                        .unwrap_or(orchestrator_bridge::ws::DEFAULT_PORT);
+                    let bridge_bind = store
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.get_setting("bridge_bind"))
+                        .unwrap_or_default();
+                    let bridge_token = store
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.get_setting("bridge_token"))
+                        .unwrap_or_default();
+                    // Never start a bridge with no credential, whatever the flag
+                    // says — an empty token would be refused by `Config::from_parts`
+                    // anyway, and pushing `on` with one produces an error state
+                    // that looks like a bug rather than "you have not paired yet".
+                    let bridge_status = host.set_bridge(
+                        bridge_on && !bridge_token.is_empty(),
+                        bridge_port,
+                        &bridge_bind,
+                        &bridge_token,
+                    );
+                    // One routing probe at boot, never per frame.
+                    let tailnet_ip = crate::bridgecfg::detect_tailnet_ip();
                     // the PROJECTS FOLDER (#29): where "＋ new project" creates a
                     // project's own directory, and the root the scan/fold trust.
                     // Unset → ~/local (what the scan always hardcoded). Mirrored
@@ -359,6 +442,13 @@ pub(crate) fn run() {
                         screen: Screen::Standup,
                         selected: 0,
                         mode: default_workspace_mode(),
+                        bridge_on,
+                        bridge_port,
+                        bridge_bind,
+                        bridge_token,
+                        bridge_status,
+                        bridge_err: None,
+                        tailnet_ip,
                         host,
                         host_mode,
                         term_focus: cx.focus_handle(),
@@ -671,5 +761,31 @@ fn open_settings_window(orch: &Entity<Orchestrator>, cx: &mut App) {
                 cx.notify();
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod store_perm_tests {
+    // Selective imports, NOT `use super::*`: `use gpui::*` at the top of this file
+    // brings gpui's own `test` attribute macro into scope, and a test module that
+    // glob-imports it fails to compile with "recursion limit reached while
+    // expanding `#[test]`". Same trap documented in rail_order.rs.
+    use super::sidecar;
+    use std::path::Path;
+
+    #[test]
+    fn sidecar_appends_to_the_file_name_and_does_not_replace_the_extension() {
+        let db = Path::new("/tmp/orchestrator/store.db");
+        assert_eq!(sidecar(db, "-wal"), Path::new("/tmp/orchestrator/store.db-wal"));
+        assert_eq!(sidecar(db, "-shm"), Path::new("/tmp/orchestrator/store.db-shm"));
+        // The whole reason this is a function rather than `with_extension`: the
+        // suffix sqlite uses starts with '-', and `with_extension("-wal")` REPLACES
+        // ".db" instead of appending, yielding "store.-wal" — a path nothing writes,
+        // so the sidecar would silently keep its old world-readable mode.
+        assert_eq!(db.with_extension("-wal"), Path::new("/tmp/orchestrator/store.-wal"));
+        assert_ne!(sidecar(db, "-wal"), db.with_extension("-wal"));
+        // And a store path with no extension at all must still get its sidecars.
+        let bare = Path::new("/tmp/orchestrator/store");
+        assert_eq!(sidecar(bare, "-wal"), Path::new("/tmp/orchestrator/store-wal"));
     }
 }

@@ -1,0 +1,115 @@
+# Kod for iOS — generated with `xcodegen generate`. NEVER hand-edit Kod.xcodeproj;
+# it is gitignored and rebuilt from this file.
+name: Kod
+options:
+  bundleIdPrefix: pro.felisai
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # The wire client is a single @MainActor actor-hop-free island; Swift 6 strict
+    # checking buys nothing here and would only add ceremony to a 400-line client.
+    SWIFT_STRICT_CONCURRENCY: minimal
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+targets:
+  Kod:
+    type: application
+    platform: iOS
+    sources:
+      - path: Kod
+    info:
+      path: Supporting/Info.plist
+      properties:
+        CFBundleDisplayName: Kod
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # The bridge is a plain ws:// listener on the LAN (loopback in v0), so the
+        # app needs both the ATS exception and the iOS 14+ local-network prompt.
+        NSLocalNetworkUsageDescription: Kod connects to the bridge running on your Mac.
+        # Required, not optional: calling AVCaptureDevice.requestAccess without this
+        # key does not fail — it kills the app on the spot.
+        NSCameraUsageDescription: Kod uses the camera only to scan the pairing code shown on your Mac. Nothing is photographed, saved or sent anywhere.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote
+        PRODUCT_NAME: Kod
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_PREVIEWS: YES
+        CODE_SIGN_STYLE: Automatic
+
+  # Needs a running bridge; skips loudly without one. Not in the Kod scheme's
+  # test action, so `xcodebuild test` stays hermetic — run it explicitly with
+  # `-scheme KodUITests`.
+  KodUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: KodUITests
+    dependencies:
+      - target: Kod
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote.uitests
+        TEST_TARGET_NAME: Kod
+
+  KodTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: KodTests
+    dependencies:
+      - target: Kod
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote.tests
+
+schemes:
+  Kod:
+    build:
+      targets:
+        Kod: all
+        KodTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - KodTests
+
+  # Separate scheme on purpose: the UI tests need a bridge, so they must not be
+  # able to turn a plain `xcodebuild test` red on a machine that has none.
+  KodUITests:
+    build:
+      targets:
+        Kod: all
+        KodUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - KodUITests

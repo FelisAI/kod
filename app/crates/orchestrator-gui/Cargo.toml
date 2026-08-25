@@ -25,6 +25,10 @@ pathfinder_simd.workspace = true
 # the GUI consumes the terminal substrate as a typed API — it never sees
 # alacritty/portable-pty types directly (docs/013 §1).
 orchestrator-host.workspace = true
+# Constants and PURE validators only (DEFAULT_PORT, is_tailnet, Config::from_parts)
+# so the GUI and the daemon can never disagree about what a legal port or bind is.
+# The GUI never runs server code — the daemon hosts the listener.
+orchestrator-bridge.workspace = true
 orchestrator-store.workspace = true
 # the session daemon: connect_or_spawn() + the RemoteHost client (docs/018).
 orchestrator-daemon.workspace = true

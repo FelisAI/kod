@@ -16,4 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 orchestrator-host.workspace = true
+# The bridge is a LEAF the daemon composes, not a peer: bridge -> host, daemon ->
+# host + bridge. No cycle, and the daemon never touches the bridge's own daemon
+# CLIENT (client.rs / retire_risk) — that half belongs to the kod-bridge CLI.
+orchestrator-bridge.workspace = true
 libc.workspace = true

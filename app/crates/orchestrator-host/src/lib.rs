@@ -52,6 +52,7 @@ mod api_hygiene {
         assert_plain::<crate::decision::DecisionView>();
         assert_plain::<crate::events::SessionEvent>();
         assert_plain::<crate::events::SessionEventKind>();
+        assert_plain::<crate::protocol::BridgeStatus>();
     }
 }
 

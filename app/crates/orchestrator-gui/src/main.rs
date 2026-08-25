@@ -26,6 +26,7 @@ use std::sync::atomic::AtomicU64;
 mod agentic;
 mod background;
 mod boot;
+mod bridgecfg;
 mod changeset;
 mod changeset_review;
 mod cmdbar;
@@ -46,6 +47,7 @@ mod pastedrop;
 mod palette;
 mod palette_ops;
 mod projdir;
+mod qr;
 mod rail_order;
 mod ratelimit;
 mod recover;
@@ -59,6 +61,7 @@ mod scan;
 mod search;
 mod session_discovery;
 mod settings;
+mod settings_mobile;
 mod spawn;
 mod standup_plan;
 mod summaries;
@@ -376,6 +379,33 @@ struct Orchestrator {
     /// an in-progress edit of one string-valued setting (Phase 4: a prompt-model
     /// key). Some = its faux-input owns the Settings window's keystream.
     setting_edit: Option<SettingEdit>,
+
+    // ---- the mobile bridge (#74) ----
+    //
+    // Mirrored onto the Orchestrator at boot rather than re-read from the store
+    // per frame. `Store` sits behind ONE non-reentrant mutex with documented
+    // double-lock deadlocks, so a settings pane that locked it on every repaint
+    // would be trading four cheap fields for a real hazard.
+    /// The user's stored choice. NOT the truth about whether anything is
+    /// listening — `bridge_status` is, and it comes from the daemon.
+    bridge_on: bool,
+    bridge_port: u16,
+    /// "" = loopback only; otherwise the literal tailnet address to bind. Exactly
+    /// the `KOD_BRIDGE_BIND` grammar, so `ws::parse_bind` stays the one authority
+    /// and the stored value is copy-pasteable into the CLI.
+    bridge_bind: String,
+    /// The bearer token the phone presents. Minted lazily on first enable, so a
+    /// Kod that never had the bridge on has no credential on disk at all.
+    bridge_token: String,
+    /// What the DAEMON says. Every status line and the pairing card read from
+    /// this, never from the four fields above: those record what was asked for,
+    /// and only this records what actually happened.
+    bridge_status: orchestrator_host::protocol::BridgeStatus,
+    /// A local failure that never reached the daemon (no randomness, store write
+    /// refused). Separate from `bridge_status.error`, which is the daemon's.
+    bridge_err: Option<String>,
+    /// This Mac's Tailscale address, probed once at boot. `None` = Tailscale down.
+    tailnet_ip: Option<std::net::Ipv4Addr>,
     /// The caret for whichever inline field is currently live. ONE, not one
     /// per field: `route_inline_key`'s if/else chain guarantees at most one
     /// editor is open at a time, so a second caret could only ever be stale.

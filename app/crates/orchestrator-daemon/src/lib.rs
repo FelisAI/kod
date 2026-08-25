@@ -21,6 +21,7 @@ use orchestrator_host::protocol::{
 use orchestrator_host::session::SessionId;
 use orchestrator_host::{SessionBackend, SessionHost};
 
+pub mod bridge;
 mod remote;
 pub use remote::RemoteHost;
 
@@ -255,6 +256,10 @@ pub fn run_default() -> io::Result<()> {
     let _ = std::fs::remove_file(&path); // reclaim a stale socket (we hold the lock)
     let listener = UnixListener::bind(&path)?;
     let host = SessionHost::new();
+    // Hand the bridge its feed source. Installed HERE and not in `run()` so the
+    // unit-test entry points never grow a network listener as a side effect.
+    // Nothing starts listening until a GUI pushes a config with `on = true`.
+    bridge::install(Arc::clone(&host));
     // Detached sweep (1s): with no client attached, nothing else observes the
     // sessions — this keeps phase_since stamps TRUE across walk-away gaps
     // (design critique #4) and runs the dirty-gated reconcile/trouble scans.
@@ -556,6 +561,18 @@ fn send_event(
 
 fn dispatch(host: &SessionHost, cmd: Command) -> CommandReply {
     match cmd {
+        // The bridge supervisor is a process global installed by `run_default`,
+        // so these need nothing from `host` and the signature is unchanged. Both
+        // are request/reply on purpose: a bind failure must come back on the same
+        // click that caused it, not arrive later as a status the user has to
+        // notice.
+        Command::SetBridge {
+            on,
+            port,
+            bind,
+            token,
+        } => CommandReply::Bridge(bridge::apply(on, port, &bind, &token)),
+        Command::BridgeStatus => CommandReply::Bridge(bridge::status()),
         Command::SpawnClaude { project_slug, spec } => {
             match host.spawn_claude(project_slug, spec) {
                 Ok((id, cli)) => CommandReply::Spawned {

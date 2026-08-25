@@ -23,7 +23,7 @@ use crate::session::{CliKind, SessionId};
 /// Bumped by hand whenever any wire type below changes shape. The client sends
 /// it in `Hello`; the daemon rejects a mismatch so a freshly-rebuilt GUI never
 /// talks to an incompatible older daemon (docs/018 §13).
-pub const WIRE_VERSION: u32 = 22; // …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset
+pub const WIRE_VERSION: u32 = 23; // …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge
 
 /// Reject absurd frame lengths (a corrupt/foreign peer) before allocating.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -119,6 +119,152 @@ pub enum Command {
         /// GivesUp. Trailing field (positional wire): a conscious add.
         fire_on_reset: bool,
     },
+    /// Configure the mobile bridge the DAEMON hosts (docs/020 mobile) — REQUEST/
+    /// REPLY, answered with [`CommandReply::Bridge`]. `on: false` stops it but
+    /// still records the config, so the reply can say Off rather than
+    /// "never configured". `bind` and `token` stay strings on the wire: the
+    /// daemon owns parsing/validating them and reports a bad one back as
+    /// [`BridgeStatus::error`] instead of the GUI guessing. The daemon is
+    /// storage-free, so the GUI re-pushes this on every attach. Trailing variant
+    /// (positional wire): a safe add.
+    SetBridge {
+        on: bool,
+        port: u16,
+        bind: String,
+        token: String,
+    },
+    /// Poll the daemon-hosted bridge (the settings pane's live line) — request/
+    /// reply. Trailing variant (positional wire): a safe add.
+    BridgeStatus,
+}
+
+/// The daemon-hosted mobile bridge's live state — the whole answer to "how is it
+/// doing", so the GUI never has to infer it from a bare ack.
+///
+/// Plain serde data (lib.rs `public_api_is_plain_data`): it crosses the socket
+/// inside [`CommandReply::Bridge`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BridgeStatus {
+    pub running: bool,
+    /// every URL a phone can actually reach it on (one per bound address).
+    pub endpoints: Vec<String>,
+    /// phones currently connected.
+    pub clients: u32,
+    /// why it is NOT running (bind refused, bad token, …). `None` while healthy.
+    pub error: Option<String>,
+    /// whether this daemon has EVER been told the bridge config. Distinguishes
+    /// "off because the user turned it off" (`configured`) from "this daemon has
+    /// not been told yet" (a fresh or respawned daemon before the GUI attaches
+    /// and re-pushes) — the UI must render those differently (Off vs waiting for
+    /// Kod), and the daemon is storage-free so the second case is REAL, not
+    /// hypothetical.
+    pub configured: bool,
+    /// wall-clock ms when the current running/stopped state was entered (uptime
+    /// chip). 0 = never.
+    pub since_ms: u64,
+}
+
+/// What the UI should actually SAY, derived from the three fields that can
+/// otherwise be combined into a sentence that lies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgePhase {
+    /// Serving. `endpoints` names where.
+    Running,
+    /// Tried and failed, or cannot host one at all. Show the reason verbatim.
+    Failed,
+    /// This daemon has never been told the config — a fresh or respawned daemon
+    /// before the GUI attaches. NOT the same as off, and must not read as off.
+    Waiting,
+    /// Configured, no error, deliberately not running.
+    Off,
+}
+
+impl BridgeStatus {
+    /// "Nothing to report, and here is why" — the answer from a backend that
+    /// cannot host a bridge at all, or when the daemon never answered. Leaves
+    /// `configured` false: an unavailable bridge is exactly the case the UI must
+    /// NOT render as a user-chosen Off.
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            error: Some(reason.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// The precedence rule, in ONE place.
+    ///
+    /// It lives here rather than in the view because there are three independent
+    /// booleans and only four legal readings, and the wrong combination is not a
+    /// cosmetic bug: rendering a daemon that failed to bind as "waiting for Kod"
+    /// tells the user to do nothing when the truth is that their phone will never
+    /// connect. `error` outranks `configured` for exactly that reason.
+    pub fn phase(&self) -> BridgePhase {
+        if self.running {
+            BridgePhase::Running
+        } else if self.error.is_some() {
+            BridgePhase::Failed
+        } else if !self.configured {
+            BridgePhase::Waiting
+        } else {
+            BridgePhase::Off
+        }
+    }
+}
+
+#[cfg(test)]
+mod bridge_status_tests {
+    use super::{BridgePhase, BridgeStatus};
+
+    #[test]
+    fn a_failure_outranks_never_having_been_configured() {
+        // The regression this exists for: `unavailable` leaves `configured` false,
+        // so a naive `if !configured { Waiting }` renders a daemon that could not
+        // bind — or one that is gone — as "waiting for Kod", i.e. as something the
+        // user should simply wait out. They would wait forever.
+        let s = BridgeStatus::unavailable("lost the daemon");
+        assert!(!s.configured);
+        assert_eq!(s.phase(), BridgePhase::Failed);
+    }
+
+    #[test]
+    fn a_configured_bridge_that_failed_to_bind_reads_as_failed_not_off() {
+        let s = BridgeStatus {
+            configured: true,
+            error: Some("port 8787 is already in use".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.phase(), BridgePhase::Failed);
+    }
+
+    #[test]
+    fn the_three_quiet_states_stay_distinguishable() {
+        let fresh = BridgeStatus::default();
+        assert_eq!(fresh.phase(), BridgePhase::Waiting, "a daemon nobody told yet");
+
+        let off = BridgeStatus { configured: true, ..Default::default() };
+        assert_eq!(off.phase(), BridgePhase::Off, "the user turned it off");
+
+        let on = BridgeStatus {
+            configured: true,
+            running: true,
+            endpoints: vec!["127.0.0.1:8787".into()],
+            ..Default::default()
+        };
+        assert_eq!(on.phase(), BridgePhase::Running);
+    }
+
+    #[test]
+    fn running_wins_over_a_stale_error() {
+        // A restart that succeeded after a failure must not keep showing the old
+        // failure — the status line would contradict the phone that is connected.
+        let s = BridgeStatus {
+            configured: true,
+            running: true,
+            error: Some("stale".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.phase(), BridgePhase::Running);
+    }
 }
 
 // ---- daemon → client ----
@@ -189,6 +335,10 @@ pub enum CommandReply {
         matches: Vec<SearchMatch>,
         total: u32,
     },
+    /// the bridge's state — the reply to BOTH `SetBridge` and `BridgeStatus`, so
+    /// a config click and a poll take the same rendering path. Trailing variant
+    /// (positional wire): a safe add.
+    Bridge(BridgeStatus),
 }
 
 // ---- framing: u32-LE length-prefixed bincode ----
@@ -426,6 +576,23 @@ mod tests {
                 request_id: 4,
                 reply: CommandReply::Error("boom".into()),
             },
+            ServerMsg::Reply {
+                request_id: 5,
+                reply: CommandReply::Bridge(BridgeStatus {
+                    running: true,
+                    endpoints: vec!["ws://192.168.1.4:8765".into()],
+                    clients: 2,
+                    error: None,
+                    configured: true,
+                    since_ms: 12_000,
+                }),
+            },
+            // the failed arm too, so BOTH shapes of `error: Option<String>` are
+            // hashed (same reason sample_info() carries the Some arms).
+            ServerMsg::Reply {
+                request_id: 6,
+                reply: CommandReply::Bridge(BridgeStatus::unavailable("bind refused")),
+            },
         ];
         // an Info event per DecisionView variant (and a None) — covers
         // SessionInfo/PendingDecision/DecisionView entirely.
@@ -570,6 +737,19 @@ mod tests {
                 request_id: 19,
                 command: Command::SetAutoContinue { on: true, fire_on_reset: true },
             },
+            ClientMsg::Request {
+                request_id: 20,
+                command: Command::SetBridge {
+                    on: true,
+                    port: 8765,
+                    bind: "lan".into(),
+                    token: "s3cret".into(),
+                },
+            },
+            ClientMsg::Request {
+                request_id: 21,
+                command: Command::BridgeStatus,
+            },
         ];
         let mut bytes = bincode::serialize(&msgs).unwrap();
         bytes.extend(bincode::serialize(&cmds).unwrap());
@@ -589,7 +769,7 @@ mod tests {
     /// the change must be a CONSCIOUS act paired with a WIRE_VERSION bump.
     #[test]
     fn protocol_hash_is_stable() {
-        const PROTOCOL_HASH: u64 = 0xc08f1ea2cebf8361; // WIRE_VERSION 22
+        const PROTOCOL_HASH: u64 = 0xf6fb7b92b02b6c54; // WIRE_VERSION 23
         let got = fnv1a(&protocol_corpus());
         assert_eq!(
             got, PROTOCOL_HASH,
@@ -628,6 +808,128 @@ mod tests {
             read_frame::<_, ServerMsg>(&mut r).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    fn variant_tag<T: Serialize>(v: &T) -> u32 {
+        let bytes = bincode::serialize(v).unwrap();
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    /// The enum tag on the wire is the variant's POSITION, so inserting a variant
+    /// anywhere but the end silently re-points every later one: an older GUI's
+    /// `Quit` would arrive at the daemon as `SetAutoContinue`. `protocol_hash_is_stable`
+    /// notices such an edit but reports it as "the wire changed"; this pins the
+    /// indices so the failure names the actual damage.
+    #[test]
+    fn trailing_additions_did_not_renumber_existing_variants() {
+        assert_eq!(variant_tag(&Command::Quit), 14, "Quit moved");
+        assert_eq!(
+            variant_tag(&Command::SetAutoContinue {
+                on: true,
+                fire_on_reset: false
+            }),
+            15,
+            "SetAutoContinue moved"
+        );
+        // the wire-23 adds, at the END where they cannot disturb the above.
+        assert_eq!(
+            variant_tag(&Command::SetBridge {
+                on: true,
+                port: 1,
+                bind: String::new(),
+                token: String::new()
+            }),
+            16
+        );
+        assert_eq!(variant_tag(&Command::BridgeStatus), 17);
+        assert_eq!(variant_tag(&CommandReply::Ok), 2, "CommandReply::Ok moved");
+        assert_eq!(
+            variant_tag(&CommandReply::Bridge(BridgeStatus::default())),
+            5
+        );
+    }
+
+    /// `configured` is the field the settings pane branches on, and it must
+    /// survive the socket independently of `running`: stopped-but-configured is
+    /// "Off" (the user's choice), stopped-and-unconfigured is "waiting for Kod"
+    /// (a respawned daemon nobody has pushed config to yet). Collapse the two and
+    /// the pane lies about a bridge that is merely un-pushed.
+    #[test]
+    fn bridge_status_round_trips_with_configured_independent_of_running() {
+        let off_by_choice = BridgeStatus {
+            running: false,
+            endpoints: vec![],
+            clients: 0,
+            error: None,
+            configured: true,
+            since_ms: 4242,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(
+            &mut buf,
+            &ServerMsg::Reply {
+                request_id: 8,
+                reply: CommandReply::Bridge(off_by_choice),
+            },
+        )
+        .unwrap();
+        write_frame(
+            &mut buf,
+            &ServerMsg::Reply {
+                request_id: 9,
+                reply: CommandReply::Bridge(BridgeStatus {
+                    running: true,
+                    endpoints: vec!["ws://10.0.0.2:8765".into(), "ws://127.0.0.1:8765".into()],
+                    clients: 3,
+                    error: None,
+                    configured: true,
+                    since_ms: 1,
+                }),
+            },
+        )
+        .unwrap();
+
+        let mut r = &buf[..];
+        let a: ServerMsg = read_frame(&mut r).unwrap();
+        let b: ServerMsg = read_frame(&mut r).unwrap();
+        match (a, b) {
+            (
+                ServerMsg::Reply {
+                    reply: CommandReply::Bridge(off),
+                    ..
+                },
+                ServerMsg::Reply {
+                    reply: CommandReply::Bridge(up),
+                    ..
+                },
+            ) => {
+                assert!(!off.running && off.configured, "Off must stay configured");
+                assert_eq!(off.since_ms, 4242);
+                assert!(up.running);
+                assert_eq!(up.clients, 3);
+                // every endpoint, in order — the phone needs the LAN one, and the
+                // pane shows them all.
+                assert_eq!(
+                    up.endpoints,
+                    vec!["ws://10.0.0.2:8765", "ws://127.0.0.1:8765"]
+                );
+            }
+            _ => panic!("wrong msg"),
+        }
+    }
+
+    /// `unavailable` is the "we cannot know" answer, NOT a user-chosen Off: it
+    /// must leave `configured` false so the pane renders "waiting for Kod" and
+    /// carry the reason, so a bind failure is readable instead of a silent stop.
+    #[test]
+    fn unavailable_is_never_mistaken_for_a_configured_off() {
+        let s = BridgeStatus::unavailable("bind refused: port 8765 in use");
+        assert!(!s.running);
+        assert!(!s.configured);
+        assert_eq!(s.error.as_deref(), Some("bind refused: port 8765 in use"));
+        assert!(s.endpoints.is_empty());
+        assert_eq!(s.clients, 0);
+        assert_eq!(s.since_ms, 0);
     }
 
     #[test]

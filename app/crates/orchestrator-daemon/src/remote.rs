@@ -15,8 +15,8 @@ use orchestrator_host::decision::PendingDecision;
 use orchestrator_host::emulator::GridSnapshot;
 use orchestrator_host::input::KeyInput;
 use orchestrator_host::protocol::{
-    read_frame, write_frame, ClientMsg, Command, CommandReply, EventKind, ServerEvent, ServerMsg,
-    WIRE_VERSION,
+    read_frame, write_frame, BridgeStatus, ClientMsg, Command, CommandReply, EventKind,
+    ServerEvent, ServerMsg, WIRE_VERSION,
 };
 use orchestrator_host::pty::SpawnSpec;
 use orchestrator_host::session::{CliKind, SessionId};
@@ -211,6 +211,22 @@ impl RemoteHost {
             _ => Err(io::Error::other("unexpected daemon reply")),
         }
     }
+
+    /// Fold any bridge reply into a status. There is no `io::Result` here on
+    /// purpose: the pane always has a line to draw, so a failure has to arrive AS
+    /// a status. `request` already synthesizes `Error` for a lost daemon, a failed
+    /// write and a 20s timeout, so every one of those lands in `unavailable` with
+    /// its real text — the pane never shows a stale "running" for a daemon that
+    /// went away.
+    fn bridge(reply: CommandReply) -> BridgeStatus {
+        match reply {
+            CommandReply::Bridge(s) => s,
+            CommandReply::Error(e) => BridgeStatus::unavailable(&e),
+            // Ok/Bool/Spawned/Matches to a bridge command means the daemon and the
+            // GUI disagree about the protocol — say so, don't invent a state.
+            _ => BridgeStatus::unavailable("daemon answered a bridge command with something else"),
+        }
+    }
 }
 
 fn apply_event(cache: &Arc<Mutex<Cache>>, ev: ServerEvent) {
@@ -397,5 +413,82 @@ impl SessionBackend for RemoteHost {
         // fire-and-forget: the daemon caches the flag in its SessionHost (docs/019
         // auto-continue). Mirrors set_cli_session_id — no reply is needed.
         self.fire(Command::SetAutoContinue { on, fire_on_reset });
+    }
+    fn set_bridge(&self, on: bool, port: u16, bind: &str, token: &str) -> BridgeStatus {
+        // BLOCKING request(), NOT fire(): turning the bridge on can fail out in the
+        // daemon (port already bound, bind spec rejected) and the user must see
+        // that on the click that caused it — a fire-and-forget push would leave the
+        // toggle looking green while nothing was listening. The daemon is
+        // storage-free, so the GUI is the source of truth and re-pushes on attach.
+        Self::bridge(self.request(Command::SetBridge {
+            on,
+            port,
+            bind: bind.into(),
+            token: token.into(),
+        }))
+    }
+    fn bridge_status(&self) -> BridgeStatus {
+        // also request(): unlike infos/grids there is no cached bridge state fed by
+        // the event stream, so the only honest answer comes from asking. Called by
+        // the settings pane on open/poll, never per frame.
+        Self::bridge(self.request(Command::BridgeStatus))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A daemon that died, timed out, or answered nonsense must NOT leave the
+    /// settings pane drawing the last "running" it saw — `request` reports all
+    /// three as `Error`, so each has to come back as an unavailable status
+    /// carrying the real reason.
+    #[test]
+    fn non_bridge_replies_fold_to_unavailable() {
+        let lost = RemoteHost::bridge(CommandReply::Error("daemon connection lost".into()));
+        assert!(!lost.running);
+        // NOT configured: an unreachable daemon is "waiting for Kod", never the
+        // user-chosen Off (protocol.rs `BridgeStatus::configured`).
+        assert!(!lost.configured);
+        assert_eq!(lost.error.as_deref(), Some("daemon connection lost"));
+
+        for reply in [
+            CommandReply::Ok,
+            CommandReply::Bool(true),
+            CommandReply::Spawned {
+                id: SessionId(1),
+                cli_session_id: None,
+            },
+            CommandReply::Matches {
+                matches: vec![],
+                total: 0,
+            },
+        ] {
+            let s = RemoteHost::bridge(reply);
+            assert!(!s.running && !s.configured);
+            assert!(
+                s.error.is_some(),
+                "an error-less unavailable renders as a healthy Off"
+            );
+        }
+    }
+
+    /// The daemon's own answer passes through untouched — including the pair the
+    /// pane branches on (`running: false` + `configured: true` is Off).
+    #[test]
+    fn a_bridge_reply_passes_through_unchanged() {
+        let s = RemoteHost::bridge(CommandReply::Bridge(BridgeStatus {
+            running: false,
+            endpoints: vec!["ws://10.0.0.2:8765".into()],
+            clients: 0,
+            error: None,
+            configured: true,
+            since_ms: 99,
+        }));
+        assert!(!s.running);
+        assert!(s.configured);
+        assert_eq!(s.endpoints, vec!["ws://10.0.0.2:8765"]);
+        assert_eq!(s.since_ms, 99);
+        assert!(s.error.is_none());
     }
 }
