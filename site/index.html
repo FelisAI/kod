@@ -57,7 +57,12 @@ header{padding:28px 0 0}
 .masthead{display:flex; align-items:center}
 
 /* ── hero ── */
-.hero{padding:76px 0 22px; display:grid; grid-template-columns:1.05fr .95fr; gap:56px; align-items:center}
+/* ONE column. The right-hand slot used to hold a hand-drawn mock of four
+     sessions, which asked a first-time reader to decode an illustration before
+     they knew what the product was — it showed the shape of a UI without saying
+     what the UI does. The real Standup screenshot, immediately below, does that
+     job and is true. */
+  .hero{padding:76px 0 26px}
 h1{
   font-size:clamp(34px,4.6vw,52px); line-height:1.08; letter-spacing:-.028em;
   color:var(--strong); margin:0 0 20px; font-weight:680; text-wrap:balance;
@@ -86,6 +91,24 @@ h1{
   margin-left:8px; font-weight:400;
 }
 .alpha{font-size:14px; color:var(--muted2); margin:16px 0 0; max-width:52ch; line-height:1.55}
+
+  /* "Works with" — the CLIs Kod drives. Wordmarks set in the page's own type
+     rather than reproduced logos: Claude and Codex are other people's trademarks,
+     and an approximation drawn from memory would be both visually wrong and a
+     misuse of them. If official SVGs are ever added to assets/, swap the spans
+     for imgs and keep the row. No CDN either way — this page makes no external
+     requests at runtime. */
+  .works{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:18px 0 0}
+  .works .lead{font-size:13px; color:var(--muted2)}
+  .cli-chip{
+    display:inline-flex; align-items:center; gap:7px;
+    border:1px solid var(--hair); border-radius:8px; padding:5px 11px;
+    font-family:var(--mono); font-size:12.5px; color:var(--text); background:var(--card);
+  }
+  /* The official marks, served locally — the page still makes no external
+     requests at runtime. Both SVGs are fill:currentColor, so they take the
+     chip's own colour instead of fighting the palette. */
+  .cli-chip img{flex:none; opacity:.92}
 
 /* ── the rail: the product's whole argument, in markup ──
    Four sessions. Three quiet. One wants you. That is the app. */
@@ -148,7 +171,7 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
 .kodkod{margin:0 0 16px; max-width:56ch; font-style:italic; color:var(--muted2)}
 
 @media (max-width:880px){
-  .hero{grid-template-columns:1fr; gap:38px; padding-top:52px}
+  .hero{padding-top:52px}
   .grid{grid-template-columns:1fr}
   .nav{display:none}
 }
@@ -160,8 +183,9 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
   <header><div class="masthead">
     <a class="brand" href="/"><img src="assets/kod-mark.png" alt=""><span>Kod</span></a>
     <nav class="nav">
-      <a href="#what">How it helps</a>
-      <a href="#install">Install</a>
+        <a href="#standup">Standup</a>
+        <a href="#what">How it helps</a>
+        <a href="#install">Install</a>
       <a href="https://github.com/FelisAI/kod">Source</a>
     </nav>
   </div></header>
@@ -178,63 +202,69 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
         <a class="btn btn-primary" href="https://github.com/FelisAI/kod/releases/latest/download/Kod.dmg">Download for macOS</a>
         <a class="btn btn-ghost" href="https://github.com/FelisAI/kod">View source on GitHub</a>
       </div>
+      <p class="works">
+        <span class="lead">Drives</span>
+        <span class="cli-chip"><img src="assets/claude.svg" alt="" width="15" height="15">claude&nbsp;code</span>
+        <span class="cli-chip"><img src="assets/openai.svg" alt="" width="15" height="15">codex</span>
+        <span class="lead">— and plain shells, side by side.</span>
+      </p>
       <p class="req">
         <span class="tag">Early alpha</span>
         macOS 13+ · Apple silicon &amp; Intel · signed and notarized · Apache-2.0
       </p>
       <p class="alpha">
         Kod is early. It is built and used daily by one person, and rough edges are
-        real: text fields do not accept paste yet, projects cannot be deleted, and
-        the map and memory surfaces are compiled out by default. If that is
+          real: projects cannot be renamed or deleted, and the map and memory
+          surfaces are compiled out by default. If that is
         interesting rather than disqualifying, the
         <a href="https://github.com/FelisAI/kod/issues">issues</a> are the honest
         list.
       </p>
     </div>
-
-    <div class="rail" aria-label="Example: four sessions, one needs you">
-      <div class="rail-h">Sessions</div>
-      <div class="row work">
-        <span class="dot"></span><span class="proj">atlas</span><span class="cli">claude</span>
-        <span class="state">working</span>
-      </div>
-      <div class="row needs">
-        <span class="dot"></span><span class="proj">harbor</span><span class="cli">claude</span>
-        <span class="state">needs you</span>
-      </div>
-      <div class="row quiet">
-        <span class="dot"></span><span class="proj">ledger</span><span class="cli">codex</span>
-        <span class="state">idle · 12m</span>
-      </div>
-      <div class="row quiet">
-        <span class="dot"></span><span class="proj">beacon</span><span class="cli">shell</span>
-        <span class="state">idle · 2h</span>
-      </div>
-    </div>
-  </div>
 </div>
 
 <div class="wrap">
+  <section id="standup">
+    <h2>Standup: you shouldn't have to reread every transcript</h2>
+    <p class="sub">
+      Standup is the reason Kod exists. Every session writes down what it got done as
+      it goes idle, so coming back to a morning's work is reading a list — not opening
+      each session in turn to remember where it was. What needs you sits at the top;
+      what merely happened sits under it; what is still running stays out of the way.
+    </p>
+    <figure>
+      <img src="assets/standup.png" width="1348" height="974"
+             alt="Kod's Standup screen, headed '18 agents live — 4 working, 14 idle'. A 'What happened' section lists six projects that moved since the last check, each with a one-line summary. Below it, a live strip and a timeline of the day's activity, every entry carrying the next action to take.">
+        <figcaption>Every project that moved while you were away, one line each — and what to do next about it.</figcaption>
+    </figure>
+    <p class="note" style="max-width:64ch">
+      It also tracks <em>when you last looked</em>, so "what happened" means what
+      happened since you last read it — not an undifferentiated wall that starts again
+      from the beginning every time you open the app.
+    </p>
+  </section>
+
   <section id="what">
     <h2>You shouldn't have to track what's running</h2>
     <p class="sub">
-      Which of your agents is working, which is idle, which hit a usage limit, which
-      has been sitting on a question for twenty minutes. That is state a machine
-      should hold, not a person. Kod keeps it across every project and puts whatever
-      is blocked at the top.
+      Which agent is working, which is idle, which hit a usage limit, which has been
+      sitting on a question for twenty minutes. That is state a machine should hold, not
+      a person. Kod keeps it across every project, notifies you the moment one is
+      genuinely blocked, and stays quiet otherwise — a count on the Dock icon and
+      nothing more. A background daemon owns the sessions, so closing the window does
+      not kill the work.
     </p>
     <figure>
-      <img src="assets/workspace.png" width="1240" height="852"
-           alt="Kod's workspace: a rail of projects down the left showing when each was last touched, and a list of recent sessions in the selected project, each with what it last did and a Resume button.">
-      <figcaption>Pick up where you left off — every recent session in a project, each with what it last did, so returning to a project costs a glance instead of a re-read.</figcaption>
+      <img src="assets/workspace.png" width="1348" height="974"
+             alt="Kod's workspace. A rail down the left lists fifteen active projects — orchestrator, teams, ai-video, landscaping, hyatt-points, gouge and more — each with a count of its live sessions, one showing a usage-limit chip at 44 percent. The main pane holds a live claude session, mid-answer, noting it has been working for 7 minutes 53 seconds.">
+        <figcaption>Every project and every agent in one window, each showing what is live and what is near a usage limit — so the fleet is a glance rather than a hunt.</figcaption>
     </figure>
-
     <div class="grid">
       <div class="card">
-        <h3>Standup</h3>
-        <p>One reactive home across every project — and idle-time summaries of what each
-        session got done, so catching up is reading four lines instead of scrolling four
-        transcripts.</p>
+        <h3>Real terminals</h3>
+        <p>Full-fidelity PTYs, not a chat box over an API — the agent's own TUI, colour and
+        all. Drag a file onto one to paste its path, or paste a screenshot and Kod hands
+        the agent a file it can actually read.</p>
       </div>
       <div class="card">
         <h3>Profiles</h3>
@@ -247,23 +277,7 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
         track of, are findable and resumable — losing one stops meaning losing its
         context.</p>
       </div>
-    </div>
-  </section>
-
-  <section>
-    <h2>You shouldn't have to watch for it</h2>
-    <p class="sub">
-      Polling twelve tabs to see if anything needs you is the tax that makes running
-      several agents exhausting. Kod pulls you back instead: a notification the moment
-      an agent is genuinely blocked, and a count on the Dock icon the rest of the
-      time — ambient, never interrupting. A background daemon owns the sessions, so
-      closing the window doesn't kill the work.
-    </p>
-    <figure>
-      <img src="assets/standup.png" width="1240" height="852"
-           alt="Kod's Standup screen reading 'All quiet — nothing needs you right now', above today's activity timeline, with the project rail on the left.">
-      <figcaption>All quiet is a first-class state — and the one you want most of the time. Kod is loud only when something is genuinely blocked.</figcaption>
-    </figure>
+      </div>
   </section>
 
   <section id="next">

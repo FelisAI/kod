@@ -13,7 +13,7 @@ Built in Rust on [GPUI](https://github.com/zed-industries/zed).
 
 <p align="center">
   <img src="app/assets/screenshots/workspace.png" width="900"
-       alt="Kod's session workspace. A project rail on the left lists atlas, harbor, beacon and ledger with how long ago each was touched. The main pane, 'Pick up where you left off', lists three recent atlas sessions — each showing what it last did and a Resume button.">
+       alt="Kod's session workspace. A project rail down the left lists fifteen active projects — orchestrator, teams, ai-video, landscaping, hyatt-points, gouge and more — each with a count of its live sessions, and one showing a rate-limit chip at 44 percent. The main pane holds a live claude session in the landscaping project, mid-answer, with a note that it has been working for 7 minutes 53 seconds.">
 </p>
 
 ---
@@ -38,7 +38,7 @@ Built in Rust on [GPUI](https://github.com/zed-industries/zed).
 
 <p align="center">
   <img src="app/assets/screenshots/standup.png" width="900"
-       alt="Kod's Standup screen, reading 'All quiet — nothing needs you right now', above a timeline of today's activity, with the same project rail down the left side.">
+       alt="Kod's Standup screen, headed '18 agents live — 4 working, 14 idle'. A 'What happened' section lists six projects that moved since the last check, each with a one-line summary. Below it, a live strip and a timeline of today's activity, each entry carrying the next action to take.">
 </p>
 
 ## Requirements
