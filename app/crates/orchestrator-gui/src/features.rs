@@ -67,5 +67,17 @@ mod tests {
             spawn.contains("if !crate::features::MAP_ENABLED {"),
             "spawn.rs: spawn_breakdown (G4) must early-return on !MAP_ENABLED"
         );
+
+        // G5 (Standup's ▲ MAP UPDATES tier). Gating what CREATES proposals is not
+        // enough on its own: this tier displays ones already in the store, so a
+        // build without the feature still showed a MAP UPDATES section to every
+        // existing install — the proposals were old, but the section was not.
+        // Found by the founder running a plain `cargo run` and asking why Map was
+        // on screen.
+        let standup = include_str!("render_standup.rs");
+        assert!(
+            standup.contains("if crate::features::MAP_ENABLED {"),
+            "render_standup.rs: the MAP UPDATES tier must stay behind MAP_ENABLED"
+        );
     }
 }
