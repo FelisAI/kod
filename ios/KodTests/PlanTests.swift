@@ -150,12 +150,12 @@ final class PlanTests: XCTestCase {
         XCTAssertFalse(BridgeSettings(host: "h", port: 8765, token: "").isUsable, "no token means nothing to dial with")
     }
 
-    /// The bridge declares `pub const DEFAULT_PORT: u16 = 8787` in ws.rs and has its
+    /// The bridge declares `pub const DEFAULT_PORT: u16 = 18787` in ws.rs and has its
     /// own test pinning it. This is the other half of that contract: the two numbers
     /// are compiled into different binaries in different languages, so nothing but a
     /// test on each side keeps them equal. If you change one, this fails.
     func testDefaultPortMatchesTheBridge() {
-        XCTAssertEqual(BridgeSettings.defaultPort, 8787)
+        XCTAssertEqual(BridgeSettings.defaultPort, 18787)
         XCTAssertEqual(BridgeSettings.empty.port, BridgeSettings.defaultPort)
     }
 

@@ -321,4 +321,94 @@ final class ComposerTests: XCTestCase {
         // The real answer still works.
         XCTAssertNotNil(c.settle(rid: liveRid, sid: 7, ok: true, message: ""))
     }
+
+    /// A send that is never answered must leave the composer USABLE again.
+    ///
+    /// Without this the spinner replaces the send button and every control key
+    /// stays disabled for the life of the app, and the only way out — switching
+    /// sessions — is also the one action that throws the draft away.
+    func testAnUnansweredSendLeavesTheComposerRecoverable() {
+        var c = Composer()
+        c.edit("are you sure?")
+        XCTAssertNotNil(c.send(to: 7))
+        XCTAssertTrue(c.busy)
+        XCTAssertFalse(c.canSend, "no second send while one is in flight")
+
+        c.fail("your Mac did not answer. Your text is still here — try again.")
+
+        XCTAssertFalse(c.busy)
+        XCTAssertEqual(c.text, "are you sure?", "undelivered text is not the user's to lose")
+        XCTAssertTrue(c.canSend, "the same draft must be sendable again")
+        XCTAssertNotNil(c.failure, "and the reason must be there to read")
+    }
+
+    /// Typing after a failure clears the explanation — it described a send that
+    /// is no longer the one in the box.
+    func testEditingAfterAFailureClearsTheExplanation() {
+        var c = Composer()
+        c.edit("first")
+        _ = c.send(to: 7)
+        c.fail("the connection dropped")
+        XCTAssertNotNil(c.failure)
+        c.edit("first and more")
+        XCTAssertNil(c.failure)
+    }
+
+    /// The echo must only appear for text the Mac ACCEPTED. Showing a refused or
+    /// in-flight message as "you sent" would be the screen claiming something
+    /// happened that did not.
+    func testTheEchoOnlyRecordsAcceptedText() {
+        var c = Composer()
+        c.edit("run the tests")
+        _ = c.send(to: 7)
+        XCTAssertNil(c.delivered, "in flight is not delivered")
+
+        c.fail("the connection dropped")
+        XCTAssertNil(c.delivered, "a failed send is not delivered")
+
+        c.edit("run the tests")
+        _ = c.send(to: 7)
+        _ = c.settle(rid: c.inFlightRid, sid: 7, ok: false, message: "refused")
+        XCTAssertNil(c.delivered, "a refusal is not delivered")
+
+        c.edit("run the tests")
+        _ = c.send(to: 7)
+        _ = c.settle(rid: c.inFlightRid, sid: 7, ok: true, message: "")
+        XCTAssertEqual(c.delivered, "run the tests")
+    }
+
+    /// It belongs to one session.
+    ///
+    /// The app never carries a composer between sessions — `selectedSid`'s didSet
+    /// replaces the whole struct — so this pins the property that makes that
+    /// safe, rather than a cross-session sequence the app cannot produce. A first
+    /// draft of this test drove one composer across two sids and failed for an
+    /// unrelated reason: after an accepted paste the composer is still busy on the
+    /// Enter that submits it.
+    func testAFreshComposerCarriesNothingFromTheLastSession() {
+        var c = Composer()
+        c.edit("for seven")
+        _ = c.send(to: 7)
+        _ = c.settle(rid: c.inFlightRid, sid: 7, ok: true, message: "")
+        XCTAssertEqual(c.delivered, "for seven")
+
+        // What the model actually does when you open another session.
+        let next = Composer(sid: 9)
+        XCTAssertNil(next.delivered)
+        XCTAssertEqual(next.text, "")
+        XCTAssertNil(next.failure)
+    }
+
+    /// An accepted paste leaves the composer busy on the Enter that submits it —
+    /// the property the test above tripped over, worth stating outright.
+    func testAnAcceptedPasteIsStillBusyUntilItsEnterIsAcknowledged() {
+        var c = Composer()
+        c.edit("go")
+        _ = c.send(to: 7)
+        let follow = c.settle(rid: c.inFlightRid, sid: 7, ok: true, message: "")
+        XCTAssertNotNil(follow, "the paste's acceptance produces the Enter")
+        XCTAssertTrue(c.busy, "and the composer stays busy until that Enter is answered")
+        _ = c.settle(rid: c.inFlightRid, sid: 7, ok: true, message: "")
+        XCTAssertFalse(c.busy)
+    }
 }

@@ -30,7 +30,17 @@ fn main() {
     // agree with, and hardcoding anyone's actual project paths here would put a
     // developer's directory layout in the repository.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let plan: &[&str] = &["demo:alpha", "demo:alpha", "demo:beta", "demo:gamma"];
+    // Extra arguments are project slugs, so a sandbox can be given the SAME keys
+    // its snapshot already has summaries for. Without that the rail looks empty
+    // next to a full Standup: a project only appears there when it has a live
+    // session or a stored path, and a snapshot restores neither.
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let owned: Vec<&str> = args.iter().map(String::as_str).collect();
+    let plan: &[&str] = if owned.is_empty() {
+        &["demo:alpha", "demo:alpha", "demo:beta", "demo:gamma"]
+    } else {
+        &owned
+    };
     for slug in plan {
         let id = c
             .send(Command::SpawnShell {

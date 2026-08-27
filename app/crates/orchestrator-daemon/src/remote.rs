@@ -488,6 +488,7 @@ mod tests {
             error: None,
             configured: true,
             since_ms: 99,
+            fingerprint: None,
         }));
         assert!(!s.running);
         assert!(s.configured);

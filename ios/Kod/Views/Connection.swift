@@ -13,6 +13,7 @@ extension ConnectionState {
         case .connecting, .reconnecting: return KodColor.amber
         case .unauthorized, .failed: return KodColor.red
         case .unconfigured: return KodColor.muted2
+        case .insecure: return KodColor.amber
         }
     }
 
@@ -24,6 +25,7 @@ extension ConnectionState {
         case .unauthorized: return "rejected"
         case .failed: return "offline"
         case .unconfigured: return "set up"
+        case .insecure: return "not secure"
         }
     }
 
@@ -35,6 +37,8 @@ extension ConnectionState {
         case .unauthorized(let m): return "token rejected — \(m)"
         case .failed(let m): return "can't reach \(endpoint) — \(m)"
         case .unconfigured: return "no bridge configured"
+        case .insecure:
+            return "won't send your token in the clear to \(endpoint)"
         }
     }
 }
@@ -192,7 +196,22 @@ struct ConnectionView: View {
 
     private func save() {
         guard let p = Int(port) else { return }
-        model.apply(settings: BridgeSettings(host: host.trimmingCharacters(in: .whitespaces), port: p, token: token))
+        // CARRY THE PIN FORWARD. This form edits host, port and token; it has no
+        // field for the fingerprint and no way to obtain one, so rebuilding the
+        // settings without it silently DROPPED it — and because a settings save
+        // removes an absent pin from storage, one tap here turned a pinned wss://
+        // link into cleartext ws:// carrying the bearer token, permanently, with
+        // nothing on any screen saying the connection was no longer pinned.
+        //
+        // A pin belongs to a host, so it is dropped only when the host actually
+        // changes — at which point the old key certainly does not describe the new
+        // machine, and re-scanning is the only honest way back.
+        let newHost = host.trimmingCharacters(in: .whitespaces)
+        let keptPin = newHost.caseInsensitiveCompare(model.settings.host) == .orderedSame
+            ? model.settings.fingerprint
+            : nil
+        model.apply(settings: BridgeSettings(host: newHost, port: p, token: token,
+                                             fingerprint: keptPin))
         dismiss()
     }
 
@@ -210,6 +229,25 @@ struct ConnectionView: View {
                     Text("Fix the token and save to try again.")
                         .font(KodFont.meta)
                         .foregroundStyle(KodColor.muted2)
+                }
+                if case .insecure = model.connection {
+                    // The one refusal a user CANNOT resolve in this form. Typing an
+                    // address is possible; typing a 43-character key fingerprint is
+                    // not, and there is no field for it — so saying "check your
+                    // settings" would send them round the same loop forever. Name
+                    // the only way out.
+                    Text("Your Mac only accepts encrypted connections, and the key "
+                         + "for that can't be typed in — it comes from the pairing "
+                         + "code. Tap Scan QR code above, on Settings → Mobile on "
+                         + "your Mac.")
+                        .font(KodFont.meta)
+                        .foregroundStyle(KodColor.muted2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Typing an address by hand only works for 127.0.0.1, which "
+                         + "is this phone, not your Mac.")
+                        .font(KodFont.meta)
+                        .foregroundStyle(KodColor.muted2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }

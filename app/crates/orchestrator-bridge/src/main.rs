@@ -39,7 +39,7 @@ fn main() -> ExitCode {
             eprintln!("  probe   attach, print the session list, exit.");
             eprintln!("  serve   attach and serve the phone protocol.");
             eprintln!("          KOD_BRIDGE_TOKEN  required, no default.");
-            eprintln!("          KOD_BRIDGE_PORT   default 8787.");
+            eprintln!("          KOD_BRIDGE_PORT   default 18787.");
             eprintln!("          KOD_BRIDGE_BIND   unset = loopback only. Set it to this");
             eprintln!("                            machine's Tailscale address (`tailscale ip -4`)");
             eprintln!("                            to let your phone connect; loopback stays");

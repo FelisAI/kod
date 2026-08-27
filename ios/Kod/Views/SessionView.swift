@@ -70,6 +70,29 @@ struct SessionView: View {
                            heading: "WAITING ON YOU")
                 }
 
+                // What YOU sent, echoed locally.
+                //
+                // Nothing else on this screen changes when a message is accepted:
+                // `last_message` is written by the agent's Stop hook, so it does
+                // not move until the turn ENDS — which can be minutes. Without
+                // this the only feedback is the text box emptying, which reads as
+                // "did that do anything?". This is the phone's own record, not
+                // the Mac's, and it says so.
+                if model.composer.sid == s.sid, let sent = model.composer.delivered {
+                    VStack(alignment: .leading, spacing: 10) {
+                        TierHeading(text: "YOU SENT", color: KodColor.muted)
+                        KodCard {
+                            Text(sent)
+                                .font(.system(size: 15))
+                                .foregroundStyle(KodColor.text)
+                                .lineSpacing(3)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 10) {
                     TierHeading(text: "LAST MESSAGE", color: KodColor.muted)
                     KodCard {
@@ -115,6 +138,19 @@ struct SessionView: View {
             Rectangle()
                 .fill(KodColor.hair)
                 .frame(height: 1)
+            // OUTSIDE the branches below, deliberately.
+            //
+            // It used to live inside the composer, which meant it disappeared in
+            // exactly the case it exists for: a session can stop looking typable
+            // between a send and its answer (it ends, or the Mac stops offering
+            // input), and then the branch flips to a note and takes the refusal —
+            // and the visible draft — with it. The user sees their text gone and
+            // no reason anywhere.
+            if model.composer.sid == s.sid, let failure = model.composer.failure {
+                refusal(failure, kept: model.composer.text)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
+            }
             Group {
                 // Order matters: the most specific true thing first. A dead shell
                 // is dead before it is a shell.
@@ -141,6 +177,50 @@ struct SessionView: View {
         .background(KodColor.panel)
     }
 
+    /// A refusal, and — when the composer is not on screen to hold it — the text
+    /// it kept. Nothing here ever empties the box: the model only does that on an
+    /// acceptance, so the words the user typed are still theirs.
+    private func refusal(_ why: String, kept: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(KodColor.red)
+                Text(why)
+                    .font(KodFont.meta)
+                    .foregroundStyle(KodColor.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !kept.isEmpty && !composerIsOnScreen {
+                // The composer is gone, so nothing else on screen is holding the
+                // draft. Show it rather than let it look lost.
+                Text("Kept: \(kept)")
+                    .font(KodFont.meta)
+                    .foregroundStyle(KodColor.muted)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// "answer" only when the session is genuinely waiting on you; otherwise you
+    /// are giving it something new — redirecting it, adding context, telling it to
+    /// stop — and calling that "answer" describes one case out of several. The CLI
+    /// name is interpolated, so a codex session says codex.
+    private func prompt(for s: Session) -> String {
+        s.phase == .awaiting || s.pendingHeadline != nil
+            ? "answer \(s.cli.label)…"
+            : "message \(s.cli.label)…"
+    }
+
+    /// Whether the text field is currently rendered. When it is not, nothing else
+    /// on screen is holding the user's draft.
+    private var composerIsOnScreen: Bool {
+        guard let s = model.selected, s.alive, s.phase != .dead else { return false }
+        return canType(s)
+    }
+
     private func note(_ title: String, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
@@ -160,7 +240,7 @@ struct SessionView: View {
         return VStack(alignment: .leading, spacing: 9) {
             keys
             HStack(alignment: .bottom, spacing: 9) {
-                TextField("answer \(s.cli.label)…", text: $m.draft, axis: .vertical)
+                TextField(prompt(for: s), text: $m.draft, axis: .vertical)
                     .lineLimit(1...5)
                     .font(.system(size: 16))
                     .foregroundStyle(KodColor.strong)
@@ -180,19 +260,6 @@ struct SessionView: View {
                     }
                 send
             }
-            if let failure = model.composer.failure {
-                // The text is still in the box — the model only empties it on an
-                // acceptance — so this reads as "try again", not "it vanished".
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(KodColor.red)
-                    Text(failure)
-                        .font(KodFont.meta)
-                        .foregroundStyle(KodColor.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
         }
     }
 
@@ -200,21 +267,47 @@ struct SessionView: View {
     /// claude permission prompt gets answered, which is the single most likely
     /// thing anyone does from a phone — so they are one tap away, above the field,
     /// rather than hidden behind the text you would otherwise have to type.
+    /// Shown ONLY while the agent is actually asking something.
+    ///
+    /// These keys exist to answer a permission prompt — arrow to a choice, Enter
+    /// to take it — and outside that they are a fragment of a keyboard with no
+    /// visible purpose. On first use the reaction was "I don't see how we can use
+    /// them", which is the correct reaction to a control offered at a moment it
+    /// does nothing. When something IS waiting, they appear with a line saying so
+    /// and the whole thing explains itself. Send stays available always, because
+    /// typing is always meaningful.
+    @ViewBuilder
     private var keys: some View {
-        HStack(spacing: 7) {
-            key("esc", .escape)
-            key("↑", .up)
-            key("↓", .down)
-            key("tab", .tab)
-            Spacer(minLength: 6)
-            key("enter", .enter, primary: true)
+        if model.selected?.pendingHeadline != nil || model.selected?.phase == .awaiting {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Answer the prompt above")
+                    .font(KodFont.meta)
+                    .foregroundStyle(KodColor.muted2)
+                HStack(spacing: 7) {
+                    key("esc", .escape)
+                    key("↑", .up)
+                    key("↓", .down)
+                    key("tab", .tab)
+                    Spacer(minLength: 6)
+                    key("enter", .enter, primary: true)
+                }
+            }
         }
     }
 
     private func key(_ label: String, _ which: PhoneKey, primary: Bool = false) -> some View {
         let tint = primary ? KodColor.accent : KodColor.muted
         return Button {
-            model.press(which)
+            // Enter WITH a draft means "send what I typed", exactly as it does on
+            // a real keyboard. Routing it to a bare key press instead submitted
+            // whatever was already in the AGENT's prompt and left the user's typed
+            // line sitting in the box, unsent — two controls that look like they
+            // submit, one of which silently did not submit what you wrote.
+            if which == .enter && model.composer.canSend {
+                model.sendDraft()
+            } else {
+                model.press(which)
+            }
         } label: {
             Text(label)
                 .font(.system(size: 13, weight: .medium, design: .monospaced))

@@ -27,6 +27,13 @@ targets:
       path: Supporting/Info.plist
       properties:
         CFBundleDisplayName: Kod
+        # Wired to the build settings, NOT left to xcodegen's defaults. Without
+        # these two lines the generated Info.plist hardcodes 1.0/1 and silently
+        # ignores MARKETING_VERSION and CURRENT_PROJECT_VERSION below — so bumping
+        # the version in this file changes nothing, and every TestFlight upload
+        # collides with the last one on the same build number.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIUserInterfaceStyle: Dark
         ITSAppUsesNonExemptEncryption: false
@@ -39,25 +46,60 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        # The bridge is a plain ws:// listener on the LAN (loopback in v0), so the
-        # app needs both the ATS exception and the iOS 14+ local-network prompt.
+        # Still required for a LAN address on iOS 14+, TLS or no TLS: this prompt
+        # is about who the phone may TALK TO, not about how the bytes are wrapped.
         NSLocalNetworkUsageDescription: Kod connects to the bridge running on your Mac.
         # Required, not optional: calling AVCaptureDevice.requestAccess without this
         # key does not fail — it kills the app on the spot.
         NSCameraUsageDescription: Kod uses the camera only to scan the pairing code shown on your Mac. Nothing is photographed, saved or sent anywhere.
+        # ArbitraryLoads ALONE. Do not "also" add NSAllowsLocalNetworking: when
+        # that key is present, iOS 10+ IGNORES NSAllowsArbitraryLoads (it is kept
+        # only for older systems), and LocalNetworking exempts just .local names
+        # and link-local addresses — not a Tailscale 100.64/10 address, and not a
+        # 192.168/16 one either. The two together are therefore STRICTER than
+        # ArbitraryLoads on its own, and the symptom is a connection that never
+        # leaves the phone: endless retries and "The resource could not be loaded
+        # because the App Transport Security policy requires the use of a secure
+        # connection." Cost an evening.
+        #
+        # TLS ARRIVED AND THIS KEY STILL CANNOT GO. It was written when the bridge
+        # only spoke ws://; the phone now dials wss:// with a pinned key whenever
+        # the pairing code carries one (BridgeClient.PinnedTrust). Two things still
+        # need the blanket exception, and neither has a narrower spelling:
+        #
+        #   * The certificate is SELF-SIGNED — no CA issues certificates for
+        #     192.168.0.71 — so it cannot satisfy ATS's trusted-chain requirement
+        #     no matter how strong the ciphers are. Our delegate is what accepts
+        #     it, and it accepts exactly one public key.
+        #   * The dev/loopback path is still plaintext ws:// to 127.0.0.1.
+        #
+        # NSExceptionDomains cannot carry either one: its keys are domain names,
+        # and ATS does not accept IP literals there — and a bare IP is precisely
+        # what a phone dials when the Mac has no name. So the security boundary
+        # here is deliberately NOT ATS: it is the pin, plus a bridge that refuses
+        # to bind past loopback without TLS. This key comes out the day the phone
+        # dials a real hostname with a CA-issued certificate, which for a LAN
+        # daemon is not a day that is coming.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         PRODUCT_NAME: Kod
-        MARKETING_VERSION: "0.1.0"
+        MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
-        TARGETED_DEVICE_FAMILY: "1,2"
+        # iPhone ONLY for the first release. "1,2" means iPad too, which obliges
+        # iPad screenshots and a layout that holds up there — review surface for a
+        # device this app was not designed against. The Session reader and the
+        # composer are built for one thumb on a 390pt screen.
+        TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
         ENABLE_PREVIEWS: YES
         CODE_SIGN_STYLE: Automatic
+        # Felis AI LLC. Needed to install on a real iPhone; the simulator does not
+        # sign at all, which is why this was absent until the first device build.
+        DEVELOPMENT_TEAM: BHX233597M
 
   # Needs a running bridge; skips loudly without one. Not in the Kod scheme's
   # test action, so `xcodebuild test` stays hermetic — run it explicitly with
@@ -72,7 +114,8 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote.uitests
+        PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon.uitests
         TEST_TARGET_NAME: Kod
 
   KodTests:
@@ -85,7 +128,8 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote.tests
+        PRODUCT_BUNDLE_IDENTIFIER: pro.felisai.kod.remote
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon.tests
 
 schemes:
   Kod:

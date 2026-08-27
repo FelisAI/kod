@@ -29,6 +29,12 @@ struct Composer: Equatable {
     /// The id of the send currently in flight, and the source of the next one.
     /// Monotonic and never reused, so an answer that arrives after its send was
     /// abandoned can be told apart from the answer to what is in flight NOW.
+    /// The last text this composer got an ACCEPTANCE for, kept so the reader can
+    /// show it. Without it the screen is identical before and after a send, and
+    /// the only feedback is the box emptying — which reads as "did that do
+    /// anything?" right up until the agent finishes its turn, which can be
+    /// minutes. Cleared when the composer moves to another session.
+    private(set) var delivered: String?
     private(set) var inFlightRid: UInt64 = 0
     private var nextRid: UInt64 = 1
 
@@ -62,6 +68,7 @@ struct Composer: Equatable {
     /// something already is — one tap must not become two lines.
     mutating func send(to sid: UInt64) -> ClientMessage? {
         guard canSend else { return nil }
+        if self.sid != sid { delivered = nil }
         self.sid = sid
         failure = nil
         inFlight = .paste(text)
@@ -98,6 +105,7 @@ struct Composer: Equatable {
         switch step {
         case .paste(let sent):
             if text == sent { text = "" }
+            delivered = sent
             inFlight = .submit
             inFlightRid = nextRid
             nextRid += 1
@@ -154,7 +162,14 @@ final class AppModel {
     private var clock: Task<Void, Never>?
     #if DEBUG
     /// Fixture-backed: no socket, no ticking clock. Set only by the demo hooks.
-    fileprivate var demoMode = false
+    /// Showing sample data instead of a Mac.
+    ///
+    /// Reachable from the UI, not just a launch argument: without a Mac running
+    /// Kod this app is a connection screen and nothing else, which is unevaluable
+    /// for anyone deciding whether to set it up — App Review included. Internal,
+    /// not fileprivate, because the views must be able to say so on screen; a
+    /// demo that does not announce itself is a lie.
+    private(set) var demoMode = false
     #endif
 
     init(settings: BridgeSettings = SettingsStore.load(), autostart: Bool = true) {
@@ -201,6 +216,31 @@ final class AppModel {
             default: tab = .standup
             }
         }
+    }
+
+    /// Fill the app with sample sessions and dial nothing.
+    ///
+    /// Same fixtures the `-kod-demo` launch argument uses, so what a reviewer or a
+    /// curious user sees is the same thing the design was checked against.
+    func enterDemo() {
+        demoMode = true
+        stop()
+        store.apply(.sessions(epoch: "demo",
+                              sessions: Fixtures.everyTier.map(Self.asTheDaemonWouldMark)))
+        connection = .connected
+        inputAllowed = true
+        now = Fixtures.now + 60_000
+        selectedSid = 2
+        tab = .standup
+    }
+
+    /// Leave the demo and go back to whatever was configured.
+    func exitDemo() {
+        demoMode = false
+        store = SessionStore()
+        selectedSid = nil
+        composer = Composer()
+        apply(settings: settings)
     }
 
     /// The daemon's own rule — agents that are alive accept typing, shells and
@@ -265,15 +305,15 @@ final class AppModel {
     }
 
     func start() {
-        #if DEBUG
         // A demo model dials nothing and freezes its clock; otherwise the
         // foreground restart would stomp the fixture `now` with wall-clock time
-        // and every age would read in days.
+        // and every age would read in days. NOT #if DEBUG: the demo is a shipped
+        // feature now, and TestFlight ships Release — gating this on DEBUG meant
+        // the demo silently started dialling in exactly the build a reviewer runs.
         if demoMode { return }
-        #endif
         startClock()
         guard settings.isUsable else {
-            connection = .unconfigured
+            connection = settings.insecureBeyondThisDevice ? .insecure : .unconfigured
             return
         }
         client.startIfNeeded(settings)
@@ -303,6 +343,30 @@ final class AppModel {
         Task { [weak self] in
             guard let self else { return }
             if let why = await client.send(msg) { composer.fail(why) }
+        }
+        armInputDeadline()
+    }
+
+    /// How long to wait for the Mac's answer before giving the composer back.
+    ///
+    /// Every send is a request/reply, and the reply can simply not arrive: the
+    /// link drops mid-flight, or a frame the bridge answers with `err` rather
+    /// than `input_result` lands on the floor. Without a deadline the composer
+    /// stays busy for the life of the app — spinner instead of a send button,
+    /// every control key disabled — and the only escape is switching sessions,
+    /// which is also the one action that discards the draft. Backgrounding a
+    /// phone mid-send is the ordinary way to reach that.
+    private static let inputDeadline: Duration = .seconds(12)
+
+    private func armInputDeadline() {
+        let rid = composer.inFlightRid
+        Task { [weak self] in
+            try? await Task.sleep(for: Self.inputDeadline)
+            guard let self else { return }
+            // Only the send this deadline was armed for. A later send has its own,
+            // and settling it here would blame the wrong text.
+            guard composer.inFlightRid == rid, composer.busy else { return }
+            composer.fail("your Mac did not answer. Your text is still here — try again.")
         }
     }
 

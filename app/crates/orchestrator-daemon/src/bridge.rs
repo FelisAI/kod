@@ -38,7 +38,7 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command as OsCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orchestrator_host::protocol::BridgeStatus;
@@ -50,6 +50,10 @@ static BRIDGE: OnceLock<Supervisor> = OnceLock::new();
 struct Running {
     child: Child,
     endpoints: Vec<String>,
+    /// The pin the phone must have, read off the child's banner. `None` means
+    /// the child is serving plaintext — only legal on loopback — and the pairing
+    /// URL it feeds must therefore be `ws://` with no `f`.
+    fingerprint: Option<String>,
     since_ms: u64,
 }
 
@@ -171,13 +175,15 @@ impl Supervisor {
             .spawn()
             .map_err(|e| format!("could not start the mobile bridge: {e}"))?;
 
-        // Read the child's OWN first line rather than re-deriving the address from
-        // the config: it prints only after both listeners bound and the attach
+        // Read the child's OWN first line rather than re-deriving anything from
+        // the config: it prints only after every listener bound and the attach
         // succeeded, so a status line built from it cannot claim something is
-        // reachable that is not.
-        let endpoints = match child.stdout.take() {
-            Some(out) => first_line_endpoints(out),
-            None => Vec::new(),
+        // reachable that is not. The pin is on the same line for a stronger
+        // reason — the certificate is minted inside the child, and this is the
+        // only place its identity crosses back.
+        let (endpoints, fingerprint) = match child.stdout.take() {
+            Some(out) => first_line_banner(out),
+            None => (Vec::new(), None),
         };
         if endpoints.is_empty() {
             // It printed nothing, which means it failed before binding. Its stderr
@@ -201,6 +207,7 @@ impl Supervisor {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
             child,
             endpoints,
+            fingerprint,
             since_ms: now_ms(),
         });
         *self.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -250,7 +257,12 @@ impl Supervisor {
                 error: None,
                 configured: true,
                 since_ms: r.since_ms,
+                fingerprint: r.fingerprint.clone(),
             },
+            // A bridge that is not running has no pin to hand out, and must not
+            // keep offering the last one: a pairing card minted from a stale pin
+            // points a phone at a port with nothing behind it, and the phone's
+            // only way to say so is a certificate error.
             None => BridgeStatus {
                 running: false,
                 endpoints: Vec::new(),
@@ -258,6 +270,7 @@ impl Supervisor {
                 error,
                 configured,
                 since_ms: *self.since_ms.lock().unwrap_or_else(|e| e.into_inner()),
+                fingerprint: None,
             },
         }
     }
@@ -266,24 +279,46 @@ impl Supervisor {
 /// Pull the bound addresses out of the bridge's startup banner.
 ///
 /// The banner is one line and looks like:
-///   `bridge · wire 24 · epoch <hex> · listening on 127.0.0.1:8787 and 100.x:8787 (tailnet) · 3 sessions`
+///   `bridge · wire 25 · epoch <hex> · listening on 127.0.0.1:8787 and 192.168.0.71:8787 (lan) · pin <b64url> · 3 sessions`
+///
+/// The `(lan)` / `(tailnet)` labels are written for a person reading a terminal,
+/// so anything inside parentheses is dropped rather than matched by name — a
+/// third label added later must not turn an endpoint into an unparseable string
+/// that the settings pane then offers as a host to dial.
 pub(crate) fn parse_endpoints(line: &str) -> Vec<String> {
     let Some(rest) = line.split("listening on ").nth(1) else {
         return Vec::new();
     };
     let rest = rest.split(" · ").next().unwrap_or(rest);
     rest.split(" and ")
-        .map(|s| s.replace("(tailnet)", "").trim().to_string())
+        .map(|s| s.split(" (").next().unwrap_or(s).trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-fn first_line_endpoints(out: std::process::ChildStdout) -> Vec<String> {
+/// Pull the key pin off the same banner.
+///
+/// Found as its own ` · `-delimited segment rather than at an offset, so adding
+/// anything else to the line cannot move it.
+///
+/// `None` is not a parse failure: it means the child is serving plaintext, which
+/// only loopback is allowed to be, and it is what tells the desktop to build a
+/// `ws://` pairing URL with no `f=` rather than a `wss://` one the phone would
+/// then refuse for want of a key to pin.
+pub(crate) fn parse_fingerprint(line: &str) -> Option<String> {
+    line.split(" · ")
+        .find_map(|seg| seg.trim().strip_prefix("pin "))
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+}
+
+fn first_line_banner(out: std::process::ChildStdout) -> (Vec<String>, Option<String>) {
     let mut r = BufReader::new(out);
     let mut line = String::new();
     match r.read_line(&mut line) {
-        Ok(0) | Err(_) => Vec::new(),
-        Ok(_) => parse_endpoints(&line),
+        Ok(0) | Err(_) => (Vec::new(), None),
+        Ok(_) => (parse_endpoints(&line), parse_fingerprint(&line)),
     }
 }
 
@@ -311,6 +346,12 @@ mod tests {
         assert_eq!(s.phase(), BridgePhase::Failed, "and must not read as a chosen Off");
     }
 
+    /// The banner the current bridge actually prints, kept here verbatim so this
+    /// module and `orchestrator_bridge::ws::banner` cannot drift apart quietly.
+    const BANNER: &str = "bridge · wire 25 · epoch abc · listening on 127.0.0.1:8787 and \
+                          100.101.102.103:8787 (tailnet) and 192.168.0.71:8787 (lan) · \
+                          pin PxzwAjQTKyQ_naZJoUs8563rFF5OMq2sZhU2-fYSBkY · 3 sessions";
+
     #[test]
     fn endpoints_come_from_the_childs_own_banner() {
         let line = "bridge · wire 24 · epoch abc · listening on 127.0.0.1:8787 and \
@@ -319,6 +360,36 @@ mod tests {
             parse_endpoints(line),
             vec!["127.0.0.1:8787".to_string(), "100.101.102.103:8787".to_string()]
         );
+        // The LAN label is new, and an endpoint list that kept it would be a
+        // settings pane offering `192.168.0.71:8787 (lan)` as a host to dial.
+        assert_eq!(
+            parse_endpoints(BANNER),
+            vec![
+                "127.0.0.1:8787".to_string(),
+                "100.101.102.103:8787".to_string(),
+                "192.168.0.71:8787".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_pin_comes_off_the_banner_and_its_absence_means_plaintext() {
+        // The certificate is minted inside the child, so this line is the only
+        // route by which the desktop can ever learn what to put in the QR.
+        assert_eq!(
+            parse_fingerprint(BANNER).as_deref(),
+            Some("PxzwAjQTKyQ_naZJoUs8563rFF5OMq2sZhU2-fYSBkY")
+        );
+        // base64url is unpadded and uses `-`/`_`; nothing here may trim or
+        // re-case it, because the phone compares the string byte for byte.
+        assert!(parse_fingerprint(BANNER).unwrap().contains('-'));
+        assert!(parse_fingerprint(BANNER).unwrap().contains('_'));
+        // Plaintext loopback prints no pin segment at all, and that ABSENCE is
+        // the signal for a `ws://` pairing URL with no `f=`.
+        let plain = "bridge · wire 25 · epoch abc · listening on 127.0.0.1:8787 · 0 sessions";
+        assert_eq!(parse_fingerprint(plain), None);
+        assert!(parse_fingerprint("refusing: that is your DEFAULT daemon socket.").is_none());
+        assert!(parse_fingerprint("").is_none());
     }
 
     #[test]

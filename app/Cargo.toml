@@ -17,7 +17,7 @@ orchestrator-host = { path = "crates/orchestrator-host" }
 orchestrator-bridge = { path = "crates/orchestrator-bridge" }
 orchestrator-store = { path = "crates/orchestrator-store" }
 orchestrator-daemon = { path = "crates/orchestrator-daemon" }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 gpui = "0.2.2"
 # 0.5.6 references ARM SIMD intrinsics removed in this nightly; pin to the known-good rev.
 pathfinder_simd = "=0.5.5"

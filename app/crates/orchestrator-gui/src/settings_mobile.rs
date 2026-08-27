@@ -19,7 +19,7 @@ use gpui::*;
 
 use crate::bridgecfg;
 use crate::qr::Qr;
-use crate::settings::{setting_radio_row, setting_toggle_row, settings_body, settings_section};
+use crate::settings::{setting_toggle_row, settings_body, settings_section};
 use crate::*;
 use orchestrator_daemon::HostMode;
 use orchestrator_host::protocol::{BridgePhase, BridgeStatus};
@@ -79,62 +79,82 @@ impl Orchestrator {
         )
     }
 
-    /// Card 2 — who can reach it. Selection is derived from what is BOUND.
+    /// Card 2 — who can reach it. Two INDEPENDENT switches, both derived from
+    /// what is BOUND.
+    ///
+    /// Two switches rather than the old radios because "This Mac only" was never
+    /// really an option: loopback is bound whatever you pick, so that row meant
+    /// "no phone can reach this" — indistinguishable from Off except that a
+    /// listener is still running. Neither switch on says that plainly instead.
     fn mobile_card_access(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Derived from the daemon's endpoints, not from `bridge_bind`. A radio
-        // computed from a stored key can render narrower than reality — click
-        // "This Mac only", fail to restart the listener, and the dot moves while a
-        // tailnet socket stays open. Computed from what is actually bound, that
-        // state cannot be drawn.
-        let reachable = bridgecfg::reachable_host(&self.bridge_status.endpoints);
-        let (loopback_selected, tailnet_selected) = if self.bridge_status.running {
-            (reachable.is_none(), reachable.is_some())
+        // Derived from the daemon's endpoints, not from `bridge_bind`, whenever
+        // there is a listener to ask. A switch computed from a stored key can
+        // render narrower than reality — turn one off, fail to restart the
+        // listener, and the knob slides while the socket stays open. Computed
+        // from what is actually bound, that state cannot be drawn. The stored key
+        // is the fallback only when nothing is listening, because then there are
+        // no endpoints and the user's last choice is the honest answer.
+        let bound = bridgecfg::bound(&self.bridge_status.endpoints);
+        let (lan_on, tailnet_on) = if self.bridge_status.running {
+            (bound.lan.is_some(), bound.tailnet.is_some())
         } else {
-            (self.bridge_bind.is_empty(), !self.bridge_bind.is_empty())
+            bridgecfg::bind_switches(&self.bridge_bind)
         };
-        let tailnet = self.tailnet_ip;
-        let tailnet_note = match tailnet {
-            Some(ip) => format!("Your phone connects over Tailscale to {ip}."),
-            None => "Tailscale is not running — start it and reopen this window.".to_string(),
+        // The address comes from the endpoint the daemon reported, never from a
+        // value probed here and remembered: that cache is what used to leave this
+        // pane insisting you reopen the window after restarting Tailscale.
+        let lan_note = match &bound.lan {
+            Some(ip) => format!("Your phone connects to {ip}. Both have to be on this network."),
+            None => "Phones on the same Wi-Fi as this Mac can connect.".to_string(),
+        };
+        let tailnet_note = match &bound.tailnet {
+            Some(ip) => format!("Your phone connects to {ip}, from anywhere."),
+            None => "Your phone can connect from anywhere, as long as Tailscale is running on \
+                     both."
+                .to_string(),
         };
 
         settings_section(
             "Who can reach it",
-            "Kod refuses every other kind of address. This version authenticates with one \
-             shared token and has no TLS, so a Wi-Fi or wildcard address would put that token \
-             in the clear.",
+            "Kod binds only the addresses you pick here and nothing else — never every \
+             interface. Anything past this Mac is served over TLS, and the pairing code below \
+             carries the fingerprint of this Mac's key so your phone can tell Kod apart from \
+             whatever else might answer on that address.",
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .child(setting_radio_row(
-                    "bridge-bind-loopback",
-                    loopback_selected,
-                    "This Mac only",
-                    "Nothing off this machine can connect. Useful with an SSH tunnel.",
-                    cx.listener(|this: &mut Orchestrator, _, _w, cx| {
-                        this.set_bridge_bind(String::new(), cx);
+                .child(setting_toggle_row(
+                    "bridge-bind-lan",
+                    lan_on,
+                    "My Wi-Fi network",
+                    lan_note,
+                    cx.listener(move |this: &mut Orchestrator, _, _w, cx| {
+                        // Built from what is DRAWN, so the click does what the
+                        // screen says: flipping one switch must leave the other
+                        // exactly as the user sees it.
+                        this.set_bridge_bind(bridgecfg::bind_tokens(!lan_on, tailnet_on), cx);
                     }),
                 ))
-                .child(setting_radio_row(
-                    "bridge-bind-tailnet",
-                    tailnet_selected,
-                    "This Mac and my Tailscale network",
+                .child(setting_toggle_row(
+                    "bridge-bind-tailscale",
+                    tailnet_on,
+                    "My Tailscale network",
                     tailnet_note,
                     cx.listener(move |this: &mut Orchestrator, _, _w, cx| {
-                        match tailnet {
-                            Some(ip) => this.set_bridge_bind(ip.to_string(), cx),
-                            None => {
-                                this.bridge_err = Some(
-                                    "Tailscale is not running on this Mac, so there is no \
-                                     address to listen on. Start Tailscale and reopen Settings."
-                                        .into(),
-                                );
-                                cx.notify();
-                            }
-                        }
+                        this.set_bridge_bind(bridgecfg::bind_tokens(lan_on, !tailnet_on), cx);
                     }),
-                )),
+                ))
+                // Say it, rather than leaving two off switches to mean something.
+                // This state is legitimate — the simulator and an SSH tunnel both
+                // want it — but it is not "off", and nothing else on screen
+                // distinguishes a listener no phone can reach from no listener.
+                .when(!lan_on && !tailnet_on, |c| {
+                    c.child(div().pt(px(6.)).child(hint(
+                        "No phone can connect: Kod is listening on this Mac only. That is the \
+                         setting for testing on the simulator, or over an SSH tunnel.",
+                    )))
+                }),
         )
     }
 
@@ -169,22 +189,40 @@ impl Orchestrator {
             // ends up debugging Tailscale, the firewall and the token — none of
             // which are wrong.
             problem(
-                "Set to “This Mac only”, so your phone cannot reach it. Choose “This Mac and \
-                 my Tailscale network” above to pair.",
+                "Kod is listening on this Mac only, so there is no address a phone could dial. \
+                 Turn on “My Wi-Fi network” or “My Tailscale network” above to pair.",
             )
             .into_any_element()
         } else if token.is_empty() {
             problem("No access token yet — turn the bridge off and on again to mint one.")
                 .into_any_element()
+        } else if st.fingerprint.is_none() {
+            // Off loopback, the pinned key is the phone's ONLY notion of who
+            // answered, so a code with no `f` in it is one the phone is built to
+            // refuse. Drawing the QR anyway would send someone hunting the
+            // firewall for a connection that was declined on principle.
+            problem(
+                "Kod is listening past this Mac but has no certificate to pin yet, and your \
+                 phone refuses an unencrypted connection to anything but itself. Turn the \
+                 bridge off and on again to mint one.",
+            )
+            .into_any_element()
         } else {
-            let url = bridgecfg::pair_url(host.as_deref().unwrap_or_default(), st_port(st), &token);
+            let url = bridgecfg::pair_url(
+                host.as_deref().unwrap_or_default(),
+                st_port(st),
+                &token,
+                st.fingerprint.as_deref(),
+            );
             div()
                 .flex()
                 .flex_col()
                 .gap(px(12.))
                 .child(qr_block(&url))
                 .child(hint("Scan this in the Kod app on your phone. It carries the address, \
-                             the port and the token together."))
+                             the port, the token, and the fingerprint of this Mac's key — which \
+                             is how your phone knows it is Kod answering and not something else \
+                             on that address."))
                 .child(
                     div()
                         .flex()
@@ -385,17 +423,14 @@ impl Orchestrator {
                     }
                 }
             }
-            // First enable defaults to the tailnet when there is one. Loopback
-            // would be a bridge no phone can reach, on the one click whose whole
-            // purpose is off-Mac reading — "This Mac only" stays one click away
-            // as a deliberate downgrade.
-            if self.bridge_bind.is_empty() {
-                if let Some(ip) = self.tailnet_ip {
-                    let s = ip.to_string();
-                    let _ = self.store_setting("bridge_bind", &s);
-                    self.bridge_bind = s;
-                }
-            }
+            // Deliberately does NOT pick an exposure for the user. The old
+            // version defaulted to the tailnet address probed at boot; with
+            // symbolic binds there is nothing to probe, and guessing here would
+            // either widen the exposure on a click that did not ask for it, or —
+            // if Tailscale happened to be down — fail the bind and snap this
+            // toggle straight back to Off with no explanation. The two switches
+            // sit directly below, and the card says plainly that no phone can
+            // connect until one is on.
         }
 
         self.bridge_on = turning_on;
@@ -418,13 +453,23 @@ impl Orchestrator {
         if bind == self.bridge_bind {
             return;
         }
-        self.bridge_bind = bind.clone();
+        let previous = std::mem::replace(&mut self.bridge_bind, bind.clone());
         // Push BEFORE persisting. Narrowing the exposure is the whole reason
-        // someone clicks "This Mac only", and a version that only wrote the store
-        // would leave the tailnet listener bound and accepting.
+        // someone turns a switch off, and a version that only wrote the store
+        // would leave that listener bound and accepting.
         self.push_bridge(cx);
-        if let Err(e) = self.store_setting("bridge_bind", &bind) {
-            self.bridge_err = Some(format!("Could not save the setting: {e}"));
+        if self.bridge_status.running || !self.bridge_on {
+            if let Err(e) = self.store_setting("bridge_bind", &bind) {
+                self.bridge_err = Some(format!("Could not save the setting: {e}"));
+            }
+        } else {
+            // The daemon refused this bind — no certificate, or the symbolic name
+            // resolved to nothing because that network is not up. Keeping it
+            // would draw a switch On over a socket that does not exist (the one
+            // lie this pane exists to prevent) and would retry the same refusal
+            // on every launch. `bridge_status.error` carries the reason, which
+            // the status line prints verbatim.
+            self.bridge_bind = previous;
         }
         cx.notify();
     }

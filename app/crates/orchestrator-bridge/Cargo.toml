@@ -8,15 +8,39 @@ edition = "2021"
 # to announce a WIRE_VERSION the daemon does not expect. See the note in client.rs.
 [dependencies]
 orchestrator-host = { path = "../orchestrator-host" }
+# getifaddrs, to tell a physical interface from a VPN tunnel — see
+# detect_lan_ip. Already a workspace dependency (the daemon uses it).
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
 # The phone-facing WebSocket server. SYNC tungstenite, not tokio-tungstenite:
 # the bridge's other half is already a blocking unix-socket client and the whole
 # expected load is a handful of phones belonging to one person, so an async
-# runtime would buy nothing and colour every function it touched. No TLS features
-# — v0 binds loopback only (see ws.rs), and pulling a TLS stack in here would
-# imply an exposure story this slice does not have.
+# runtime would buy nothing and colour every function it touched. Still no TLS
+# feature here: the TLS session is wrapped around the TcpStream in ws.rs before
+# tungstenite ever sees it, so tungstenite stays a pure framing layer with no
+# opinion about, or second copy of, a crypto stack.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+# TLS (tls.rs). `default-features = false` + `ring` is not a preference, it is
+# what keeps this out of the tree twice: rustls is ALREADY here under gpui's HTTP
+# stack with the ring provider, and taking rustls' defaults would pull aws-lc-rs
+# in beside it — a second crypto implementation, with a C build, for one
+# listener.
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2.2.0"
+# Minting the certificate IN PROCESS. The alternative is driving `openssl`, and a
+# subprocess means the private key travelling through argv, a pipe or a temp
+# file; argv is world-readable on macOS. `x509-parser` stays off — reading
+# certificates back is tls.rs's own structural walk, not a parser.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# The pin: SHA-256 of the DER SubjectPublicKeyInfo, base64url without padding.
+# Both are already in the tree; neither is hand-rolled here, because the phone
+# refuses every connection for the rest of time if this encoding is off by one
+# character.
+sha2 = "0.10"
+base64 = "0.22"
 
 [[bin]]
 name = "kod-bridge"

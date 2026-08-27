@@ -39,7 +39,7 @@ and timeline events are dropped, since the phone renders neither.
    token.
 
 3. In the app, tap the connection chip and enter host, port (default
-   `8787`, matching the bridge) and the token. The token is stored in the
+   `18787`, matching the bridge) and the token. The token is stored in the
    Keychain.
 
 ### Which socket?
@@ -58,7 +58,7 @@ Name it explicitly. `kod-bridge` refuses your default daemon socket unless
 `KodUITests` drives the shipped app against a real bridge and **skips loudly**
 when there isn't one — it exists to catch the failures that live in the seam
 between two binaries, which nothing pure can reach. The port mismatch it was
-written after (app defaulted to 8765, bridge bound 8787) is now pinned from both
+written after (app defaulted to 8765, bridge bound another) is now pinned from both
 sides: `BridgeSettings.defaultPort` and `ws::DEFAULT_PORT`.
 
 ## Project file

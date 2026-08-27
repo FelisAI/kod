@@ -56,34 +56,50 @@
 //! is also why the daemon connection is opened here rather than through
 //! [`crate::client::Client`] — see [`attach_split`].
 //!
-//! ## Binding
+//! ## Binding, and why the LAN is allowed now
 //!
-//! Loopback always; a Tailscale address as an explicit opt-in; nothing else,
-//! ever.
+//! Loopback is always bound. Past that the listener may also hold this Mac's
+//! tailnet address, its LAN address, both, or a literal address — and every one
+//! of those is REFUSED unless the connection is encrypted. See [`tls_required`];
+//! it is the rule the rest of this section rests on.
 //!
-//! An earlier version of this note claimed Tailscale "terminates as loopback"
-//! and bound 127.0.0.1 only. That is false, and it made the phone case
+//! An earlier version of this note bound 127.0.0.1 only, on the claim that
+//! Tailscale "terminates as loopback". That is false, and it made the phone case
 //! impossible: an SSH tunnel does terminate as loopback, but Tailscale gives the
 //! Mac its own 100.x address on a utun interface, and a loopback-bound listener
 //! REFUSES those connections. Measured, not assumed — connecting to the tailnet
 //! address gave ECONNREFUSED while 127.0.0.1 accepted.
 //!
-//! So the policy is a range check, not a blanket ban. v0 has one shared bearer
-//! token and no TLS:
+//! The version after that allowed a tailnet address and refused the LAN, and the
+//! reasoning was sound for what it had: one shared bearer token, no TLS. A
+//! tailnet hop is already authenticated and encrypted by WireGuard; a LAN hop
+//! would have put a credential that TYPES INTO YOUR SHELLS onto café wifi in the
+//! clear. TLS does not overturn that argument, it removes its premise. With the
+//! connection encrypted under a key the phone pinned at pairing, a LAN hop
+//! carries no more in the clear than a tailnet one, so `lan` becomes a legal
+//! answer — and turning TLS off makes it illegal again, in the same breath.
 //!
-//! * loopback — safe by construction, and what an SSH tunnel presents.
-//! * a tailnet address (100.64.0.0/10) — WireGuard already authenticates the
-//!   device and encrypts the hop, so the token is not crossing anything in the
-//!   clear. This is the case the phone actually needs.
-//! * anything else — REFUSED. 0.0.0.0 or a LAN address would put a plaintext
-//!   bearer token on café wifi, which is the downgrade the old note feared.
+//! 0.0.0.0 stays refused in every configuration. Binding the chosen addresses
+//! one at a time instead leaves the socket simply absent from every other
+//! interface this Mac has, which is a wall that costs nothing and stands in
+//! front of the pin rather than behind it.
 //!
-//! When a tailnet bind is configured the bridge listens on BOTH it and loopback,
-//! so the simulator and the phone can be connected at the same time.
+//! ## Resolution happens at bind time
+//!
+//! The configured value is SYMBOLIC — `""`, `"lan"`, `"tailscale"`,
+//! `"lan,tailscale"` — and turns into addresses in [`Net::resolve`], immediately
+//! before the bind and never stored. That is what makes a DHCP renewal, a
+//! network change or a Tailscale restart a non-event: there is no cached address
+//! to invalidate and no window anyone has to be told to reopen.
+//!
+//! Resolution asks the KERNEL for the route — a UDP `connect` that sends no
+//! packets — and never keys off an interface name. Measured on this machine:
+//! `utun0` carries a 192.168 address and the tailnet lives on a later utun, so
+//! "the first utun" is confidently wrong.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -104,12 +120,13 @@ use orchestrator_host::session::SessionId;
 
 use crate::client::AttachError;
 use crate::mirror::{Change, Mirror};
+use crate::tls::Tls;
 use crate::wire::{
     decode_frame, BridgeMsg, Caps, PhoneMsg, WireSession, MAX_FRAME, PROTO,
 };
 
 /// The port the phone dials when nothing says otherwise.
-pub const DEFAULT_PORT: u16 = 8787;
+pub const DEFAULT_PORT: u16 = 18787;
 
 /// How long a connection may sit between reads before the loop checks its
 /// outbound queue. Short enough that a phase change reaches the phone promptly,
@@ -176,16 +193,32 @@ const HARD_FRAME_CEILING: usize = MAX_FRAME * 2;
 
 // --------------------------------------------------------------------- config
 
-/// Where the phone-facing listener is allowed to live.
+/// Where the phone-facing listener is allowed to live, as CONFIGURED.
 ///
-/// Deliberately NOT a bare `IpAddr`: the whole safety argument is that only two
-/// kinds of address are acceptable, so the type refuses to represent a third.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bind {
-    /// 127.0.0.1 only. The default, and what an SSH tunnel presents.
-    Loopback,
-    /// Loopback AND this tailnet address, for a phone on the same tailnet.
-    Tailnet(Ipv4Addr),
+/// Symbolic rather than a set of addresses, and that is the whole point: `lan`
+/// means "whatever this Mac's LAN address is at the moment we bind". An address
+/// stored here would go stale on a DHCP renewal or a Tailscale restart, and
+/// every holder of it would then need a cache to invalidate and a window to
+/// reopen. Resolution happens once, in [`Net::resolve`], microseconds before the
+/// bind.
+///
+/// Loopback is not a field. It is always bound.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Bind {
+    /// This Mac's address on the local network.
+    pub lan: bool,
+    /// This Mac's tailnet address.
+    pub tailnet: bool,
+    /// Literal addresses, for the CLI and for pinning one interface.
+    pub literal: Vec<Ipv4Addr>,
+}
+
+impl Bind {
+    /// Loopback and nothing else: the default, and the only shape that is legal
+    /// without TLS.
+    pub fn is_loopback_only(&self) -> bool {
+        !self.lan && !self.tailnet && self.literal.is_empty()
+    }
 }
 
 /// Tailscale hands out addresses from the CGNAT block 100.64.0.0/10 — that is
@@ -206,45 +239,155 @@ pub fn is_tailnet(ip: IpAddr) -> bool {
     }
 }
 
-/// Resolve `KOD_BRIDGE_BIND`. Unset means loopback; anything set must be a
-/// tailnet address, and every other value is refused WITH THE REASON — a silent
-/// downgrade to loopback would leave the user staring at a phone that cannot
-/// connect and no explanation on the terminal.
+/// An address a phone on the same wifi would have: RFC 1918, plus link-local for
+/// a network with no DHCP server.
+///
+/// Deliberately NOT "everything that is not public". The CGNAT block belongs to
+/// Tailscale here (see [`is_tailnet`]), and folding the two together would let a
+/// tailnet-only bind admit LAN peers and a LAN-only bind admit tailnet ones —
+/// each of which is precisely the peer the other configuration was chosen to
+/// exclude.
+pub fn is_private_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        // Unique-local fc00::/7 and link-local fe80::/10.
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// THE RULE THAT MAKES A LAN BIND SAFE: nothing past loopback without TLS.
+///
+/// Loopback needs no encryption — those packets never leave the machine, and the
+/// simulator and an SSH tunnel both arrive there. Everything else does: without
+/// it the bearer token, and every keystroke it authorises, cross whatever
+/// network you happen to be on in the clear. So the combination is REFUSED
+/// outright rather than warned about, and refused here, in one function, so the
+/// settings window, the command line and the accept loop cannot reach three
+/// different conclusions.
+///
+/// The sentence is written to be shown in a window exactly as it stands. It
+/// names no environment variable, because a user who has never set one reads
+/// that as a bug in the app rather than as a note about a field they just
+/// changed.
+pub fn tls_required(beyond_loopback: bool, tls: bool) -> Result<(), String> {
+    if tls || !beyond_loopback {
+        return Ok(());
+    }
+    Err("With TLS off the bridge can only listen on this Mac. Reaching it over wifi or \
+         Tailscale would send your access token — and everything you type into your \
+         sessions — across the network in the clear, so the bridge refuses that \
+         combination. Turn TLS back on, or set the address back to loopback."
+        .to_string())
+}
+
+/// One sentence for every malformed bind, because they all have the same fix.
+fn bad_bind(token: &str) -> String {
+    format!(
+        "“{token}” is not an address this bridge will listen on. Use `lan` for this Mac's \
+         address on the local network, `tailscale` for its Tailscale address, both \
+         separated by a comma, or a literal IPv4 address — and leave it empty for \
+         loopback only."
+    )
+}
+
+/// Resolve the `bridge_bind` grammar (`KOD_BRIDGE_BIND` on the command line).
+///
+/// Comma-separated, case-insensitive, whitespace-tolerant:
+///
+/// ```text
+/// ""                loopback only (the default)
+/// "tailscale"       loopback + this Mac's tailnet address
+/// "lan"             loopback + this Mac's LAN address
+/// "lan,tailscale"   all three
+/// "192.168.0.71"    loopback + that literal address
+/// ```
+///
+/// Nothing is resolved here — see [`Bind`]. Every other value is refused WITH THE
+/// REASON: a silent downgrade to loopback would leave the user staring at a phone
+/// that cannot connect and no explanation anywhere on screen.
 pub fn parse_bind(raw: Option<String>) -> Result<Bind, String> {
-    let Some(raw) = raw else { return Ok(Bind::Loopback) };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(Bind::Loopback);
+    let mut bind = Bind::default();
+    let Some(raw) = raw else { return Ok(bind) };
+    for token in raw.split(',') {
+        let t = token.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("loopback") || t.eq_ignore_ascii_case("localhost")
+        {
+            continue;
+        }
+        if t.eq_ignore_ascii_case("lan") {
+            bind.lan = true;
+            continue;
+        }
+        // "tailnet" alongside "tailscale" because both are in the vocabulary
+        // already — this file's own type is called `Bind::tailnet`.
+        if t.eq_ignore_ascii_case("tailscale") || t.eq_ignore_ascii_case("tailnet") {
+            bind.tailnet = true;
+            continue;
+        }
+        let ip: Ipv4Addr = t.parse().map_err(|_| bad_bind(t))?;
+        if ip.is_unspecified() {
+            // Refused on its own terms rather than through `bad_bind`: 0.0.0.0 is
+            // not a typo for something legal, it is the one value someone reaches
+            // for on purpose and should be talked out of.
+            return Err(format!(
+                "{ip} is every interface this Mac has, including the ones you have not \
+                 thought about. Say `lan` or `tailscale` instead: the bridge binds those \
+                 addresses one at a time, so the socket is simply not present on anything \
+                 else."
+            ));
+        }
+        if ip.is_loopback() {
+            continue;
+        }
+        if ip.is_multicast() || ip.is_broadcast() {
+            return Err(bad_bind(t));
+        }
+        bind.literal.push(ip);
     }
-    if raw.eq_ignore_ascii_case("loopback") || raw == "127.0.0.1" {
-        return Ok(Bind::Loopback);
-    }
-    let ip: Ipv4Addr = raw.parse().map_err(|_| {
-        format!(
-            "KOD_BRIDGE_BIND={raw} is not an IPv4 address. Set it to your Tailscale \
-             address (`tailscale ip -4`), or leave it unset for loopback."
-        )
-    })?;
-    if !is_tailnet(IpAddr::V4(ip)) {
-        return Err(format!(
-            "KOD_BRIDGE_BIND={ip} is not a Tailscale address (100.64.0.0/10). The bridge \
-             refuses it: v0 authenticates with one shared bearer token and has no TLS, so \
-             binding a LAN or wildcard address would put that token in the clear on whatever \
-             network you are on. Use `tailscale ip -4`, or an SSH tunnel to loopback."
-        ));
-    }
-    Ok(Bind::Tailnet(ip))
+    Ok(bind)
 }
 
 /// Whether a connected peer is allowed to speak the protocol at all.
 ///
 /// This runs BEFORE the token is read, so a peer that should not be able to
-/// reach the bridge never gets to present (or brute-force) a credential.
-pub fn peer_allowed(peer: IpAddr, bind: Bind) -> bool {
+/// reach the bridge never gets to present — or brute-force — a credential.
+///
+/// `bound` is what the kernel actually handed out, never what was configured. A
+/// `tailscale` bind that resolved to nothing must admit nobody, and consulting
+/// the configuration here instead would admit every tailnet peer on the strength
+/// of a word left in a settings field.
+///
+/// A bound address that is neither tailnet nor private (a literal public one,
+/// say) widens nothing, so such a bind admits loopback only. That is the safe
+/// direction to be wrong in: the symptom is a peer that cannot connect, not one
+/// that can.
+pub fn peer_allowed(peer: IpAddr, bound: &[Ipv4Addr]) -> bool {
     if peer.is_loopback() {
         return true;
     }
-    matches!(bind, Bind::Tailnet(_)) && is_tailnet(peer)
+    let tailnet_bound = bound.iter().any(|a| is_tailnet(IpAddr::V4(*a)));
+    let lan_bound = bound.iter().any(|a| is_private_lan(IpAddr::V4(*a)));
+    (tailnet_bound && is_tailnet(peer)) || (lan_bound && is_private_lan(peer))
+}
+
+/// `KOD_BRIDGE_TLS`. Unset means ON.
+///
+/// The default has to be the safe one. A plaintext default is discovered by
+/// someone else reading your wire, which is not a feedback loop anybody gets to
+/// learn from.
+fn parse_tls(raw: Option<String>) -> Result<bool, String> {
+    let Some(raw) = raw else { return Ok(true) };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "on" | "true" | "yes" => Ok(true),
+        "0" | "off" | "false" | "no" => Ok(false),
+        other => Err(format!(
+            "KOD_BRIDGE_TLS={other:?} is neither on nor off. Leave it unset — TLS is on by \
+             default, and turning it off restricts the bridge to loopback."
+        )),
+    }
 }
 
 /// Everything `serve` reads from the environment, resolved up front so a
@@ -254,6 +397,9 @@ pub struct Config {
     pub token: String,
     pub port: u16,
     pub bind: Bind,
+    /// Serve TLS. On unless something explicitly turns it off, and turning it
+    /// off is only legal with a loopback bind — [`tls_required`].
+    pub tls: bool,
 }
 
 impl Config {
@@ -262,6 +408,7 @@ impl Config {
             std::env::var("KOD_BRIDGE_TOKEN").ok(),
             std::env::var("KOD_BRIDGE_PORT").ok(),
             std::env::var("KOD_BRIDGE_BIND").ok(),
+            std::env::var("KOD_BRIDGE_TLS").ok(),
         )
     }
 
@@ -274,6 +421,7 @@ impl Config {
         token: Option<String>,
         port: Option<String>,
         bind: Option<String>,
+        tls: Option<String>,
     ) -> Result<Self, String> {
         let token = token.ok_or_else(|| {
             "KOD_BRIDGE_TOKEN is not set. The bridge will not start without one: there is \
@@ -296,7 +444,11 @@ impl Config {
             return Err("KOD_BRIDGE_PORT must not be 0".to_string());
         }
         let bind = parse_bind(bind)?;
-        Ok(Self { token, port, bind })
+        let tls = parse_tls(tls)?;
+        // Refused at CONFIG time as well as at bind time, so the process dies
+        // before it opens a socket or touches the daemon.
+        tls_required(!bind.is_loopback_only(), tls)?;
+        Ok(Self { token, port, bind, tls })
     }
 
     /// The same rules for a caller that already holds the values AS VALUES — a
@@ -324,23 +476,27 @@ impl Config {
                 .to_string());
         }
         if port == 0 {
-            return Err("0 is not a port. Use 8787 unless you have a reason not to, and set the \
+            return Err("0 is not a port. Use 18787 unless you have a reason not to, and set the \
                         same number in the phone app."
                 .to_string());
         }
-        // The reason is discarded on purpose: "not an IPv4 address" and "not a
-        // Tailscale address" have the SAME fix, and one sentence that says what
-        // to type beats two that say what was wrong.
+        // The reason is discarded on purpose: every way of getting this wrong
+        // has the same fix, and one sentence that says what to type beats two
+        // that say what was wrong.
         let bind = parse_bind(Some(bind.to_string())).map_err(|_| {
             format!(
                 "“{bind}” is not an address this bridge will listen on. Leave it empty for \
-                 loopback — an SSH tunnel or the simulator — or paste this Mac's Tailscale \
-                 address (`tailscale ip -4`, something like 100.x.y.z). Nothing else is \
-                 accepted: there is no TLS yet, so a LAN or wildcard address would put your \
-                 token in the clear on whatever network you happen to be on."
+                 loopback — an SSH tunnel or the simulator — or use `lan` for this Mac's \
+                 address on the local network, `tailscale` for its Tailscale address, or \
+                 both separated by a comma. A literal IPv4 address works too. Nothing else \
+                 is accepted, `0.0.0.0` included: the bridge binds the addresses you name \
+                 and is simply not present on the rest."
             )
         })?;
-        Ok(Self { token, port, bind })
+        // The app always serves TLS — that is what lets its pairing card always
+        // carry a pin — so `tls_required` has nothing to refuse on this path and
+        // is not restated.
+        Ok(Self { token, port, bind, tls: true })
     }
 }
 
@@ -979,6 +1135,235 @@ impl Started {
     }
 }
 
+/// A bind resolved to real addresses, plus the TLS identity that will be served
+/// on them.
+///
+/// Built by [`Net::resolve`] and used IMMEDIATELY. Keeping one of these across a
+/// network change is exactly the caching this design exists to avoid: it is a
+/// value handed from `serve` into [`serve_with`], not a thing to store.
+pub struct Net {
+    /// The non-loopback addresses to bind, in the order a phone should be
+    /// offered them. Loopback is not in here — it is bound unconditionally.
+    pub extra: Vec<Ipv4Addr>,
+    /// `None` is plaintext, which [`tls_required`] has already established is
+    /// only reachable with `extra` empty.
+    pub tls: Option<Arc<Tls>>,
+}
+
+impl Net {
+    /// Resolve `cfg.bind` against the routing table AS IT IS RIGHT NOW, and load
+    /// (or, on first use, mint) the TLS identity for the addresses that came
+    /// back. `dir` is where that identity lives — see [`crate::tls`].
+    pub fn resolve(cfg: &Config, dir: &Path) -> Result<Self, String> {
+        // Checked before anything is resolved, so the sentence a user reads is
+        // the one they can act on — "turn TLS on", not "Tailscale is not up".
+        tls_required(!cfg.bind.is_loopback_only(), cfg.tls)?;
+        let extra = resolve_bind(&cfg.bind)?;
+        let tls = match cfg.tls {
+            true => Some(Arc::new(Tls::load_or_mint(dir, &extra)?)),
+            false => None,
+        };
+        Ok(Self { extra, tls })
+    }
+
+    /// Loopback, plaintext. The shape every socket test in this file wants, and
+    /// the only shape `tls_required` lets a caller assemble by hand.
+    pub fn loopback_plaintext() -> Self {
+        Self { extra: Vec::new(), tls: None }
+    }
+
+    /// What the phone must have pinned, or `None` when this bridge is plaintext.
+    pub fn fingerprint(&self) -> Option<String> {
+        self.tls.as_ref().map(|t| t.fingerprint())
+    }
+}
+
+/// The non-loopback addresses a [`Bind`] means right now.
+///
+/// Tailnet first, because the pairing card shows the first one and a tailnet
+/// address is the one that still works after the phone leaves the house.
+///
+/// A symbolic name that resolves to nothing is an ERROR, not an empty list. The
+/// alternative is a bridge that was asked to be reachable, came up loopback-only
+/// and reported itself healthy — the user then reads "running" on one screen and
+/// "cannot connect" on the other, with nothing to connect the two.
+pub fn resolve_bind(bind: &Bind) -> Result<Vec<Ipv4Addr>, String> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    let mut push = |ip: Ipv4Addr| {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    };
+    if bind.tailnet {
+        push(detect_tailnet_ip().ok_or_else(|| {
+            "this Mac has no Tailscale address at the moment, so there is nothing to bind. \
+             Is Tailscale running and logged in? (`tailscale ip -4`)"
+                .to_string()
+        })?);
+    }
+    if bind.lan {
+        push(detect_lan_ip().ok_or_else(|| {
+            "this Mac has no address on the local network at the moment, so there is nothing \
+             to bind. Join a wifi or ethernet network, or use `tailscale` instead."
+                .to_string()
+        })?);
+    }
+    for ip in &bind.literal {
+        push(*ip);
+    }
+    Ok(out)
+}
+
+/// This Mac's Tailscale IPv4 address, or `None` when Tailscale is not up.
+pub fn detect_tailnet_ip() -> Option<Ipv4Addr> {
+    // Any address inside 100.64.0.0/10 serves as the probe; this one is
+    // Tailscale's own DNS resolver, so it exists on every tailnet.
+    route_probe("100.100.100.100:9", |ip| is_tailnet(IpAddr::V4(ip)))
+}
+
+/// This Mac's address on the local network, or `None` when it is on none.
+///
+/// The probe aims at TEST-NET-1 (RFC 5737): an address with no special route
+/// anywhere, so the kernel answers with whatever the DEFAULT route is, which is
+/// the interface a phone on the same wifi can reach. MEASURED on this Mac —
+/// 192.0.2.1 resolved to 192.168.0.71 (the en1 address) while 100.100.100.100
+/// resolved to the tailnet one, which is the discrimination this needs.
+///
+/// A tailnet or loopback answer is REFUSED rather than returned. With a
+/// Tailscale exit node up the default route runs through the tunnel, and handing
+/// that address back as "the LAN address" would bind the wrong interface and
+/// then print it on the pairing card.
+pub fn detect_lan_ip() -> Option<Ipv4Addr> {
+    // The route probe alone is NOT enough here, and this is the whole subtlety of
+    // "lan".
+    //
+    // It follows the DEFAULT route, so on a machine with a corporate VPN up
+    // (WireGuard, OpenVPN, an IPsec client) the answer is the tunnel's RFC1918
+    // address — 10.x — which is private, passes every range check, and is not the
+    // user's wifi at all. Binding it publishes the bridge into the corporate
+    // network and widens `peer_allowed` to that whole private space, under a
+    // switch that says "My Wi-Fi network".
+    //
+    // So the probe's answer must also sit on a PHYSICAL interface. On macOS those
+    // are `en*` (Ethernet and Wi-Fi); tunnels are `utun*`/`ipsec*`/`ppp*`, and
+    // `awdl*`/`llw*`/`bridge*` are virtual. This is not the "pick by interface
+    // name" mistake the tailnet probe avoids — that one guessed WHICH utun, which
+    // is unknowable; this only asks whether an address the kernel already chose
+    // belongs to real hardware. Anyone whose LAN is somewhere stranger can still
+    // name a literal address.
+    let ip = route_probe("192.0.2.1:9", |ip| is_private_lan(IpAddr::V4(ip)))?;
+    if on_physical_interface(ip) {
+        Some(ip)
+    } else {
+        None
+    }
+}
+
+/// Whether `want` is configured on an `en*` interface.
+///
+/// `getifaddrs` rather than anything shelled out: it is the same list `ifconfig`
+/// prints, without a subprocess.
+fn on_physical_interface(want: Ipv4Addr) -> bool {
+    use std::ffi::CStr;
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        // Cannot tell — refuse rather than guess. A false "yes" here is the
+        // exposure this function exists to prevent.
+        return false;
+    }
+    let mut found = false;
+    let mut cur = head;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        let sa = unsafe { &*ifa.ifa_addr };
+        if sa.sa_family as i32 != libc::AF_INET {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().to_string();
+        if !name.starts_with("en") {
+            continue;
+        }
+        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        if addr == want {
+            found = true;
+            break;
+        }
+    }
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
+/// Ask the kernel which local address it would use to reach `dst`.
+///
+/// A UDP `connect` SENDS NOTHING — it only asks for a route and binds a local
+/// address — so this is a routing-table lookup with no packets, no timeout and
+/// no dependency on any address being reachable or any CLI being installed.
+///
+/// Never by interface name: measured on this Mac, `utun0` carries a 192.168
+/// address and the tailnet lives on a later utun, so anything keying off "the
+/// first utun" confidently returns the wrong one.
+fn route_probe(dst: &str, accept: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    sock.connect(dst).ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) if accept(v4) => Some(v4),
+        _ => None,
+    }
+}
+
+/// The startup banner, and the ONLY thing the supervising daemon reads to learn
+/// what actually happened — see `orchestrator-daemon/src/bridge.rs`, which parses
+/// this line rather than re-deriving anything from the config it passed in.
+///
+/// The pin is on it because the daemon has no other way to reach it: the
+/// certificate lives in this child process, and `BridgeStatus.fingerprint` is
+/// what the desktop puts into the pairing QR. No pin on the line means no TLS,
+/// which means the phone must be told to dial `ws://` — so its ABSENCE carries
+/// information too, and dropping the segment when there is nothing to say is
+/// deliberate rather than tidy.
+pub fn banner(
+    wire_version: u32,
+    epoch: &str,
+    endpoints: &[String],
+    fingerprint: Option<&str>,
+    sessions: usize,
+) -> String {
+    let where_ = endpoints
+        .iter()
+        .map(|e| format!("{e}{}", endpoint_label(e)))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let pin = fingerprint.map(|f| format!(" · pin {f}")).unwrap_or_default();
+    format!(
+        "bridge · wire {wire_version} · epoch {epoch} · listening on {where_}{pin} · \
+         {sessions} sessions"
+    )
+}
+
+/// " (tailnet)" / " (lan)" for a human reading the terminal. Derived from the
+/// address rather than from the config, so it cannot describe an endpoint as
+/// something it is not.
+fn endpoint_label(endpoint: &str) -> &'static str {
+    let Some(ip) = endpoint.rsplit_once(':').and_then(|(h, _)| h.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+    else {
+        return "";
+    };
+    if ip.is_loopback() {
+        ""
+    } else if is_tailnet(ip) {
+        " (tailnet)"
+    } else if is_private_lan(ip) {
+        " (lan)"
+    } else {
+        ""
+    }
+}
+
 /// Bind and start accepting WITHOUT blocking; the caller owns the shutdown.
 ///
 /// This is the half of [`serve`] a GUI can drive. It deliberately knows nothing
@@ -994,29 +1379,39 @@ impl Started {
 /// Stopping: set `stop`, then [`Started::join`].
 pub fn serve_with(
     cfg: &Config,
+    net: &Net,
     hub: Arc<Hub>,
     stop: Arc<AtomicBool>,
     input: Sender<PhoneRequest>,
 ) -> Result<Started, String> {
-    // Loopback is always bound, even when a tailnet address is configured: the
-    // simulator and an SSH tunnel both arrive on 127.0.0.1, and losing them the
-    // moment the phone is set up would be a bad trade.
+    // The last gate, at the only place in the process where a socket is actually
+    // opened. `Config::parse` and `Net::resolve` both refuse this combination
+    // with a sentence written for a person; this one is structural, so a future
+    // caller that assembles a `Config` by hand — every field is public — still
+    // cannot arrive at a plaintext listener on a network.
+    tls_required(!net.extra.is_empty(), net.tls.is_some())?;
+
+    // Loopback is always bound, whatever else is: the simulator and an SSH
+    // tunnel both arrive on 127.0.0.1, and losing them the moment the phone is
+    // set up would be a bad trade.
     let mut listeners = vec![TcpListener::bind((Ipv4Addr::LOCALHOST, cfg.port))
         .map_err(|e| format!("cannot bind 127.0.0.1:{}: {e}", cfg.port))?];
-    if let Bind::Tailnet(ip) = cfg.bind {
-        listeners.push(TcpListener::bind((ip, cfg.port)).map_err(|e| {
+    for ip in &net.extra {
+        listeners.push(TcpListener::bind((*ip, cfg.port)).map_err(|e| {
             format!(
-                "cannot bind {ip}:{}: {e}. Is that still this machine's Tailscale \
-                 address? Check `tailscale ip -4`.",
+                "cannot bind {ip}:{}: {e}. That was this Mac's address a moment ago — did \
+                 the network just change?",
                 cfg.port
             )
         })?);
     }
 
     let token = Arc::new(cfg.token.clone());
-    let bind = cfg.bind;
-    // Shared by BOTH accept threads when a tailnet address is bound, which is
-    // why the gate below is a read-modify-write and not a load then an add.
+    // What the kernel gave us, which is what `peer_allowed` must judge against.
+    let bound = Arc::new(net.extra.clone());
+    let tls = net.tls.clone();
+    // Shared by every accept thread, which is why the gate below is a
+    // read-modify-write and not a load then an add.
     let conns = Arc::new(AtomicUsize::new(0));
     let mut endpoints = Vec::with_capacity(listeners.len());
     let mut accept_threads = Vec::with_capacity(listeners.len());
@@ -1036,6 +1431,8 @@ pub fn serve_with(
         let token = Arc::clone(&token);
         let stop = Arc::clone(&stop);
         let conns = Arc::clone(&conns);
+        let bound = Arc::clone(&bound);
+        let tls = tls.clone();
         let input = input.clone();
         accept_threads.push(std::thread::spawn(move || {
             // Leaving this loop DROPS the listener, and that — not the flag — is
@@ -1069,7 +1466,7 @@ pub fn serve_with(
                 // can reach these sockets, but if a bind ever widens by
                 // accident this refuses the peer BEFORE it can present — or
                 // guess at — the bearer token.
-                if !stream.peer_addr().map(|a| peer_allowed(a.ip(), bind)).unwrap_or(false) {
+                if !stream.peer_addr().map(|a| peer_allowed(a.ip(), &bound)).unwrap_or(false) {
                     continue;
                 }
                 // Over the cap the socket is DROPPED here, which closes it: a
@@ -1087,6 +1484,7 @@ pub fn serve_with(
                 let token = Arc::clone(&token);
                 let stop = Arc::clone(&stop);
                 let conns = Arc::clone(&conns);
+                let tls = tls.clone();
                 let input = input.clone();
                 std::thread::spawn(move || {
                     // The slot must come back even if `conn` panics, or every
@@ -1095,7 +1493,7 @@ pub fn serve_with(
                     // outright, so there is nothing an unwind can leave visibly
                     // half-built — hence AssertUnwindSafe rather than a redesign.
                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                        conn(stream, &hub, &token, &stop, &input)
+                        conn(stream, tls.as_deref(), &hub, &token, &stop, &input)
                     }));
                     conns.fetch_sub(1, Ordering::SeqCst);
                 });
@@ -1107,13 +1505,17 @@ pub fn serve_with(
 
 /// Run the bridge: bind, attach, serve until the daemon goes away.
 ///
-/// ORDER MATTERS. Config is validated and the listener is bound BEFORE
-/// `Client::attach` — that is `serve_with`, which binds before it returns — so a
-/// missing token or a busy port fails without ever having touched the daemon.
-/// Attaching is the one irreversible act in this process (see `client.rs` on
-/// retire), so it goes last.
+/// ORDER MATTERS, and there are now four steps rather than two. Config is
+/// validated, the bind is resolved, the TLS identity is loaded or minted, and
+/// the listeners are bound — all BEFORE `Client::attach`. So a missing token, a
+/// Tailscale that is not up, an unwritable runtime directory or a busy port each
+/// fail without ever having touched the daemon. Attaching is the one
+/// irreversible act in this process (see `client.rs` on retire), so it goes last.
 pub fn serve(socket: &Path) -> Result<(), String> {
     let cfg = Config::from_env()?;
+    // The identity lives beside the daemon's socket, which is the only path this
+    // process was given — see `tls::identity_dir`.
+    let net = Net::resolve(&cfg, &crate::tls::identity_dir(socket))?;
     let hub = Arc::new(Hub::new(mint_epoch()));
     // The CLI has no stop path — the process IS the lifetime — so this is only
     // ever set on the way out, to retire the listeners with the daemon they
@@ -1123,14 +1525,17 @@ pub fn serve(socket: &Path) -> Result<(), String> {
     // own answer before reading another frame, so at most MAX_CONNS asks can be
     // in flight no matter how hard the phones type.
     let (input_tx, input_rx) = mpsc::channel::<PhoneRequest>();
-    let started = serve_with(&cfg, Arc::clone(&hub), Arc::clone(&stop), input_tx)?;
+    let started = serve_with(&cfg, &net, Arc::clone(&hub), Arc::clone(&stop), input_tx)?;
+    let endpoints = started.endpoints.clone();
+    let fingerprint = net.fingerprint();
 
     // `?` here would return with the accept threads still looping and still
     // holding the port — and, worse, still ACCEPTING phones and serving them an
     // empty Hub for a daemon we never reached. Every exit from this function past
     // the bind has to go through the same teardown, so the fallible part is
     // wrapped and the teardown runs once at the end.
-    let outcome = serve_attached(socket, &cfg, &hub, input_rx);
+    let outcome =
+        serve_attached(socket, &endpoints, fingerprint.as_deref(), &hub, input_rx);
     stop.store(true, Ordering::Relaxed);
     started.join();
     outcome
@@ -1140,7 +1545,8 @@ pub fn serve(socket: &Path) -> Result<(), String> {
 /// error path cannot skip the caller's stop-and-join.
 fn serve_attached(
     socket: &Path,
-    cfg: &Config,
+    endpoints: &[String],
+    fingerprint: Option<&str>,
     hub: &Arc<Hub>,
     requests: Receiver<PhoneRequest>,
 ) -> Result<(), String> {
@@ -1155,14 +1561,9 @@ fn serve_attached(
     hub.reset(wire_sessions(&mirror));
 
     if let ServerMsg::Welcome { wire_version, .. } = &welcome {
-        let where_ = match cfg.bind {
-            Bind::Loopback => format!("127.0.0.1:{}", cfg.port),
-            Bind::Tailnet(ip) => format!("127.0.0.1:{p} and {ip}:{p} (tailnet)", p = cfg.port),
-        };
         println!(
-            "bridge · wire {wire_version} · epoch {} · listening on {where_} · {} sessions",
-            hub.epoch(),
-            mirror.sessions.len()
+            "{}",
+            banner(*wire_version, hub.epoch(), endpoints, fingerprint, mirror.sessions.len())
         );
     }
 
@@ -1226,9 +1627,64 @@ fn ws_config() -> WebSocketConfig {
         .max_frame_size(Some(HARD_FRAME_CEILING))
 }
 
+/// What a connection speaks over: the raw socket, or a rustls session wrapped
+/// AROUND that same socket.
+///
+/// Wrapped rather than replaced, because everything below still needs the socket
+/// itself. The whole read strategy in `conn` is a socket option — a short read
+/// timeout is what turns a blocking read into "check the outbound queue" — and
+/// neither tungstenite nor rustls has anything to offer in its place.
+enum Wire {
+    Plain(TcpStream),
+    /// Boxed because a `ServerConnection` carries the TLS buffers and is large,
+    /// and this value is moved into tungstenite's `WebSocket` and then lives for
+    /// the life of the connection thread.
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+
+impl Wire {
+    /// The socket underneath, for the timeouts.
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Wire::Plain(s) => s,
+            Wire::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.read(buf),
+            // rustls surfaces the underlying socket's errors unchanged, so the
+            // WouldBlock a read timeout produces still reaches `would_block`
+            // below and still means "nothing yet", not "the link died". A TLS
+            // record split across a timeout stays in rustls' own buffer and is
+            // completed on the next turn of the loop.
+            Wire::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.write(buf),
+            Wire::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Wire::Plain(s) => s.flush(),
+            Wire::Tls(s) => s.flush(),
+        }
+    }
+}
+
 /// One connection, start to finish.
 fn conn(
     stream: TcpStream,
+    tls: Option<&Tls>,
     hub: &Hub,
     token: &str,
     stop: &AtomicBool,
@@ -1244,7 +1700,21 @@ fn conn(
     {
         return;
     }
-    let Ok(mut ws) = tungstenite::accept_with_config(stream, Some(ws_config())) else {
+    // The TLS handshake happens lazily, inside the first read tungstenite makes
+    // — so it inherits HELLO_TIMEOUT, and a peer that opens a socket and then
+    // stalls mid-handshake is dropped by the same deadline that catches one
+    // stalling mid-hello. Everything that can go wrong here (a client speaking
+    // plaintext at a TLS port, an interrupted handshake, an unusable
+    // certificate) fails THIS connection and nothing else: the listener, the
+    // other phones and the daemon pump are all somewhere else entirely.
+    let wire = match tls {
+        Some(tls) => match rustls::ServerConnection::new(tls.config()) {
+            Ok(session) => Wire::Tls(Box::new(rustls::StreamOwned::new(session, stream))),
+            Err(_) => return,
+        },
+        None => Wire::Plain(stream),
+    };
+    let Ok(mut ws) = tungstenite::accept_with_config(wire, Some(ws_config())) else {
         return;
     };
 
@@ -1324,7 +1794,7 @@ fn conn(
     let Some(handle) = handle else { return };
 
     // Phase 2: read pings, write deltas, until either end stops.
-    let _ = ws.get_ref().set_read_timeout(Some(POLL));
+    let _ = ws.get_ref().tcp().set_read_timeout(Some(POLL));
     // Proof of life, for IDLE_TIMEOUT. It starts HERE rather than at accept so
     // that a slow handshake is not charged against the phone's first minute.
     let mut last_rx = Instant::now();
@@ -1417,7 +1887,7 @@ fn would_block(e: &tungstenite::Error) -> bool {
     )
 }
 
-fn send_all(ws: &mut WebSocket<TcpStream>, frames: &[BridgeMsg]) -> bool {
+fn send_all(ws: &mut WebSocket<Wire>, frames: &[BridgeMsg]) -> bool {
     for f in frames {
         if ws.write(Message::Text(f.to_frame().into())).is_err() {
             return false;
@@ -1476,17 +1946,20 @@ mod tests {
 
     #[test]
     fn a_missing_or_empty_token_refuses_to_start() {
-        assert!(Config::parse(None, None, None).is_err());
-        assert!(Config::parse(Some(String::new()), None, None).is_err());
-        assert!(Config::parse(Some("   ".into()), None, None).is_err());
+        assert!(Config::parse(None, None, None, None).is_err());
+        assert!(Config::parse(Some(String::new()), None, None, None).is_err());
+        assert!(Config::parse(Some("   ".into()), None, None, None).is_err());
     }
 
     #[test]
-    fn the_port_defaults_to_8787_and_must_be_a_port() {
-        assert_eq!(Config::parse(Some("k".into()), None, None).unwrap().port, 8787);
-        assert_eq!(Config::parse(Some("k".into()), Some("9001".into()), None).unwrap().port, 9001);
-        assert!(Config::parse(Some("k".into()), Some("no".into()), None).is_err());
-        assert!(Config::parse(Some("k".into()), Some("0".into()), None).is_err());
+    fn the_port_defaults_to_18787_and_must_be_a_port() {
+        assert_eq!(Config::parse(Some("k".into()), None, None, None).unwrap().port, DEFAULT_PORT);
+        assert_eq!(
+            Config::parse(Some("k".into()), Some("9001".into()), None, None).unwrap().port,
+            9001
+        );
+        assert!(Config::parse(Some("k".into()), Some("no".into()), None, None).is_err());
+        assert!(Config::parse(Some("k".into()), Some("0".into()), None, None).is_err());
     }
 
     // ---- bind policy ----
@@ -1509,56 +1982,234 @@ mod tests {
     }
 
     #[test]
-    fn bind_defaults_to_loopback_and_accepts_only_a_tailnet_address() {
-        assert_eq!(parse_bind(None).unwrap(), Bind::Loopback);
-        assert_eq!(parse_bind(Some("".into())).unwrap(), Bind::Loopback);
-        assert_eq!(parse_bind(Some("  ".into())).unwrap(), Bind::Loopback);
-        assert_eq!(parse_bind(Some("loopback".into())).unwrap(), Bind::Loopback);
-        assert_eq!(parse_bind(Some("127.0.0.1".into())).unwrap(), Bind::Loopback);
-        assert_eq!(
-            parse_bind(Some("100.101.102.103".into())).unwrap(),
-            Bind::Tailnet("100.101.102.103".parse().unwrap())
-        );
-    }
-
-    #[test]
-    fn bind_refuses_wildcard_lan_and_junk_rather_than_downgrading_silently() {
-        // Each of these would put a plaintext bearer token on a network. The
-        // failure must be LOUD: silently falling back to loopback would leave a
-        // user with a phone that cannot connect and no reason on screen.
-        for bad in ["0.0.0.0", "192.168.1.10", "10.0.0.4", "8.8.8.8", "nonsense", "::1"] {
-            let err = parse_bind(Some(bad.into())).unwrap_err();
-            assert!(!err.is_empty(), "{bad} was accepted, or refused without a reason");
+    fn the_lan_range_and_the_tailnet_range_never_overlap() {
+        // They gate different peers, so an address that satisfied both would let
+        // a tailnet-only bind admit wifi neighbours — or the reverse. The CGNAT
+        // block is the trap: it is private-ISH and it is Tailscale's.
+        let v4 = |s: &str| IpAddr::V4(s.parse().unwrap());
+        assert!(is_private_lan(v4("192.168.0.71")));
+        assert!(is_private_lan(v4("10.4.9.2")));
+        assert!(is_private_lan(v4("172.16.0.1")));
+        assert!(is_private_lan(v4("169.254.53.162")));
+        assert!(!is_private_lan(v4("100.68.100.56")), "the CGNAT block is Tailscale's");
+        assert!(!is_private_lan(v4("8.8.8.8")));
+        assert!(!is_private_lan(v4("172.32.0.1")), "172.16/12 ends at 172.31");
+        for s in ["100.64.0.1", "100.127.255.254", "192.168.0.71", "10.0.0.1", "8.8.8.8"] {
+            assert!(!(is_tailnet(v4(s)) && is_private_lan(v4(s))), "{s} is both");
         }
     }
 
     #[test]
-    fn a_tailnet_peer_is_refused_while_the_bridge_is_loopback_only() {
+    fn bind_defaults_to_loopback_and_reads_the_symbolic_names() {
+        for loopback in [None, Some(""), Some("  "), Some("loopback"), Some("127.0.0.1")] {
+            let b = parse_bind(loopback.map(str::to_string)).unwrap();
+            assert!(b.is_loopback_only(), "{loopback:?} was not loopback-only: {b:?}");
+        }
+        assert_eq!(parse_bind(Some("lan".into())).unwrap(), Bind { lan: true, ..Bind::default() });
+        assert_eq!(
+            parse_bind(Some("tailscale".into())).unwrap(),
+            Bind { tailnet: true, ..Bind::default() }
+        );
+        // The case the settings window writes. Order, spacing and case are all
+        // things a hand-edited setting will differ in, and none of them mean
+        // anything.
+        let both = Bind { lan: true, tailnet: true, literal: Vec::new() };
+        assert_eq!(parse_bind(Some("lan,tailscale".into())).unwrap(), both);
+        assert_eq!(parse_bind(Some("tailscale,lan".into())).unwrap(), both);
+        assert_eq!(parse_bind(Some(" LAN , Tailscale ".into())).unwrap(), both);
+        // Nothing was resolved: a parse must reach these answers without asking
+        // the network anything, which is what lets resolution wait for the bind.
+        assert!(both.lan && both.tailnet);
+    }
+
+    #[test]
+    fn a_literal_address_still_works() {
+        assert_eq!(
+            parse_bind(Some("100.101.102.103".into())).unwrap(),
+            Bind { literal: vec!["100.101.102.103".parse().unwrap()], ..Bind::default() }
+        );
+        assert_eq!(
+            parse_bind(Some("192.168.0.71".into())).unwrap(),
+            Bind { literal: vec!["192.168.0.71".parse().unwrap()], ..Bind::default() }
+        );
+        // A literal is NOT the symbolic form: it is pinned to that one address
+        // and is not re-resolved when the network changes.
+        assert!(!parse_bind(Some("192.168.0.71".into())).unwrap().lan);
+    }
+
+    #[test]
+    fn the_wildcard_and_junk_are_refused_rather_than_downgraded_silently() {
+        // The failure must be LOUD: silently falling back to loopback would leave
+        // a user with a phone that cannot connect and no reason on screen.
+        for bad in ["0.0.0.0", "nonsense", "::1", "255.255.255.255", "224.0.0.1", "lan,nope"] {
+            let err = parse_bind(Some(bad.into())).unwrap_err();
+            assert!(!err.is_empty(), "{bad} was accepted, or refused without a reason");
+        }
+        // 0.0.0.0 gets its own sentence. It is the one value nobody reaches for
+        // by accident, so the answer has to be an argument rather than a syntax
+        // complaint — binding the named addresses one at a time is what keeps
+        // the socket off every other interface.
+        let err = parse_bind(Some("0.0.0.0".into())).unwrap_err();
+        assert!(err.contains("every interface"), "{err}");
+    }
+
+    // ---- the rule that makes a LAN bind safe ----
+
+    #[test]
+    fn nothing_past_loopback_without_tls_and_the_refusal_says_what_to_do() {
+        // Each of these would put a bearer token that TYPES INTO YOUR SHELLS on
+        // a network in the clear. This is the one rule LAN support rests on, so
+        // it is refused at config time as well as at bind time.
+        for bind in ["lan", "tailscale", "lan,tailscale", "192.168.0.71"] {
+            let err = Config::parse(Some("k".into()), None, Some(bind.into()), Some("0".into()))
+                .unwrap_err();
+            assert!(
+                err.contains("TLS") && err.contains("loopback"),
+                "the refusal for {bind:?} does not say what to do: {err}"
+            );
+            // Shown verbatim in a settings window, so it must not blame an
+            // environment variable the user has never heard of.
+            assert!(!err.contains("KOD_BRIDGE"), "window-hostile wording: {err}");
+        }
+    }
+
+    #[test]
+    fn loopback_without_tls_is_still_allowed() {
+        // The simulator, an SSH tunnel, and every socket test below. This is the
+        // one hop that never needed encrypting, because the packets never leave
+        // the machine.
+        let cfg = Config::parse(Some("k".into()), None, None, Some("0".into())).unwrap();
+        assert!(!cfg.tls);
+        assert!(cfg.bind.is_loopback_only());
+        assert!(
+            Config::parse(Some("k".into()), None, Some("loopback".into()), Some("off".into()))
+                .is_ok()
+        );
+        assert!(tls_required(false, false).is_ok());
+    }
+
+    #[test]
+    fn tls_is_on_unless_something_explicitly_turns_it_off() {
+        // A plaintext default is a mistake nobody finds out about from their own
+        // side, so the default is the safe one and the opt-out has to be typed.
+        assert!(Config::parse(Some("k".into()), None, Some("lan".into()), None).unwrap().tls);
+        assert!(Config::parse(Some("k".into()), None, None, None).unwrap().tls);
+        assert!(Config::parse(Some("k".into()), None, None, Some("1".into())).unwrap().tls);
+        assert!(!Config::parse(Some("k".into()), None, None, Some("no".into())).unwrap().tls);
+        // Not a guess either way: an unreadable value is an error, because
+        // reading "maybe" as "off" is the whole hazard.
+        assert!(Config::parse(Some("k".into()), None, None, Some("banana".into())).is_err());
+    }
+
+    #[test]
+    fn a_peer_is_judged_against_what_was_actually_bound() {
         let tail: IpAddr = "100.101.102.103".parse().unwrap();
         let lan: IpAddr = "192.168.1.10".parse().unwrap();
         let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
 
-        // Loopback bind: only loopback peers, whatever they claim to be.
-        assert!(peer_allowed(local, Bind::Loopback));
-        assert!(!peer_allowed(tail, Bind::Loopback));
-        assert!(!peer_allowed(lan, Bind::Loopback));
+        // Nothing but loopback bound: only loopback peers, whatever they claim.
+        assert!(peer_allowed(local, &[]));
+        assert!(!peer_allowed(tail, &[]));
+        assert!(!peer_allowed(lan, &[]));
 
-        // Tailnet bind: loopback still works (simulator, SSH tunnel), tailnet
-        // peers are admitted, and a LAN peer is still refused even though the
-        // process now holds a non-loopback listener.
-        let b = Bind::Tailnet("100.101.102.103".parse().unwrap());
-        assert!(peer_allowed(local, b));
-        assert!(peer_allowed(tail, b));
-        assert!(!peer_allowed(lan, b));
+        let tailnet_bound: Vec<Ipv4Addr> = vec!["100.101.102.103".parse().unwrap()];
+        assert!(peer_allowed(local, &tailnet_bound), "the simulator and SSH tunnels live here");
+        assert!(peer_allowed(tail, &tailnet_bound));
+        // Holding a tailnet listener does not make this Mac's wifi neighbours
+        // welcome — the two are separately chosen and separately gated.
+        assert!(!peer_allowed(lan, &tailnet_bound));
+
+        let lan_bound: Vec<Ipv4Addr> = vec!["192.168.0.71".parse().unwrap()];
+        assert!(peer_allowed(lan, &lan_bound));
+        assert!(!peer_allowed(tail, &lan_bound));
+        // A router forwarding a port at this Mac does not get to bring the
+        // internet with it.
+        assert!(!peer_allowed(public, &lan_bound));
+
+        let both: Vec<Ipv4Addr> =
+            vec!["100.101.102.103".parse().unwrap(), "192.168.0.71".parse().unwrap()];
+        assert!(peer_allowed(local, &both));
+        assert!(peer_allowed(tail, &both));
+        assert!(peer_allowed(lan, &both));
+        assert!(!peer_allowed(public, &both));
+
+        // A literal PUBLIC address widens nothing: being wrong in the direction
+        // of "cannot connect" is the only direction that is safe to be wrong in.
+        let public_bound: Vec<Ipv4Addr> = vec!["8.8.8.8".parse().unwrap()];
+        assert!(peer_allowed(local, &public_bound));
+        assert!(!peer_allowed(public, &public_bound));
     }
 
     #[test]
     fn config_threads_the_bind_through_from_the_environment() {
-        assert_eq!(Config::parse(Some("k".into()), None, None).unwrap().bind, Bind::Loopback);
-        let cfg = Config::parse(Some("k".into()), None, Some("100.90.1.2".into())).unwrap();
-        assert_eq!(cfg.bind, Bind::Tailnet("100.90.1.2".parse().unwrap()));
+        assert!(Config::parse(Some("k".into()), None, None, None)
+            .unwrap()
+            .bind
+            .is_loopback_only());
+        let cfg = Config::parse(Some("k".into()), None, Some("lan,tailscale".into()), None).unwrap();
+        assert!(cfg.bind.lan && cfg.bind.tailnet);
         // A bad bind must fail the WHOLE config, not be dropped on the floor.
-        assert!(Config::parse(Some("k".into()), None, Some("0.0.0.0".into())).is_err());
+        assert!(Config::parse(Some("k".into()), None, Some("0.0.0.0".into()), None).is_err());
+    }
+
+    // ---- resolution: symbolic names to addresses, at bind time ----
+
+    #[test]
+    fn resolution_keeps_literals_in_order_and_never_repeats_an_address() {
+        // A repeated address would be a second `TcpListener::bind` on a port
+        // this process already holds — EADDRINUSE, from a configuration that
+        // merely said the same thing twice.
+        let b = parse_bind(Some("10.0.0.4,10.0.0.4,10.0.0.5".into())).unwrap();
+        assert_eq!(
+            resolve_bind(&b).unwrap(),
+            vec!["10.0.0.4".parse::<Ipv4Addr>().unwrap(), "10.0.0.5".parse().unwrap()]
+        );
+        assert!(resolve_bind(&Bind::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_route_probes_cannot_hand_back_each_others_addresses() {
+        // Whatever this machine's networking looks like today. The failure this
+        // guards is binding the tunnel and advertising it as wifi, or the
+        // reverse — which is exactly what picking by interface name produces
+        // here, where utun0 carries a 192.168 address and the tailnet is on a
+        // later utun.
+        if let Some(ip) = detect_tailnet_ip() {
+            assert!(is_tailnet(IpAddr::V4(ip)), "the tailnet probe returned {ip}");
+            assert!(!is_private_lan(IpAddr::V4(ip)));
+        }
+        if let Some(ip) = detect_lan_ip() {
+            assert!(is_private_lan(IpAddr::V4(ip)), "the LAN probe returned {ip}");
+            assert!(!is_tailnet(IpAddr::V4(ip)));
+        }
+        let (l, t) = (detect_lan_ip(), detect_tailnet_ip());
+        assert!(l.is_none() || t.is_none() || l != t, "both probes returned {l:?}");
+    }
+
+    #[test]
+    fn the_banner_carries_the_pin_the_daemon_has_no_other_way_to_learn() {
+        let line = banner(
+            25,
+            "e1",
+            &["127.0.0.1:8787".into(), "192.168.0.71:8787".into()],
+            Some("PIN"),
+            3,
+        );
+        assert!(
+            line.contains("listening on 127.0.0.1:8787 and 192.168.0.71:8787 (lan)"),
+            "{line}"
+        );
+        assert!(line.contains(" · pin PIN · "), "{line}");
+        assert!(
+            banner(25, "e1", &["100.68.100.56:8787".into()], Some("P"), 0).contains("(tailnet)")
+        );
+        // No TLS, no pin segment. Its ABSENCE is how the daemon knows the phone
+        // must be told `ws://` rather than `wss://`, so an empty pin must not be
+        // printed as an empty string either.
+        let plain = banner(25, "e1", &["127.0.0.1:8787".into()], None, 0);
+        assert!(!plain.contains("pin"), "{plain}");
+        assert!(plain.contains("listening on 127.0.0.1:8787 · 0 sessions"), "{plain}");
     }
 
     // ---- auth ----
@@ -2042,22 +2693,30 @@ mod tests {
         // Same rules, both directions. If these ever disagree, one of the two
         // doors into the bridge is enforcing a policy the other does not.
         assert!(Config::from_parts("k".into(), 0, "").is_err());
-        assert!(Config::parse(Some("k".into()), Some("0".into()), None).is_err());
+        assert!(Config::parse(Some("k".into()), Some("0".into()), None, None).is_err());
         assert!(Config::from_parts(String::new(), 8787, "").is_err());
         assert!(Config::from_parts("   ".into(), 8787, "").is_err());
-        for bad in ["0.0.0.0", "192.168.1.10", "10.0.0.4", "8.8.8.8", "nonsense", "::1"] {
+        for bad in ["0.0.0.0", "nonsense", "::1", "lan,nope"] {
             assert!(Config::from_parts("k".into(), 8787, bad).is_err(), "{bad} was accepted");
             assert!(parse_bind(Some(bad.into())).is_err(), "{bad} was accepted");
         }
         // …and the same acceptances.
+        // DEFAULT_PORT, not a literal: this compares the two entry points, so a
+        // hardcoded number on one side is exactly the drift the whole pair of
+        // tests exists to catch — and it is what broke when the default moved off
+        // 8787.
         assert_eq!(
-            Config::from_parts("k".into(), 8787, "").unwrap(),
-            Config::parse(Some("k".into()), None, None).unwrap()
+            Config::from_parts("k".into(), DEFAULT_PORT, "").unwrap(),
+            Config::parse(Some("k".into()), None, None, None).unwrap()
         );
         assert_eq!(
-            Config::from_parts("k".into(), 9001, "100.101.102.103").unwrap().bind,
-            Bind::Tailnet("100.101.102.103".parse().unwrap())
+            Config::from_parts("k".into(), 9001, "lan,tailscale").unwrap().bind,
+            parse_bind(Some("lan,tailscale".into())).unwrap()
         );
+        // The window has no TLS switch, and the app always serves it — that is
+        // what lets its pairing card always carry a pin. A `from_parts` that
+        // returned `tls: false` would make every one of these binds illegal.
+        assert!(Config::from_parts("k".into(), 8787, "lan").unwrap().tls);
 
         // The one thing that must NOT be shared: the phrasing. An error naming
         // an environment variable in a Settings window reads as a bug in the
@@ -2081,7 +2740,15 @@ mod tests {
     }
 
     fn cfg_on(port: u16) -> Config {
-        Config { token: "s3cret".into(), port, bind: Bind::Loopback }
+        Config { token: "s3cret".into(), port, bind: Bind::default(), tls: false }
+    }
+
+    /// A scratch directory for a test that needs a TLS identity on disk.
+    fn tls_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kod-ws-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     /// A connected client with the websocket handshake done. The read timeout is
@@ -2095,7 +2762,11 @@ mod tests {
     }
 
     /// hello → hello_ok → the one snapshot: an established phone.
-    fn establish(ws: &mut WebSocket<TcpStream>) {
+    ///
+    /// Generic over the transport so the plaintext and TLS cases are proved by
+    /// the SAME handshake code: if these diverged, a TLS bug that only showed up
+    /// after the upgrade would have nowhere to be caught.
+    fn establish<S: Read + Write>(ws: &mut WebSocket<S>) {
         ws.send(Message::Text(String::from_utf8(hello("s3cret")).unwrap().into())).unwrap();
         for expected in ["hello_ok", "sessions"] {
             match ws.read().expect("the bridge hung up mid-handshake") {
@@ -2211,7 +2882,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
         hub.upsert(session(1, WirePhase::Idle));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
+        let started = serve_with(&cfg_on(port), &Net::loopback_plaintext(), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
         assert_eq!(started.endpoints, vec![format!("127.0.0.1:{port}")]);
 
         let mut ws = dial(port).expect("the websocket handshake never completed");
@@ -2233,6 +2904,169 @@ mod tests {
         started.join();
     }
 
+    // ---- TLS: a real handshake against a real listener ----
+
+    /// The phone's certificate check, in ten lines: ignore the name entirely,
+    /// accept exactly one public key.
+    ///
+    /// This is not a test shortcut standing in for something stricter. It is
+    /// what `ios/Kod` has to do and the only thing it CAN do — nothing will
+    /// issue a certificate for `192.168.0.71`, so there is no name to validate
+    /// and no chain to build. Writing the client side out here is what makes the
+    /// test meaningful: it proves the string in `BridgeStatus.fingerprint` is
+    /// the string that actually unlocks the connection.
+    #[derive(Debug)]
+    struct Pinned {
+        pin: String,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for Pinned {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            let got = crate::tls::fingerprint_of(end_entity).map_err(rustls::Error::General)?;
+            if got == self.pin {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General(format!("pin mismatch: {got} is not {}", self.pin)))
+            }
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.provider.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    type TlsClient = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+    /// Dial with a genuine TLS handshake, trusting `pin` and nothing else.
+    fn dial_tls(port: u16, pin: &str) -> Result<WebSocket<TlsClient>, String> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pinned { pin: pin.into(), provider }))
+            .with_no_client_auth();
+        // A name the certificate does NOT carry, deliberately: if the handshake
+        // still succeeds, the name really is not the trust anchor.
+        let name = rustls::pki_types::ServerName::try_from("kod.invalid").unwrap();
+        let session =
+            rustls::ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
+        let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).map_err(|e| e.to_string())?;
+        // The difference between a FAILING test and a hung test run.
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (ws, _) = tungstenite::client(
+            format!("ws://127.0.0.1:{port}/"),
+            rustls::StreamOwned::new(session, tcp),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(ws)
+    }
+
+    #[test]
+    fn a_phone_that_pinned_this_key_gets_through_and_one_that_did_not_does_not() {
+        let dir = tls_dir("handshake");
+        let tls = Arc::new(crate::tls::Tls::load_or_mint(&dir, &[]).unwrap());
+        let pin = tls.fingerprint();
+        let net = Net { extra: Vec::new(), tls: Some(Arc::clone(&tls)) };
+
+        let port = free_port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let hub = Arc::new(Hub::new("e1"));
+        hub.upsert(session(1, WirePhase::Idle));
+        let started =
+            serve_with(&cfg_on(port), &net, Arc::clone(&hub), Arc::clone(&stop), no_daemon())
+                .unwrap();
+
+        let mut ws = dial_tls(port, &pin).expect("the TLS handshake never completed");
+        establish(&mut ws);
+        assert!(within(Duration::from_secs(2), || hub.sub_count() == 1));
+        // Alive AFTERWARDS, not merely upgraded: a delta minted now has to come
+        // back through the tunnel, which is the half a handshake-only test
+        // never touches.
+        hub.upsert(session(1, WirePhase::Busy));
+        match ws.read().expect("a live TLS connection stopped delivering") {
+            Message::Text(s) => assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&s).unwrap()["t"],
+                "session"
+            ),
+            other => panic!("expected a session delta, got {other:?}"),
+        }
+
+        // The whole security story. There is no name to check, so a pin that did
+        // not decide anything would be decoration.
+        assert!(dial_tls(port, "not-the-pin").is_err(), "the wrong pin was accepted");
+        // …and a plaintext dial at a TLS listener gets nowhere either.
+        assert!(dial(port).is_err(), "a plaintext client completed a websocket handshake");
+        // Both of those failed on their OWN connection: the established phone is
+        // still there, which is the property that keeps one bad client from
+        // being a denial of service against the rest.
+        hub.upsert(session(1, WirePhase::Idle));
+        assert!(matches!(ws.read(), Ok(Message::Text(_))), "a failed handshake took the phone down");
+
+        stop.store(true, Ordering::Relaxed);
+        started.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_loopback_bind_without_tls_is_refused_before_a_socket_is_opened() {
+        // The structural gate, at the only place in the process that opens a
+        // socket. `Config::parse` refuses this too, but every field of `Config`
+        // is public, so a caller that assembled one by hand would otherwise walk
+        // straight past that check into a plaintext listener on a network.
+        let port = free_port();
+        let net = Net { extra: vec!["192.168.0.71".parse().unwrap()], tls: None };
+        let err = serve_with(
+            &cfg_on(port),
+            &net,
+            Arc::new(Hub::new("e1")),
+            Arc::new(AtomicBool::new(false)),
+            no_daemon(),
+        )
+        .err()
+        .expect("a plaintext listener was opened on a network address");
+        assert!(err.contains("TLS"), "{err}");
+        // Nothing was bound, not even the loopback listener that comes first —
+        // the check runs before any of them.
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+            "the refusal still left a listener holding the port"
+        );
+    }
+
     #[test]
     fn stopping_frees_the_port_for_the_very_next_start() {
         // What joining the accept threads buys. The flag alone does not release
@@ -2241,7 +3075,7 @@ mod tests {
         // would get EADDRINUSE from a server it had just stopped.
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
-        let first = serve_with(&cfg_on(port), Arc::new(Hub::new("e1")), Arc::clone(&stop), no_daemon()).unwrap();
+        let first = serve_with(&cfg_on(port), &Net::loopback_plaintext(), Arc::new(Hub::new("e1")), Arc::clone(&stop), no_daemon()).unwrap();
         // Prove it is really serving, so a rebind below cannot pass because the
         // first start quietly failed.
         establish(&mut dial(port).expect("the first server must accept"));
@@ -2250,7 +3084,7 @@ mod tests {
         first.join();
 
         let stop2 = Arc::new(AtomicBool::new(false));
-        let second = serve_with(&cfg_on(port), Arc::new(Hub::new("e2")), Arc::clone(&stop2), no_daemon())
+        let second = serve_with(&cfg_on(port), &Net::loopback_plaintext(), Arc::new(Hub::new("e2")), Arc::clone(&stop2), no_daemon())
             .expect("rebinding the same port after a clean stop must work");
         establish(&mut dial(port).expect("the second server must accept"));
         stop2.store(true, Ordering::Relaxed);
@@ -2262,7 +3096,7 @@ mod tests {
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
+        let started = serve_with(&cfg_on(port), &Net::loopback_plaintext(), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
         let mut ws = dial(port).unwrap();
         establish(&mut ws);
         assert!(within(Duration::from_secs(2), || hub.sub_count() == 1));
@@ -2322,7 +3156,7 @@ mod tests {
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
+        let started = serve_with(&cfg_on(port), &Net::loopback_plaintext(), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
         let mut ws = dial(port).unwrap();
         establish(&mut ws);
         assert!(within(Duration::from_secs(2), || hub.sub_count() == 1));
@@ -2356,7 +3190,7 @@ mod tests {
         let port = free_port();
         let stop = Arc::new(AtomicBool::new(false));
         let hub = Arc::new(Hub::new("e1"));
-        let started = serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
+        let started = serve_with(&cfg_on(port), &Net::loopback_plaintext(), Arc::clone(&hub), Arc::clone(&stop), no_daemon()).unwrap();
 
         let mut live: Vec<WebSocket<TcpStream>> = Vec::new();
         for i in 0..MAX_CONNS {
@@ -2597,7 +3431,7 @@ mod tests {
         let hub = Arc::new(Hub::new("e1"));
         let (tx, rx) = mpsc::channel::<PhoneRequest>();
         let started =
-            serve_with(&cfg_on(port), Arc::clone(&hub), Arc::clone(&stop), tx).unwrap();
+            serve_with(&cfg_on(port), &Net::loopback_plaintext(), Arc::clone(&hub), Arc::clone(&stop), tx).unwrap();
 
         // Stands in for the daemon, on one thread, exactly where `send_loop`
         // would be. It refuses sid 2 in the daemon's own words.
@@ -2685,7 +3519,7 @@ mod tests {
 
 #[cfg(test)]
 mod message_hygiene_tests {
-    use super::Config;
+    use super::{tls_required, Config};
 
     /// Every message from `from_parts` lands in a Settings window, so a run of
     /// whitespace is a visible defect. This exists because all three of these
@@ -2697,12 +3531,46 @@ mod message_hygiene_tests {
         let errs = [
             Config::from_parts(String::new(), 8787, "").unwrap_err(),
             Config::from_parts("t".into(), 0, "").unwrap_err(),
-            Config::from_parts("t".into(), 8787, "192.168.1.10").unwrap_err(),
+            Config::from_parts("t".into(), 8787, "0.0.0.0").unwrap_err(),
+            // The TLS rule's sentence is shown in the same window, and it is the
+            // longest of the lot, so it is the likeliest to be wrapped wrong.
+            tls_required(true, false).unwrap_err(),
         ];
         for e in errs {
             assert!(!e.contains("  "), "double space in a user-facing error: {e:?}");
             assert!(!e.contains('\n'), "newline in a user-facing error: {e:?}");
             assert!(!e.contains("KOD_BRIDGE"), "names an env var the user never set: {e:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod lan_interface_tests {
+    use super::{detect_lan_ip, on_physical_interface};
+    use std::net::Ipv4Addr;
+
+    /// A VPN tunnel address must never be mistaken for the user's wifi.
+    ///
+    /// The route probe follows the DEFAULT route, so with a corporate VPN up it
+    /// returns the tunnel's 10.x — private, plausible, and completely wrong. This
+    /// asserts the second gate: whatever `detect_lan_ip` returns is configured on
+    /// real hardware.
+    #[test]
+    fn whatever_lan_detection_returns_is_on_a_physical_interface() {
+        if let Some(ip) = detect_lan_ip() {
+            assert!(
+                on_physical_interface(ip),
+                "{ip} was offered as the LAN address but is not on an en* interface"
+            );
+            assert!(!ip.is_loopback());
+        }
+    }
+
+    /// An address nothing owns is not on any interface — the gate has to be
+    /// capable of saying no, or the test above passes vacuously.
+    #[test]
+    fn an_address_this_machine_does_not_have_is_refused() {
+        assert!(!on_physical_interface(Ipv4Addr::new(203, 0, 113, 47)));
+        assert!(!on_physical_interface(Ipv4Addr::LOCALHOST), "lo0 is not en*");
     }
 }

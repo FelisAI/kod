@@ -16,6 +16,12 @@
 //! one that attaches to a real daemon, and a wrong attach RETIRES it (see
 //! [`client`]).
 //!
+//! Slice 2 puts [`tls`] under [`ws`]: the listener may now reach past loopback
+//! onto the LAN, and the only reason that is safe is that everything past
+//! loopback is refused unless it is encrypted, under a self-signed key the phone
+//! PINS out of band. No certificate authority issues for `192.168.0.71`, so a
+//! name is not the identity here and never was — the key is.
+//!
 //! The phone can watch every session, and can TYPE into claude and codex
 //! sessions — never into a shell. That last rule is not enforced here and must
 //! not be: this process is the one a network peer talks to, so it attaches as
@@ -25,5 +31,6 @@
 
 pub mod client;
 pub mod mirror;
+pub mod tls;
 pub mod wire;
 pub mod ws;

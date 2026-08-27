@@ -8,15 +8,23 @@
 //  The payload is a contract with the Mac, and it is ~100 ASCII bytes so it fits a
 //  low-error-correction QR that scans from across a desk:
 //
-//      kod://pair?h=<host>&p=<port>&t=<64 lowercase hex>
+//      kod://pair?h=<host>&p=<port>&t=<64 lowercase hex>&f=<key fingerprint>
+//
+//  `f` is base64url (unpadded) of SHA-256 over the DER SubjectPublicKeyInfo the
+//  Mac serves. PRESENT means wss:// and that key and no other; ABSENT means
+//  plaintext, which the Mac only ever permits on loopback. It is the whole of the
+//  phone's trust decision, which is why a malformed one is REJECTED rather than
+//  dropped: silently ignoring it would downgrade a TLS pairing to an unpinned
+//  connection, and the screen would look exactly the same.
 //
 //  Unknown query params are IGNORED on purpose. The Mac must be able to add a
-//  field — a device name, a cert fingerprint — without bricking the phones already
-//  in the wild, which cannot be updated in lockstep with the desktop app.
+//  field — a device name, a second port — without bricking the phones already in
+//  the wild, which cannot be updated in lockstep with the desktop app.
 
 import Foundation
 
-/// Which of the three required params a code was missing.
+/// Which of the three required params a code was missing. `f` is not here: it is
+/// optional, so it can never be reported as missing.
 enum PairingField: String, Equatable {
     case host = "h"
     case port = "p"
@@ -38,6 +46,10 @@ enum PairingError: Error, Equatable {
     case tokenNotHex
     case tokenWrongLength(Int)
     case badPort(String)
+    /// `f` was there but is not a 32-byte digest we could ever compare against.
+    /// Carries whether it was blank, because the two have different causes: blank
+    /// is a Mac that thinks it has TLS and has no key, garbage is a damaged scan.
+    case badFingerprint(blank: Bool)
 
     /// Exactly what the scanner shows. Each one names the thing that is wrong and
     /// implies the next move — a scanner that says "invalid code" and stops is how
@@ -56,6 +68,10 @@ enum PairingError: Error, Equatable {
             return "The token in this code is \(n) characters long; a Kod token is 64."
         case .badPort(let raw):
             return "\"\(raw)\" is not a usable port. It must be a whole number from 1 to 65535."
+        case .badFingerprint(let blank):
+            return blank
+                ? "This pairing code carries an empty key fingerprint, so there is nothing to check your Mac against. Ask Kod on your Mac for a fresh code."
+                : "The key fingerprint in this code is not 43 base64url characters (A-Z, a-z, 0-9, - and _). Ask Kod on your Mac for a fresh code."
         }
     }
 }
@@ -63,6 +79,9 @@ enum PairingError: Error, Equatable {
 enum Pairing {
     /// scheme + authority, all of it. Everything after this is query.
     private static let prefix = "kod://pair"
+    /// The optional key fingerprint. Not a `PairingField` because that enum is
+    /// the set of things a code can be MISSING, and this one is allowed to be.
+    private static let fingerprintParam = "f"
 
     static func parse(_ s: String) -> Result<BridgeSettings, PairingError> {
         let raw = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -134,10 +153,24 @@ enum Pairing {
             return .failure(.tokenWrongLength(token.count))
         }
 
+        // Absent is legal and means plaintext. Present-but-unusable is NOT: a
+        // fingerprint this cannot decode is one BridgeClient could never compare,
+        // so accepting it would produce either a silent downgrade to ws:// or a
+        // phone that refuses its own Mac on every attempt. Rejecting here is the
+        // only outcome that puts a sentence in front of the user.
+        var fingerprint: String? = nil
+        if let raw = fields[fingerprintParam] {
+            guard KeyPin.decode(fingerprint: raw) != nil else {
+                return .failure(.badFingerprint(blank: raw.isEmpty))
+            }
+            fingerprint = raw
+        }
+
         // The host is deliberately NOT validated as an IPv4 literal. The Mac sends
         // one today, but a MagicDNS or .local name is the obvious next step, and
         // BridgeSettings.url already copes; a stricter check here would reject a
-        // code that works.
-        return .success(BridgeSettings(host: host, port: port, token: token))
+        // code that works. Nor is it checked against the certificate later: the
+        // KEY is the identity, precisely so this address may change.
+        return .success(BridgeSettings(host: host, port: port, token: token, fingerprint: fingerprint))
     }
 }

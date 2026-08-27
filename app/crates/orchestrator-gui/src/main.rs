@@ -390,9 +390,16 @@ struct Orchestrator {
     /// listening — `bridge_status` is, and it comes from the daemon.
     bridge_on: bool,
     bridge_port: u16,
-    /// "" = loopback only; otherwise the literal tailnet address to bind. Exactly
-    /// the `KOD_BRIDGE_BIND` grammar, so `ws::parse_bind` stays the one authority
-    /// and the stored value is copy-pasteable into the CLI.
+    /// Which addresses to bind, as a comma-separated set of SYMBOLIC names:
+    /// "" (loopback only), "lan", "tailscale", "lan,tailscale". Exactly the
+    /// `KOD_BRIDGE_BIND` grammar, so `ws::parse_bind` stays the one authority and
+    /// the stored value is copy-pasteable into the CLI (which also still takes a
+    /// literal address, for pinning one).
+    ///
+    /// Symbolic and not an address BECAUSE it is stored: an address resolved once
+    /// and written here goes stale on a DHCP renewal or a Tailscale restart, and
+    /// the only cure for a stale derived value is to re-derive it — which is why
+    /// the bridge resolves these names at bind time and nothing here caches one.
     bridge_bind: String,
     /// The bearer token the phone presents. Minted lazily on first enable, so a
     /// Kod that never had the bridge on has no credential on disk at all.
@@ -404,8 +411,6 @@ struct Orchestrator {
     /// A local failure that never reached the daemon (no randomness, store write
     /// refused). Separate from `bridge_status.error`, which is the daemon's.
     bridge_err: Option<String>,
-    /// This Mac's Tailscale address, probed once at boot. `None` = Tailscale down.
-    tailnet_ip: Option<std::net::Ipv4Addr>,
     /// The caret for whichever inline field is currently live. ONE, not one
     /// per field: `route_inline_key`'s if/else chain guarantees at most one
     /// editor is open at a time, so a second caret could only ever be stale.

@@ -1,19 +1,117 @@
-//! The non-visual half of Settings → Mobile: minting the token, finding this
-//! Mac's tailnet address, and building the string the QR code carries.
+//! The non-visual half of Settings → Mobile: minting the token, reading the
+//! daemon's endpoints back into the two access switches, and building the string
+//! the QR code carries.
 //!
 //! Kept out of `settings.rs` because all of it is pure enough to test, and none of
 //! it should have to be re-derived by a view that is busy laying out cards.
+//!
+//! Nothing here probes the network. `bridge_bind` names addresses SYMBOLICALLY
+//! and the bridge resolves them at bind time, so there is no derived address to
+//! cache and therefore no window anyone has to reopen after starting Tailscale or
+//! changing networks.
 
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::net::IpAddr;
 
 /// The pairing payload. A CONTRACT shared with the iOS app's `Pairing.parse`;
 /// changing the shape here breaks every phone already paired.
 ///
-/// One string carries host, port and token together, which is the whole point:
-/// the alternative is the user transcribing three fields into a phone, one of
-/// which is 64 hex characters typed into a masked box.
-pub fn pair_url(host: &str, port: u16, token: &str) -> String {
-    format!("kod://pair?h={host}&p={port}&t={token}")
+/// One string carries host, port, token and key together, which is the whole
+/// point: the alternative is the user transcribing four fields into a phone, two
+/// of which are long random strings typed into a masked box.
+///
+/// `f` is the base64url SHA-256 of the server's public key, and it is the ONLY
+/// thing the phone uses to decide who answered — no CA will issue a certificate
+/// for 192.168.0.71, so the certificate is self-signed and hostname matching
+/// proves nothing. Present → the phone dials `wss://` and pins that key, and
+/// pinning the KEY rather than the address is why a DHCP renewal or a new
+/// Tailscale address breaks nothing. Absent → `ws://`, in the clear, which the
+/// phone accepts only for its own loopback. So omitting `f` is not a smaller
+/// code, it is a different promise: emit it only when there is genuinely no
+/// certificate.
+pub fn pair_url(host: &str, port: u16, token: &str, fingerprint: Option<&str>) -> String {
+    match fingerprint {
+        Some(f) => format!("kod://pair?h={host}&p={port}&t={token}&f={f}"),
+        None => format!("kod://pair?h={host}&p={port}&t={token}"),
+    }
+}
+
+/// The `bridge_bind` value for a pair of switches: `""`, `"lan"`, `"tailscale"`
+/// or `"lan,tailscale"`.
+///
+/// SYMBOLIC, never an address. The bridge resolves these tokens at bind time, so
+/// this Mac moving to another Wi-Fi, renewing its DHCP lease or restarting
+/// Tailscale needs no cache invalidation and no re-probe here — which is exactly
+/// the staleness the boot-time probe used to produce.
+pub fn bind_tokens(lan: bool, tailnet: bool) -> String {
+    match (lan, tailnet) {
+        (false, false) => String::new(),
+        (true, false) => "lan".to_string(),
+        (false, true) => "tailscale".to_string(),
+        (true, true) => "lan,tailscale".to_string(),
+    }
+}
+
+/// Which switches a STORED bind implies. Used ONLY when nothing is listening,
+/// because then there are no endpoints to read the real answer off.
+///
+/// A literal IPv4 stays legal — the CLI takes one, and it is how you pin a single
+/// address — so one is classified by what it IS rather than ignored: a stored
+/// 100.x address that drew both switches Off would invite a click that silently
+/// narrowed the bind on the next start.
+pub fn bind_switches(bind: &str) -> (bool, bool) {
+    let (mut lan, mut tailnet) = (false, false);
+    for tok in bind.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if tok.eq_ignore_ascii_case("lan") {
+            lan = true;
+        } else if tok.eq_ignore_ascii_case("tailscale") {
+            tailnet = true;
+        } else if let Ok(ip) = tok.parse::<IpAddr>() {
+            match classify(ip) {
+                Some(true) => tailnet = true,
+                Some(false) => lan = true,
+                None => {}
+            }
+        }
+    }
+    (lan, tailnet)
+}
+
+/// What the daemon has ACTUALLY bound, split the two ways the access switches are
+/// drawn. `Some(addr)` is both "this switch is on" and the address to name.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Bound {
+    pub lan: Option<String>,
+    pub tailnet: Option<String>,
+}
+
+/// Classify the live endpoints. This is what keeps a switch from rendering
+/// narrower than reality: a bind the daemon refused, or one it never received,
+/// leaves the previous socket open, and a control drawn from the stored key would
+/// show Off over a socket that is still accepting.
+pub fn bound(endpoints: &[String]) -> Bound {
+    let mut out = Bound::default();
+    for host in hosts(endpoints) {
+        let Ok(ip) = host.parse::<IpAddr>() else { continue };
+        match classify(ip) {
+            Some(true) => out.tailnet.get_or_insert_with(|| host.to_string()),
+            Some(false) => out.lan.get_or_insert_with(|| host.to_string()),
+            None => continue,
+        };
+    }
+    out
+}
+
+/// `Some(true)` tailnet, `Some(false)` LAN, `None` loopback (which is bound
+/// regardless and is not a switch).
+///
+/// Delegates to `ws::is_tailnet` rather than re-deriving 100.64.0.0/10 here: two
+/// definitions of "is this a tailnet address" is one too many, and the one that
+/// matters is the one the bridge enforces.
+fn classify(ip: IpAddr) -> Option<bool> {
+    if ip.is_loopback() {
+        return None;
+    }
+    Some(orchestrator_bridge::ws::is_tailnet(ip))
 }
 
 /// 32 bytes from the OS CSPRNG, lowercase hex.
@@ -49,27 +147,6 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// This Mac's Tailscale IPv4 address, or `None` when Tailscale is not up.
-///
-/// A UDP `connect` to a tailnet address sends NOTHING — it only asks the kernel to
-/// pick a route and bind a local address — so this is a routing-table lookup with
-/// no packets and no dependency on the `tailscale` binary being installed.
-///
-/// Deliberately NOT chosen by interface name: measured on this Mac, `utun0` carries
-/// a 192.168.x address and `utun1` carries the tailnet one, so anything keying off
-/// "utun0" would confidently return a LAN address that `is_tailnet` then rejects —
-/// or worse, that something else accepts.
-pub fn detect_tailnet_ip() -> Option<Ipv4Addr> {
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    // Any address inside 100.64.0.0/10 works as a routing probe; this one is
-    // Tailscale's own DNS resolver, so it exists on every tailnet.
-    sock.connect("100.100.100.100:9").ok()?;
-    match sock.local_addr().ok()?.ip() {
-        IpAddr::V4(v4) if orchestrator_bridge::ws::is_tailnet(IpAddr::V4(v4)) => Some(v4),
-        _ => None,
-    }
-}
-
 /// The host a phone should dial, taken from what the daemon says it ACTUALLY bound
 /// rather than from a stored preference.
 ///
@@ -78,15 +155,25 @@ pub fn detect_tailnet_ip() -> Option<Ipv4Addr> {
 /// asked for; `endpoints` records what the kernel gave. Only the second one can be
 /// dialled.
 pub fn reachable_host(endpoints: &[String]) -> Option<String> {
-    endpoints
-        .iter()
-        .filter_map(|e| e.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']'])))
+    hosts(endpoints)
         .find(|h| {
             h.parse::<IpAddr>()
                 .map(|ip| !ip.is_loopback())
                 .unwrap_or(false)
         })
         .map(|h| h.to_string())
+}
+
+/// The host half of each `addr:port` endpoint.
+///
+/// `rsplit_once` and the bracket trim are both load-bearing: an IPv6 endpoint is
+/// `[fd7a:115c:a1e0::1]:8787`, so splitting at the FIRST colon yields `[fd7a` and
+/// every caller downstream then fails to parse an address that is perfectly
+/// dialable.
+fn hosts(endpoints: &[String]) -> impl Iterator<Item = &str> {
+    endpoints
+        .iter()
+        .filter_map(|e| e.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']'])))
 }
 
 #[cfg(test)]
@@ -117,14 +204,93 @@ mod tests {
 
     #[test]
     fn the_pairing_url_matches_the_contract_the_phone_parses() {
-        let u = pair_url("100.101.102.103", 8787, &"a".repeat(64));
+        let u = pair_url("100.101.102.103", 8787, &"a".repeat(64), None);
         assert!(u.starts_with("kod://pair?"));
         assert!(u.contains("h=100.101.102.103"));
         assert!(u.contains("p=8787"));
         assert!(u.ends_with(&format!("t={}", "a".repeat(64))));
-        // Comfortably inside what a QR at error-correction M can carry, and what
-        // the encoder's golden test proved decodable.
-        assert!(u.len() < 160, "payload grew past what was verified: {}", u.len());
+        // No fingerprint means no `f`, and an ABSENT key is what tells the phone
+        // this is a plaintext ws:// bridge. An empty `f=` would instead be a
+        // fingerprint that matches nothing, so the phone would refuse a loopback
+        // pairing that is legitimately unencrypted.
+        assert!(!u.contains("f="), "a keyless code must not carry an f: {u}");
+    }
+
+    #[test]
+    fn the_pairing_url_carries_the_key_to_pin_when_there_is_one() {
+        // 43 chars is the real width: base64url of a SHA-256, unpadded.
+        let f = "n4bQgYhMfWWaL_qgxVrQFaO_TxsrC4Is0V1sFbDwCgg";
+        let u = pair_url("192.168.0.71", 8787, &"a".repeat(64), Some(f));
+        assert!(u.ends_with(&format!("&f={f}")), "{u}");
+        // The pin is the phone's ONLY notion of who answered, so it must survive
+        // the trip: a code that dropped it silently downgrades to trusting
+        // whatever holds that address.
+        assert!(u.contains("h=192.168.0.71"));
+        assert!(u.contains(&format!("t={}", "a".repeat(64))));
+        // The encoder tops out at version 10 / 213 bytes (see `qr.rs`). Worst
+        // case here is an IPv6 tailnet host, still ~173 — but a payload that
+        // grows past the ceiling stops being a QR at all, so pin the headroom.
+        assert!(u.len() < 200, "payload grew past what the encoder can carry: {}", u.len());
+    }
+
+    #[test]
+    fn the_two_switches_map_onto_the_symbolic_bind_set() {
+        // The exact strings the bridge parses. Written by the GUI, read by the
+        // CLI: a typo here is a bind the daemon refuses with the switch showing
+        // On, which is the whole failure this pane is built to avoid.
+        assert_eq!(bind_tokens(false, false), "");
+        assert_eq!(bind_tokens(true, false), "lan");
+        assert_eq!(bind_tokens(false, true), "tailscale");
+        assert_eq!(bind_tokens(true, true), "lan,tailscale");
+    }
+
+    #[test]
+    fn every_switch_combination_survives_a_round_trip_through_the_stored_string() {
+        // What breaks without this: the pane reads the switches back out of the
+        // stored key whenever nothing is listening, so a value it can write but
+        // not read renders as Off and the next click writes the OPPOSITE of what
+        // the user sees.
+        for lan in [false, true] {
+            for tailnet in [false, true] {
+                let s = bind_tokens(lan, tailnet);
+                assert_eq!(bind_switches(&s), (lan, tailnet), "round trip failed for {s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_literal_address_still_lights_the_switch_it_would_bind() {
+        // A literal stays legal for the CLI and for pinning one address; the
+        // switches have to place it, not ignore it.
+        assert_eq!(bind_switches("100.101.102.103"), (false, true));
+        assert_eq!(bind_switches("192.168.0.71"), (true, false));
+        assert_eq!(bind_switches("fd7a:115c:a1e0::1"), (false, true));
+        // Loopback is bound regardless, so it is not a switch.
+        assert_eq!(bind_switches("127.0.0.1"), (false, false));
+        assert_eq!(bind_switches("loopback"), (false, false));
+        assert_eq!(bind_switches("  lan , tailscale  "), (true, true));
+    }
+
+    #[test]
+    fn the_switches_are_read_off_the_addresses_actually_bound() {
+        let eps = vec![
+            "127.0.0.1:8787".to_string(),
+            "192.168.0.71:8787".to_string(),
+            "100.101.102.103:8787".to_string(),
+        ];
+        let b = bound(&eps);
+        assert_eq!(b.lan.as_deref(), Some("192.168.0.71"));
+        assert_eq!(b.tailnet.as_deref(), Some("100.101.102.103"));
+    }
+
+    #[test]
+    fn a_loopback_only_bridge_leaves_both_switches_off() {
+        // The property the radios had and the switches must keep: a control
+        // derived from the live endpoints cannot draw an exposure that does not
+        // exist. Loopback is bound whatever the user chose, so it is never a
+        // switch — and no phone can reach it.
+        assert_eq!(bound(&["127.0.0.1:8787".to_string()]), Bound::default());
+        assert_eq!(bound(&[]), Bound::default());
     }
 
     #[test]
@@ -148,19 +314,6 @@ mod tests {
         // rsplit_once(':') is right and split_once(':') would be wrong here.
         let eps = vec!["[fd7a:115c:a1e0::1]:8787".to_string()];
         assert_eq!(reachable_host(&eps).as_deref(), Some("fd7a:115c:a1e0::1"));
-    }
-
-    #[test]
-    fn the_tailnet_probe_never_returns_a_lan_address() {
-        // It may legitimately return None (Tailscale down), but anything it DOES
-        // return must be inside 100.64.0.0/10 — the whole point is that a LAN
-        // address must never be offered as a bind target.
-        if let Some(ip) = detect_tailnet_ip() {
-            assert!(
-                orchestrator_bridge::ws::is_tailnet(IpAddr::V4(ip)),
-                "probe returned a non-tailnet address: {ip}"
-            );
-        }
     }
 }
 
@@ -192,8 +345,25 @@ pub fn dark_runs(q: &crate::qr::Qr) -> Vec<(usize, usize, usize)> {
 
 #[cfg(test)]
 mod run_tests {
-    use super::dark_runs;
+    use super::{dark_runs, pair_url};
     use crate::qr::Qr;
+
+    #[test]
+    fn the_worst_case_pairing_payload_still_encodes() {
+        // The fingerprint added ~46 bytes to a payload that used to land on
+        // version 6, and this encoder stops at version 10 / 213 bytes. Worst
+        // case is an IPv6 tailnet host with a 5-digit port; without this, the
+        // first sign of overflowing the ceiling would be a settings pane that
+        // says it could not build a pairing code.
+        let url = pair_url(
+            "fd7a:115c:a1e0:ab12:4843:cd96:6244:1a2b",
+            65535,
+            &"a".repeat(64),
+            Some("n4bQgYhMfWWaL_qgxVrQFaO_TxsrC4Is0V1sFbDwCgg"),
+        );
+        let q = Qr::encode(&url).expect("the worst-case pairing payload must still encode");
+        assert!(!dark_runs(&q).is_empty(), "an empty symbol is not a QR code");
+    }
 
     #[test]
     fn runs_cover_exactly_the_dark_modules_and_nothing_else() {

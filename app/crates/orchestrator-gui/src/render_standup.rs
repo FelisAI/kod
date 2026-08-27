@@ -678,7 +678,15 @@ impl Orchestrator {
         // ── ▲ MAP UPDATES — the morning checkmarks (docs/011 slice 3): every
         // pending proposal op across projects (sessions, break-downs, drift),
         // resolvable inline; 'map ▸' jumps to the node for context.
-        {
+        //
+        // GATED. This tier renders proposals the map made, so with the feature off
+        // it has no business on screen — and it was drawing anyway, because the
+        // gate was applied to everything that CREATES proposals (summaries.rs,
+        // agentic.rs, spawn.rs) and to every other surface that shows them, but
+        // never here. A build without `--features map` therefore still showed a
+        // MAP UPDATES section to anyone whose store held proposals from when the
+        // feature was on, which is every existing install.
+        if crate::features::MAP_ENABLED {
             let rows: Vec<(
                 String,
                 String,

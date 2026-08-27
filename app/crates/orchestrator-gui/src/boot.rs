@@ -421,8 +421,6 @@ pub(crate) fn run() {
                         &bridge_bind,
                         &bridge_token,
                     );
-                    // One routing probe at boot, never per frame.
-                    let tailnet_ip = crate::bridgecfg::detect_tailnet_ip();
                     // the PROJECTS FOLDER (#29): where "＋ new project" creates a
                     // project's own directory, and the root the scan/fold trust.
                     // Unset → ~/local (what the scan always hardcoded). Mirrored
@@ -448,7 +446,6 @@ pub(crate) fn run() {
                         bridge_token,
                         bridge_status,
                         bridge_err: None,
-                        tailnet_ip,
                         host,
                         host_mode,
                         term_focus: cx.focus_handle(),

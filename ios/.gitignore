@@ -9,3 +9,7 @@ DerivedData/
 .DS_Store
 *.xcuserstate
 xcuserdata/
+build-archive/
+build-export/
+build-sim/
+build-device/
