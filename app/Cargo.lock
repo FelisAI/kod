@@ -3840,7 +3840,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchestrator-bridge"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "libc",
@@ -3856,7 +3856,7 @@ dependencies = [
 
 [[package]]
 name = "orchestrator-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3865,7 +3865,7 @@ dependencies = [
 
 [[package]]
 name = "orchestrator-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "orchestrator-bridge",
@@ -3874,7 +3874,7 @@ dependencies = [
 
 [[package]]
 name = "orchestrator-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "block2",
  "glob",
@@ -3895,7 +3895,7 @@ dependencies = [
 
 [[package]]
 name = "orchestrator-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "bincode",
@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "orchestrator-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "glob",
  "orchestrator-core",

@@ -1,6 +1,6 @@
 [package]
 name = "orchestrator-bridge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 # The bridge is an ordinary daemon CLIENT. It depends on orchestrator-host for
