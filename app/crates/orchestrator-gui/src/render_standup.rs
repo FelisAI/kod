@@ -339,6 +339,15 @@ impl Orchestrator {
                     // so telling the user to wait would send them to sit on their hands.
                     "limit reached".into()
                 };
+                // …and what Kod will DO about it. Without this the row says when the
+                // window reopens and nothing about whether anything will happen then,
+                // so a feature that exists to handle exactly this moment is invisible
+                // at exactly this moment — which is how its owner concluded it was
+                // never built.
+                let detail = format!(
+                    "{detail} · {}",
+                    resume_promise(self.auto_continue, u.reset_at_unix.is_some())
+                );
                 let (jslug, jid) = (info.project_slug.clone(), info.id);
                 tier = tier.child(
                     div()
@@ -698,6 +707,10 @@ impl Orchestrator {
                                     | DiffOp::Rename { id, .. }
                                     | DiffOp::Remove { id }
                                     | DiffOp::Move { id, .. } => Some(*id),
+                                    DiffOp::AddDecision {
+                                        part: PartRef::Id(id),
+                                        ..
+                                    } => Some(*id),
                                     DiffOp::Add {
                                         parent: PartRef::Id(id),
                                         ..
@@ -1414,6 +1427,27 @@ impl Orchestrator {
 /// Pure because this single rule is the one that used to make Standup disagree
 /// with every other needs-you surface in the app — a comment could not prove it
 /// no longer does, and a test can.
+/// What Kod will do about a blocked session, in a few words, for the row that
+/// reports the block.
+///
+/// Three states and they are genuinely different actions for the reader: turn a
+/// switch on, wait, or go and do it yourself. Saying nothing — which is what this
+/// row did — collapses all three into "you are blocked", and the one thing the
+/// user cannot discover from there is that an auto-resume exists at all.
+///
+/// `has_reset_instant` is `reset_at_unix.is_some()`, and it is the SAME condition
+/// `session::ac_decide` arms on: a limit whose banner carried no resolvable time
+/// can never be resumed automatically, however the switch is set. Reading it off
+/// the same fact is what keeps this sentence from promising something the gate
+/// will then refuse.
+pub(crate) fn resume_promise(auto_on: bool, has_reset_instant: bool) -> &'static str {
+    match (auto_on, has_reset_instant) {
+        (false, _) => "auto-continue off",
+        (true, true) => "Kod will resume it",
+        (true, false) => "no reset time — Kod can't resume it",
+    }
+}
+
 pub(crate) fn blocked_tier_claims(limit_hit: bool, awaiting_decision: bool) -> bool {
     limit_hit && !awaiting_decision
 }
@@ -1441,6 +1475,35 @@ pub(crate) fn standup_thread_hint(summaries_on: bool, _thread_empty: bool) -> Op
 /// The standup's one grey line (pure — no store, no window).
 #[cfg(test)]
 mod tests {
+    use super::resume_promise;
+
+    /// A blocked row that does not say what will happen is why its owner believed
+    /// auto-continue had never been built: the feature's whole job is this moment,
+    /// and this moment said nothing about it.
+    #[test]
+    fn a_blocked_row_says_which_of_the_three_things_will_happen() {
+        // Off: the switch is the news, because it is the only one the user acts on.
+        assert_eq!(resume_promise(false, true), "auto-continue off");
+        assert_eq!(resume_promise(false, false), "auto-continue off");
+        // On, with a resolvable instant: the one case where waiting is correct.
+        assert_eq!(resume_promise(true, true), "Kod will resume it");
+        // On, but the banner carried no time. `ac_decide` arms only on
+        // `reset_at.is_some()`, so promising a resume here would be a lie the gate
+        // then refuses — and the user would wait for something that never comes.
+        assert_eq!(resume_promise(true, false), "no reset time — Kod can't resume it");
+        // Three states, three sentences: none may collapse into another.
+        let all = [
+            resume_promise(false, true),
+            resume_promise(true, true),
+            resume_promise(true, false),
+        ];
+        assert_eq!(
+            all.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "two of the three read the same, so one of them is unactionable"
+        );
+    }
+
     use super::standup_thread_hint;
 
     #[test]
