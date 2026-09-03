@@ -120,6 +120,14 @@ struct Inner {
     /// None the moment it clears — the natural reset edge). Carries the reset
     /// clock+zone auto-continue (slice 2) will wake on.
     usage_limit: Option<UsageLimit>,
+    /// `since_ms` of the last usage-limit HIT written to the timeline.
+    ///
+    /// Dedupe, not bookkeeping: `scan_limit` runs on every grid change, so
+    /// without it a blocked session would push one "limit hit" event per repaint.
+    /// Keyed on `since_ms` (first-observation, preserved by `carry_forward`)
+    /// rather than a bool, so a genuinely NEW block after an old one still gets
+    /// its own line.
+    limit_noted_since: Option<u64>,
     /// last hysteresis restore — restores are rate-limited (≥30s apart) so
     /// sparse-output work (a line every ~3s) can't CHAIN restores and keep an
     /// hours-old Idle stamp alive on an active session (review: proven lie).
@@ -382,6 +390,33 @@ pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
     AcDecision::Skip
 }
 
+/// Whether a freshly-scanned limit deserves a line on the timeline, and what it
+/// should say. PURE, so the edge rule is testable without a PTY or a grid.
+///
+/// `noted_since` is the `since_ms` of the last hit already written. Keying on
+/// first-observation rather than a bool is what lets a genuinely NEW block after
+/// an old one get its own line while a repaint of the SAME one gets none —
+/// `scan_limit` runs on every grid change, so a bool would write one event per
+/// repaint for as long as the session stayed blocked.
+///
+/// A WARNING is never recorded. "You've used 92%" is not an event, it is a
+/// gauge; a timeline that logged it would fill with lines nothing happened on.
+fn limit_note(limit: Option<&UsageLimit>, noted_since: Option<u64>) -> Option<(u64, String)> {
+    let u = limit?;
+    if !u.hit || noted_since == Some(u.since_ms) {
+        return None;
+    }
+    let when = u.reset_label();
+    let text = if when.is_empty() {
+        // No resolvable reset instant — `ac_decide` can never arm on this one, so
+        // the record must not imply a wait that ends.
+        "usage limit hit — no reset time in the banner".to_string()
+    } else {
+        format!("usage limit hit — resets {when}")
+    };
+    Some((u.since_ms, text))
+}
+
 /// Fold one key into the composer-draft tracking (docs/019 slice 2, hardened by
 /// the safety review). PURE `Inner` mutation, unit-tested without a subprocess
 /// (RULE ZERO). Maintains ONLY `input_buffer` (the composer-empty gate) and
@@ -590,6 +625,7 @@ impl HostedSession {
             phase_prev_since_ms: t0,
             trouble: None,
             usage_limit: None,
+            limit_noted_since: None,
             last_restore_ms: 0,
             trouble_muted_until_ms: 0,
             input_buffer: String::new(),
@@ -818,6 +854,26 @@ impl HostedSession {
         let parsed = parse_usage_limit(&g.emu.bottom_plain(6), now);
         let old = g.usage_limit.take();
         g.usage_limit = parsed.map(|new| UsageLimit::carry_forward(new, old.as_ref()));
+
+        // RECORD THE BLOCK. A usage limit was live-only until here: parsed off the
+        // grid every second, held in memory, and written nowhere — so once it
+        // cleared there was no trace it had ever happened, and "did Kod handle my
+        // limit?" could not be answered by anyone, afterwards, at all. It is the
+        // one event most worth a record and it left none.
+        //
+        // Auto-continue's own outcomes (fired / gave up / died while blocked) are
+        // already on the timeline from `auto_continue_step`. This is the missing
+        // half: the block that those outcomes are ABOUT.
+        //
+        // Edge-triggered on `since_ms`, which `carry_forward` preserves across
+        // repaints. The residual case it cannot dedupe is a banner that leaves the
+        // bottom six rows and comes back — `parsed` is then None and the stored
+        // limit is dropped, so the return reads as a new block. A blocked session
+        // is not printing, so its grid is static and that stays theoretical.
+        if let Some((since, text)) = limit_note(g.usage_limit.as_ref(), g.limit_noted_since) {
+            g.limit_noted_since = Some(since);
+            g.push_event(SessionEventKind::Notice { text });
+        }
     }
 
     /// The usage-limit banner lifted off the live grid, if present (docs/019) —
@@ -1452,6 +1508,7 @@ mod tests {
 
     fn test_inner() -> Inner {
         Inner {
+            limit_noted_since: None,
             emu: Emulator::new(10, 40),
             osc: OscTap::new(),
             title: String::new(),
@@ -1695,6 +1752,54 @@ mod tests {
         ));
         assert!(!inner.awaiting);
         assert!(inner.pending.is_none());
+    }
+
+    fn ul(hit: bool, since_ms: u64, clock: &str, tz: &str) -> UsageLimit {
+        UsageLimit {
+            hit,
+            percent: None,
+            reset_clock: clock.into(),
+            reset_tz: tz.into(),
+            reset_date: String::new(),
+            reset_at_unix: None,
+            since_ms,
+        }
+    }
+
+    /// A usage limit was live-only: parsed off the grid every second, held in
+    /// memory, written nowhere. Once it cleared there was no trace it had
+    /// happened, so "did Kod handle my limit?" was unanswerable afterwards by
+    /// anyone — which is exactly the question its owner kept having to ask.
+    #[test]
+    fn a_limit_is_recorded_once_per_block_and_never_per_repaint() {
+        let hit = ul(true, 1_000, "2:30pm", "America/Los_Angeles");
+        let (since, text) = limit_note(Some(&hit), None).expect("a fresh block is news");
+        assert_eq!(since, 1_000);
+        assert!(text.starts_with("usage limit hit"), "{text}");
+        assert!(text.contains("2:30pm"), "the reset is the actionable half: {text}");
+
+        // The SAME block, repainted. `scan_limit` runs on every grid change, so a
+        // bool here would write one line per repaint for as long as the session
+        // stayed blocked.
+        assert_eq!(limit_note(Some(&hit), Some(1_000)), None);
+
+        // A genuinely NEW block still gets its own line.
+        let again = ul(true, 9_999, "6:00pm", "America/Los_Angeles");
+        assert!(limit_note(Some(&again), Some(1_000)).is_some());
+    }
+
+    #[test]
+    fn a_warning_is_a_gauge_not_an_event_and_a_timeless_limit_says_so() {
+        // "You've used 92%" is not something that happened.
+        assert_eq!(limit_note(Some(&ul(false, 1, "2:30pm", "America/Los_Angeles")), None), None);
+        assert_eq!(limit_note(None, None), None);
+
+        // A banner with no resolvable reset can never be auto-resumed
+        // (`ac_decide` arms only on `reset_at`), so its record must not imply a
+        // wait that ends.
+        let (_, text) = limit_note(Some(&ul(true, 1, "", "")), None).expect("still a block");
+        assert!(text.contains("no reset time"), "{text}");
+        assert!(!text.contains("resets "), "must not promise a reset it does not have: {text}");
     }
 
     /// The view expires a limit on the clock; auto-continue must NOT. Its `cleared`
