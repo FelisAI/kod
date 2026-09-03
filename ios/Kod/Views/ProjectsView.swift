@@ -51,7 +51,14 @@ struct ProjectsView: View {
     private func projectCard(_ group: ProjectGroup) -> some View {
         let isOpen = expanded.contains(group.project)
 
-        KodCard(tint: group.attentionCount > 0 ? KodColor.amber : nil) {
+        // Tinted by the STRONGEST signal, like the Mac's row background: amber
+        // when something needs you, orange while work is happening, otherwise
+        // nothing. A card that only ever lit for needs-you left "running" and
+        // "idle" sharing one flat look.
+        let tint: Color? = group.attentionCount > 0
+            ? KodColor.amber
+            : (group.busyCount > 0 ? KodColor.orange : nil)
+        KodCard(tint: tint) {
             VStack(alignment: .leading, spacing: 0) {
                 Button {
                     // Expand in place rather than push a screen: the whole value of
@@ -62,8 +69,20 @@ struct ProjectsView: View {
                         VStack(alignment: .leading, spacing: 5) {
                             HStack(spacing: 7) {
                                 ProjectPill(slug: group.project)
+                                // THE LIVE MIX, in colour. This row used to carry
+                                // the needs-you count and nothing else, so a
+                                // project with three agents mid-run was visually
+                                // identical to one sitting idle — the difference
+                                // was a grey word in the line below, which you had
+                                // to read. Same segments and same colours as the
+                                // Mac's rail, so the two never disagree.
+                                ForEach(group.liveMix, id: \.label) { seg in
+                                    Text(seg.label)
+                                        .font(KodFont.pill)
+                                        .foregroundStyle(seg.tint)
+                                }
                                 if group.attentionCount > 0 {
-                                    Text(group.attentionCount == 1 ? "needs you" : "\(group.attentionCount) need you")
+                                    Text(group.attentionCount == 1 ? "needs you" : "need you")
                                         .font(KodFont.pill)
                                         .foregroundStyle(KodColor.amber)
                                 }

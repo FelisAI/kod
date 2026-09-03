@@ -3381,6 +3381,143 @@
         )));
     }
 
+    /// FORGETTING IS DESTRUCTIVE, so this asserts both halves: nothing of the
+    /// forgotten project survives ANYWHERE, and nothing of its neighbour moves.
+    ///
+    /// The first sweep is driven off the LIVE SCHEMA rather than a hand-written
+    /// table list, so a table added later fails this test instead of silently
+    /// stranding its rows — the same discipline `rename_project_key` uses.
+    #[test]
+    fn forgetting_a_project_erases_it_everywhere_and_leaves_its_neighbour_alone() {
+        let mut s = Store::open_in_memory().unwrap();
+        let doomed = "path:/tmp/projects/doomed";
+        let keeper = "path:/tmp/projects/keeper";
+
+        for k in [doomed, keeper] {
+            s.ensure_project(k, "P").unwrap();
+            s.accept_diff_from(
+                k,
+                &[add("a", PartRef::Root, "root", "d", Lifecycle::Todo, vec!["src/**".into()])],
+                "user",
+                None,
+            )
+            .unwrap();
+            s.set_setting(&format!("map_root:{k}"), "1").unwrap();
+            s.set_setting(&format!("proj_seen_ms:{k}"), "2").unwrap();
+            // The three tables with NO project_key of their own. Seeded directly:
+            // this test is about DELETION, and the whole point is that rows exist
+            // in them to be missed.
+            let part: i64 = s
+                .conn
+                .query_row("SELECT id FROM part WHERE project_key=?1", params![k], |r| r.get(0))
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO part_note(part_id,project_key,ts_secs,kind,text,source) \
+                     VALUES(?1,?2,1,'decision','why','user')",
+                    params![part, k],
+                )
+                .unwrap();
+            let note: i64 = s.conn.last_insert_rowid();
+            s.conn
+                .execute("INSERT INTO note_part(note_id,part_id) VALUES(?1,?2)", params![note, part])
+                .unwrap();
+            // `memory_source.id` is TEXT PRIMARY KEY — NOT a rowid alias — so the
+            // id is supplied explicitly. Leaving it out writes NULL and makes
+            // `last_insert_rowid()` a rowid that no span will ever join to,
+            // which is a fixture that tests nothing.
+            let src = format!("src-{k}");
+            s.conn
+                .execute(
+                    "INSERT INTO memory_source(id,project_key,kind,uri,title,captured_at_secs,content_hash,metadata_json) \
+                     VALUES(?1,?2,'k','u','t',1,'h','{}')",
+                    params![src, k],
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO memory_span(id,source_id,start_ref,end_ref,quote) VALUES(?1,?2,'a','b','q')",
+                    params![format!("span-{k}"), src],
+                )
+                .unwrap();
+            // suffixed with a NODE id, so no slug rule reaches it.
+            s.set_setting(&format!("drift_snooze:{part}"), "9").unwrap();
+        }
+        s.set_setting("project_order", &format!("[\"{doomed}\",\"{keeper}\"]")).unwrap();
+        // a colon-free GLOBAL setting: the suffix sweep must not eat it.
+        s.set_setting("bridge_on", "1").unwrap();
+
+        let count = |s: &Store, sql: &str| -> i64 { s.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let anchors_before = count(&s, "SELECT count(*) FROM part_anchor");
+        assert_eq!(anchors_before, 2, "precondition: one anchor per project");
+
+        s.forget_project(doomed).unwrap();
+
+        // 1. EVERY project_key table, read off the live schema.
+        for t in s.tables_with_project_key().unwrap() {
+            let n: i64 = s
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {t} WHERE project_key=?1"), params![doomed], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{t} still holds rows for the forgotten project");
+        }
+        // 2. `project` keys on `key`, so the sweep above does not cover it.
+        assert!(!s.project_exists(doomed));
+        assert!(s.project_exists(keeper), "the neighbour must survive");
+
+        // 3. the three join-only tables — exactly the neighbour's rows left.
+        assert_eq!(count(&s, "SELECT count(*) FROM part_anchor"), 1);
+        assert_eq!(count(&s, "SELECT count(*) FROM note_part"), 1);
+        assert_eq!(count(&s, "SELECT count(*) FROM memory_span"), 1);
+        assert_eq!(
+            count(&s, "SELECT count(*) FROM memory_span m LEFT JOIN memory_source o ON o.id=m.source_id WHERE o.id IS NULL"),
+            0,
+            "an orphaned span is a row no project can ever account for"
+        );
+
+        // 4. settings: the slug-suffixed ones gone, the neighbour's and the
+        //    global one untouched.
+        assert!(s.get_setting(&format!("map_root:{doomed}")).is_none());
+        assert!(s.get_setting(&format!("proj_seen_ms:{doomed}")).is_none());
+        assert_eq!(s.get_setting(&format!("map_root:{keeper}")).as_deref(), Some("1"));
+        assert_eq!(s.get_setting("bridge_on").as_deref(), Some("1"));
+        assert_eq!(count(&s, "SELECT count(*) FROM app_settings WHERE key LIKE 'drift_snooze:%'"), 1);
+
+        // 5. the rail order loses the element, keeps the other.
+        assert_eq!(s.get_setting("project_order").as_deref(), Some(format!("[\"{keeper}\"]").as_str()));
+
+        // 6. and the key is recorded, or the scan puts it straight back.
+        assert_eq!(s.forgotten_projects(), vec![doomed.to_string()]);
+    }
+
+    /// The escape hatch. Forgetting is irreversible about the RECORD; it must not
+    /// be irreversible about the PROJECT, or the only way back is a SQL editor.
+    #[test]
+    fn a_forgotten_project_can_be_added_back() {
+        let mut s = Store::open_in_memory().unwrap();
+        let k = "path:/tmp/projects/gone";
+        s.ensure_project(k, "Gone").unwrap();
+        s.forget_project(k).unwrap();
+        assert_eq!(s.forgotten_projects(), vec![k.to_string()]);
+
+        s.unforget_project(k).unwrap();
+        assert!(s.forgotten_projects().is_empty(), "the scan may show it again");
+        // Un-forgetting restores the PROJECT, never the history.
+        assert!(!s.project_exists(k), "un-forget is not an undo");
+    }
+
+    #[test]
+    fn forgetting_is_idempotent_and_ignores_an_empty_key() {
+        let mut s = Store::open_in_memory().unwrap();
+        let k = "path:/tmp/projects/twice";
+        s.ensure_project(k, "Twice").unwrap();
+        s.forget_project(k).unwrap();
+        s.forget_project(k).unwrap();
+        assert_eq!(s.forgotten_projects(), vec![k.to_string()], "recorded once, not twice");
+        s.forget_project("").unwrap();
+        assert_eq!(s.forgotten_projects(), vec![k.to_string()], "an empty key forgets nothing");
+    }
+
     #[test]
     fn rename_project_key_refuses_to_merge_into_an_existing_identity() {
         // findings 1/3/4: `UPDATE OR REPLACE project SET key=…` DELETED the row

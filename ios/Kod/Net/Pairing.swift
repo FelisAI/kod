@@ -8,7 +8,11 @@
 //  The payload is a contract with the Mac, and it is ~100 ASCII bytes so it fits a
 //  low-error-correction QR that scans from across a desk:
 //
-//      kod://pair?h=<host>&p=<port>&t=<64 lowercase hex>&f=<key fingerprint>
+//      kod://pair?h=<host>&h2=<host>&p=<port>&t=<64 lowercase hex>&f=<key fingerprint>
+//
+//  `h2` (and `h3`) are the SAME Mac at another address — its Wi-Fi one and its
+//  tailnet one, say. They are optional, and a build that does not know them still
+//  pairs off `h` alone, which is why the Mac puts its Wi-Fi address there.
 //
 //  `f` is base64url (unpadded) of SHA-256 over the DER SubjectPublicKeyInfo the
 //  Mac serves. PRESENT means wss:// and that key and no other; ABSENT means
@@ -82,6 +86,9 @@ enum Pairing {
     /// The optional key fingerprint. Not a `PairingField` because that enum is
     /// the set of things a code can be MISSING, and this one is allowed to be.
     private static let fingerprintParam = "f"
+    /// How many addresses a code may carry: `h`, `h2`, `h3`. Matches the Mac's
+    /// `MAX_PAIR_HOSTS`, which is set by what a QR of this size can hold.
+    static let maxHosts = 3
 
     static func parse(_ s: String) -> Result<BridgeSettings, PairingError> {
         let raw = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -166,11 +173,34 @@ enum Pairing {
             fingerprint = raw
         }
 
+        // `h2`, `h3`: the SAME Mac's other addresses, in the order to try them.
+        // One Mac can be reachable on Wi-Fi and over Tailscale at once, and a
+        // phone holding only the first of those is one that works at a desk and
+        // not on a sofa. ONE `f` covers all of them — the pin is over the KEY, so
+        // it is the machine that is identified, not the address.
+        //
+        // They ride in params an older build IGNORES (see the header), so a code
+        // from a newer Mac still pairs a phone that has never heard of `h2`. That
+        // is why the Mac puts its Wi-Fi address in `h`: it is the one that has to
+        // work for the phone that only reads `h`.
+        var altHosts: [String] = []
+        if maxHosts > 1 {
+            for n in 2...maxHosts {
+                guard let extra = fields["h\(n)"], !extra.isEmpty else { break }
+                altHosts.append(extra)
+            }
+        }
+
         // The host is deliberately NOT validated as an IPv4 literal. The Mac sends
         // one today, but a MagicDNS or .local name is the obvious next step, and
         // BridgeSettings.url already copes; a stricter check here would reject a
         // code that works. Nor is it checked against the certificate later: the
         // KEY is the identity, precisely so this address may change.
-        return .success(BridgeSettings(host: host, port: port, token: token, fingerprint: fingerprint))
+        var settings = BridgeSettings(host: host, port: port, token: token, fingerprint: fingerprint)
+        settings.altHosts = altHosts
+        // `normalized` is what drops a repeat of the primary and any blank, so a
+        // code that names one address twice does not cost an attempt dialling it
+        // twice — and so the scanner and the store agree on the same list.
+        return .success(settings.normalized())
     }
 }

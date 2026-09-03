@@ -205,7 +205,7 @@ final class AppModel {
         stop()
         let fixtures = args.contains("-kod-quiet") ? Fixtures.allQuiet : Fixtures.everyTier
         store.apply(.sessions(epoch: "demo", sessions: fixtures.map(Self.asTheDaemonWouldMark)))
-        connection = .connected
+        connection = .connected("sample data")
         inputAllowed = true
         now = Fixtures.now + 60_000
         selectedSid = 2
@@ -227,7 +227,7 @@ final class AppModel {
         stop()
         store.apply(.sessions(epoch: "demo",
                               sessions: Fixtures.everyTier.map(Self.asTheDaemonWouldMark)))
-        connection = .connected
+        connection = .connected("sample data")
         inputAllowed = true
         now = Fixtures.now + 60_000
         selectedSid = 2
@@ -299,6 +299,12 @@ final class AppModel {
     }
 
     func apply(settings new: BridgeSettings) {
+        // NORMALISED before it is kept, not only before it is stored. Holding the
+        // raw value meant `model.settings` and the store could differ by a
+        // trailing space — so a form comparing its fields against `settings` to
+        // decide whether anything had changed could read "edited" for a value it
+        // had just saved.
+        let new = new.normalized()
         settings = new
         SettingsStore.save(new)
         start()
@@ -312,10 +318,20 @@ final class AppModel {
         // the demo silently started dialling in exactly the build a reviewer runs.
         if demoMode { return }
         startClock()
-        guard settings.isUsable else {
-            connection = settings.insecureBeyondThisDevice ? .insecure : .unconfigured
-            return
-        }
+        // HANDED OVER UNCONDITIONALLY, usable or not.
+        //
+        // There used to be a guard here that set `.insecure`/`.unconfigured` and
+        // returned WITHOUT touching the client — which meant a running loop kept
+        // running. Saving an unusable settings object therefore left the old
+        // socket dialling the OLD address, overwriting the state this line had
+        // just set, one `.connecting` and `.reconnecting` at a time: the user
+        // typed their Wi-Fi address, watched a connect/timeout loop against a
+        // tailnet address they could no longer see named anywhere, and never once
+        // saw the sentence explaining why the new one was refused. The client's
+        // own `start` stops first and reaches the same two states (`BridgeClient.
+        // start`), so the guard bought nothing and cost the teardown — and it
+        // also left `BridgeClient.settings` stale, which is what made the banner's
+        // "retry" re-dial the address the user had just replaced.
         client.startIfNeeded(settings)
     }
 
@@ -415,7 +431,7 @@ final class AppModel {
 // the setter — an extension anywhere else could not fake a connected model.
 extension AppModel {
     static func preview(_ sessions: [Session] = Fixtures.everyTier,
-                        state: ConnectionState = .connected) -> AppModel {
+                        state: ConnectionState = .connected("10.0.0.14:18787")) -> AppModel {
         let m = AppModel(settings: BridgeSettings(host: "10.0.0.14", port: BridgeSettings.defaultPort, token: "preview"),
                          autostart: false)
         m.store.apply(.sessions(epoch: "preview", sessions: sessions.map(asTheDaemonWouldMark)))

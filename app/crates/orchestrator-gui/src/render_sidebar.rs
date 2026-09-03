@@ -10,6 +10,9 @@ impl Orchestrator {
     fn rail_active_project(&self, i: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let slug = self.projects[i].slug.clone();
         let name = self.projects[i].name.clone();
+        // our own copies: the row below MOVES both into its children.
+        let (forget_slug, forget_name) = (slug.clone(), name.clone());
+        let menu_slug = slug.clone();
         let unread = self.project_unread(&slug); // #50: has updates you haven't opened
         let is_sel = self.screen == Screen::Workspace && i == self.selected;
         let (awaiting, busy) = live_rank(self.cached_infos(&slug));
@@ -61,6 +64,17 @@ impl Orchestrator {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                     this.select_project(&head_slug, cx)
+                }),
+            )
+            // RIGHT-CLICK asks for the destructive verb. It does NOT select the
+            // project — `stop_propagation` — because arming a delete should not
+            // also drag you out of whatever you were reading.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.rail_forget_armed = Some(menu_slug.clone());
+                    cx.stop_propagation();
+                    cx.notify();
                 }),
             )
             .child(project_badge(&name, &slug, 21.))
@@ -264,11 +278,124 @@ impl Orchestrator {
             }
             card = card.child(group);
         }
+        if self.rail_forget_armed.as_deref() == Some(forget_slug.as_str()) {
+            card = card.child(self.rail_forget_strip(&forget_slug, &forget_name, hosted, cx));
+        }
         card
     }
 
+    /// FORGET THIS PROJECT — the rail's only destructive control, reached by
+    /// RIGHT-CLICKING the project row and by nothing else.
+    ///
+    /// It first shipped as a standing "Forget this project" line under whichever
+    /// project was open, which is a permanent invitation to destroy something you
+    /// were only reading. A destructive verb should have to be ASKED for, and
+    /// right-click is where a Mac user asks. Nothing renders here until then.
+    ///
+    /// Two steps, and the second one NAMES WHAT GOES instead of asking "are you
+    /// sure?". That wording matters here more than usual, because the two halves
+    /// are not equally reversible: adding the folder back returns the PROJECT,
+    /// but nothing returns its history. So the confirm says which is which.
+    ///
+    /// REFUSED while a session is live. `hosted` is the very count the pill above
+    /// this strip renders, so the refusal can never disagree with what the row is
+    /// showing — and `forget_project` re-checks it anyway, because a session can
+    /// start between this frame and the click.
+    fn rail_forget_strip(
+        &self,
+        slug: &str,
+        name: &str,
+        hosted: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .mt(px(3.))
+            .px(px(9.))
+            .py(px(7.))
+            .rounded(px(8.))
+            .bg(rgb(AMBER_INK))
+            .border_1()
+            .border_color(rgb(AMBER_HAIR));
+
+        if hosted > 0 {
+            // Not a warning to click past — there is no button here at all.
+            strip = strip
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(AMBER))
+                        .child(SharedString::from(format!(
+                            "{name} has {hosted} live session{} running.",
+                            if hosted == 1 { "" } else { "s" }
+                        ))),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(MUTED2))
+                        .child("Close them first, then forget it."),
+                );
+        } else {
+            strip = strip
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(AMBER))
+                        .child(SharedString::from(format!("Forget {name}?"))),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(MUTED2))
+                        .child(
+                            "Kod's record of it goes: its sessions, summaries, map, notes                              and memory. Your folder on disk is not touched. Adding it back                              later brings the project back, not its history.",
+                        ),
+                );
+        }
+
+        let row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.))
+            .pt(px(3.))
+            .child(
+                div()
+                    .id(SharedString::from(format!("forget-cancel-{slug}")))
+                    .cursor_pointer()
+                    .text_size(px(10.5))
+                    .text_color(rgb(MUTED2))
+                    .hover(|h| h.text_color(rgb(TEXT)))
+                    .child("Cancel")
+                    .on_click(cx.listener(|this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                        this.rail_forget_armed = None;
+                        cx.notify();
+                    })),
+            );
+        let fslug = slug.to_string();
+        strip
+            .child(row.when(hosted == 0, |r| {
+                r.child(
+                    div()
+                        .id(SharedString::from(format!("forget-do-{fslug}")))
+                        .cursor_pointer()
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(AMBER))
+                        .child("Forget it")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.forget_project(&fslug, cx)
+                        })),
+                )
+            }))
+            .into_any_element()
+    }
+
     /// A dormant project row: badge + name + amber needs-you dot or a "last active" stamp.
-    fn rail_rest_project(&self, i: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn rail_rest_project(&self, i: usize, cx: &mut Context<Self>) -> AnyElement {
         let slug = self.projects[i].slug.clone();
         let name = self.projects[i].name.clone();
         let unread = self.project_unread(&slug); // #50: has updates you haven't opened
@@ -286,6 +413,11 @@ impl Orchestrator {
             String::new()
         };
         let rslug = slug.clone();
+        let menu_slug = slug.clone();
+        let (forget_slug, forget_name) = (slug.clone(), name.clone());
+        // the same count the active row's pill renders, so the refusal below can
+        // never disagree with what a project row is showing.
+        let hosted = self.cached_infos(&slug).iter().filter(|s| s.alive).count();
         let (drag_slug, drag_name) = (slug.clone(), name.clone());
         // ideas are just projects (#10) — same row, dimmed, ◌ instead of badge.
         let is_idea = slug.starts_with("idea:");
@@ -309,6 +441,17 @@ impl Orchestrator {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                     this.select_project(&rslug, cx)
+                }),
+            )
+            // RIGHT-CLICK asks for the destructive verb. It does NOT select the
+            // project — `stop_propagation` — because arming a delete should not
+            // also drag you out of whatever you were reading.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.rail_forget_armed = Some(menu_slug.clone());
+                    cx.stop_propagation();
+                    cx.notify();
                 }),
             )
             .child(if is_idea {
@@ -370,11 +513,22 @@ impl Orchestrator {
             });
         // no drag affordance until the real scan has landed — the pre-scan rail is
         // seed_projects() and `reorder_project` refuses to persist that order.
-        if self.scanned {
-            rail_order::rail_reorderable(row, &drag_slug, &drag_name, false, cx)
+        let row = if self.scanned {
+            rail_order::rail_reorderable(row, &drag_slug, &drag_name, false, cx).into_any_element()
         } else {
-            row
+            row.into_any_element()
+        };
+        // Hung under ANY project row, not just the open one: right-clicking a
+        // project you are not in is the ordinary way to tidy a rail.
+        if self.rail_forget_armed.as_deref() != Some(forget_slug.as_str()) {
+            return row;
         }
+        div()
+            .flex()
+            .flex_col()
+            .child(row)
+            .child(self.rail_forget_strip(&forget_slug, &forget_name, hosted, cx))
+            .into_any_element()
     }
 
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {

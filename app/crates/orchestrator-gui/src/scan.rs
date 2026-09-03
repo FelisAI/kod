@@ -31,8 +31,25 @@ impl Orchestrator {
                 path: path.map(std::path::PathBuf::from),
             })
             .collect();
+        // Projects the user has FORGOTTEN.
+        //
+        // This is the half that makes deleting a project work at all. The rail is
+        // not built from the store — `live_projects_with_store` MERGES the store's
+        // rows with a live scan of ~/.claude/projects and the codex rollouts — so
+        // erasing a project's rows and nothing else deletes its history and leaves
+        // the project itself sitting right there, rediscovered and blank, on the
+        // next scan. Filtering happens after the resolve because the scan has no
+        // business knowing about this: it reports what is on disk, truthfully, and
+        // this is a decision about what to SHOW.
+        let forgotten: Vec<String> = self
+            .store
+            .lock()
+            .ok()
+            .map(|s| s.forgotten_projects())
+            .unwrap_or_default();
         std::thread::spawn(move || {
-            let projects = orchestrator_core::live_projects_with_store(&rows);
+            let mut projects = orchestrator_core::live_projects_with_store(&rows);
+            projects.retain(|p| !forgotten.iter().any(|k| k == &p.slug));
             *slot.lock().unwrap() = Some(projects);
         });
         // poll for the result, swap it in, then stop.

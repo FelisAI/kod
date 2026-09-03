@@ -56,28 +56,6 @@ pub(crate) fn update_floor_ms(seen_ms: u64, now_ms: u64) -> u64 {
     want.max(at_most)
 }
 
-/// What the tier is showing, in words, so the window is never a guess.
-///
-/// The window rule is not complicated, but it IS invisible — and an unlabelled
-/// "what happened" leaves you unable to tell whether you are looking at the last
-/// hour or the last fortnight. Every branch of `update_floor_ms` gets a phrase.
-pub(crate) fn window_label(seen_ms: u64, now_ms: u64) -> String {
-    let floor = update_floor_ms(seen_ms, now_ms);
-    if floor <= now_ms.saturating_sub(MAX_WINDOW_MS) {
-        return "the last 14 days".to_string();
-    }
-    // Ask which rule WON, not how it compares to the stamp: when you have been
-    // away five days the floor EQUALS the stamp, so `floor >= seen_ms` is true
-    // there too and would mislabel it as the 48h minimum.
-    if floor >= now_ms.saturating_sub(MIN_WINDOW_MS) {
-        return "the last 48 hours".to_string();
-    }
-    format!(
-        "since your last check, {}",
-        crate::timefmt::ago_label(now_ms.saturating_sub(seen_ms))
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Density {
     /// Project header + up to `LINES_PER_BLOCK` event lines.
@@ -102,15 +80,19 @@ pub(crate) struct PlannedProject {
     pub total: usize,
     pub lines: Vec<PlannedEvent>,
     pub hidden_lines: usize,
-    /// Its newest event lands after your last check.
-    pub fresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UpdatePlan {
-    /// Projects whose newest event is newer than the last-check stamp.
-    pub fresh: Vec<PlannedProject>,
-    pub earlier: Vec<PlannedProject>,
+    /// The projects with something you have not seen — and ONLY those.
+    ///
+    /// There is no already-read half any more. It used to keep one, collapsed
+    /// behind an "EARLIER — N projects you have already read" header, and that
+    /// header force-opened itself the moment nothing was new: reading the last
+    /// item unfolded everything you had just finished reading. The tier's job is
+    /// the question "is there anything I have not seen", so the answer to it when
+    /// you are caught up is a sentence, not a list.
+    pub projects: Vec<PlannedProject>,
     pub density: Density,
     /// Projects dropped by the cap — the "+N more projects" footer.
     pub hidden_projects: usize,
@@ -120,7 +102,7 @@ pub(crate) struct UpdatePlan {
 
 impl UpdatePlan {
     pub(crate) fn is_empty(&self) -> bool {
-        self.fresh.is_empty() && self.earlier.is_empty()
+        self.projects.is_empty()
     }
 }
 
@@ -149,6 +131,35 @@ fn kind_ord(k: &TimelineKind) -> u8 {
     }
 }
 
+/// What a change in "which project is open" means for the per-project read
+/// ledger.
+///
+/// STAMPING HAPPENS ON LEAVE, not on arrival — the same rule the standup's own
+/// divider has always used ("stamp on LEAVE so the divider holds still while he
+/// reads"). Stamping on arrival was why a project re-marked itself unread
+/// seconds after being opened: the summariser writes `at_ms = now` for a session
+/// you are sitting and watching, so an arrival stamp is already stale by the
+/// time you look away, and the block came back with its dot lit as if you had
+/// never been.
+///
+/// Leaving is only an honest place to stamp because what arrives during the
+/// visit is put ON SCREEN during the visit (`Orchestrator::proj_arrived`).
+/// Without that the stamp would silently bury a summary nobody ever saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisitChange {
+    /// The project just left, and therefore to be marked read.
+    pub left: Option<String>,
+    /// The visit clock restarts — a different project is open now, or none.
+    pub restart: bool,
+}
+
+pub(crate) fn visit_change(prev: Option<&str>, now: Option<&str>) -> VisitChange {
+    if prev == now {
+        return VisitChange { left: None, restart: false };
+    }
+    VisitChange { left: prev.map(str::to_string), restart: true }
+}
+
 pub(crate) fn plan_updates(
     events: &[TimelineEvent],
     is_fresh: &dyn Fn(&str) -> bool,
@@ -170,8 +181,22 @@ pub(crate) fn plan_updates(
         slot.push(e);
     }
 
+    // EVICT WHAT YOU HAVE READ, here, before anything is built or capped.
+    //
+    // This is the tier's whole semantic: ▲ WHAT HAPPENED answers "is there
+    // anything I have not seen", so a project you have opened has no business in
+    // it. It used to be kept and merely relabelled — moved under an "EARLIER — N
+    // projects you have already read" header — which meant reading an item could
+    // never remove it, only demote it, and the header force-opened itself exactly
+    // when nothing was new.
+    //
+    // Filtering HERE and not after the fact also fixes the caps: `reporting`,
+    // `density` and PROJECT_CAP now count unread projects only, so the cap can no
+    // longer evict work you have never seen in order to keep showing work you
+    // have.
     let mut projects: Vec<PlannedProject> = order
         .into_iter()
+        .filter(|key| is_fresh(key))
         .map(|key| {
             let mut evs = by_key.remove(&key).unwrap_or_default();
             evs.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
@@ -195,12 +220,10 @@ pub(crate) fn plan_updates(
                 seen_thread.insert((kind_ord(&e.kind), e.sess.as_str()))
             });
             let newest_ms = evs.first().map(|e| e.ts_ms).unwrap_or(0);
-            let fresh = is_fresh(&key);
             PlannedProject {
                 key,
                 newest_ms,
                 total: evs.len(),
-                fresh,
                 lines: evs
                     .iter()
                     .map(|e| PlannedEvent {
@@ -214,8 +237,10 @@ pub(crate) fn plan_updates(
         })
         .collect();
 
-    // newest project first — so the cap below can only ever drop the STALEST,
-    // never a project that just reported.
+    // Newest first. The cap below can only ever drop the stalest — and since
+    // everything here is UNREAD, it can no longer drop unseen work to make room
+    // for work you have already read, which is what a plan holding both halves
+    // did past PROJECT_CAP.
     projects.sort_by(|a, b| b.newest_ms.cmp(&a.newest_ms));
 
     let reporting = projects.len();
@@ -247,10 +272,8 @@ pub(crate) fn plan_updates(
         p.lines.truncate(keep);
     }
 
-    let (fresh, earlier) = projects.into_iter().partition(|p| p.fresh);
     UpdatePlan {
-        fresh,
-        earlier,
+        projects,
         density,
         hidden_projects,
         reporting,
@@ -359,7 +382,7 @@ mod tests {
     /// Projects actually rendered across both groups. Test-only: the render
     /// walks the two groups separately, so nothing in the app needs the sum.
     fn shown(p: &UpdatePlan) -> usize {
-        p.fresh.len() + p.earlier.len()
+        p.projects.len()
     }
 
     /// A DISTINCT thread per event by default. The old fixture used a constant
@@ -386,6 +409,73 @@ mod tests {
     }
 
     #[test]
+    fn a_project_is_marked_read_when_it_is_left_not_when_it_is_opened() {
+        // Arriving stamps nothing: what makes a project read is having been in
+        // it, and that is only known on the way out.
+        assert_eq!(
+            visit_change(None, Some("atlas")),
+            VisitChange { left: None, restart: true }
+        );
+        // Leaving for the standup stamps the project you left.
+        assert_eq!(
+            visit_change(Some("atlas"), None),
+            VisitChange { left: Some("atlas".into()), restart: true }
+        );
+        // Straight from one project to another stamps only the one departed.
+        assert_eq!(
+            visit_change(Some("atlas"), Some("harbor")),
+            VisitChange { left: Some("atlas".into()), restart: true }
+        );
+    }
+
+    #[test]
+    fn staying_put_neither_stamps_nor_restarts_the_visit_clock() {
+        // This runs on a 500ms tick, so it is asked constantly. A restart here
+        // would keep resetting the "since you opened this" window to now, and the
+        // strip that justifies the leave-stamp would never show anything.
+        assert_eq!(
+            visit_change(Some("atlas"), Some("atlas")),
+            VisitChange { left: None, restart: false }
+        );
+        assert_eq!(visit_change(None, None), VisitChange { left: None, restart: false });
+    }
+
+
+
+
+
+
+    /// THE SEMANTIC, PINNED: ▲ WHAT HAPPENED is what you have NOT seen.
+    #[test]
+    fn reading_everything_empties_the_tier_rather_than_relabelling_it() {
+        // Five projects all within the window, all already read — the exact shape
+        // measured on the real store when this was reported. It used to plan five
+        // "earlier" blocks and render them expanded.
+        let p = plan_updates(&spread(5), &|_| false, &|_| false, 0, false);
+        assert!(p.projects.is_empty());
+        assert!(p.is_empty(), "caught up means an empty plan, not a demoted pile");
+        assert_eq!(p.reporting, 0);
+        assert_eq!(p.hidden_projects, 0, "nothing is hidden — there is nothing");
+    }
+
+    #[test]
+    fn the_caps_count_only_what_you_have_not_seen() {
+        // 12 projects reporting but only 3 unread: the caps must size themselves
+        // to the 3. Counting all 12 flipped density to Digest and put a
+        // "+N more projects" footer over a screen with three rows on it.
+        let unread = ["p0", "p5", "p11"];
+        let p = plan_updates(&spread(12), &|k| unread.contains(&k), &|_| false, 0, false);
+        assert_eq!(p.reporting, 3);
+        assert_eq!(p.density, Density::Blocks, "3 <= BLOCK_MAX_PROJECTS");
+        assert_eq!(p.hidden_projects, 0, "3 is nowhere near PROJECT_CAP");
+        assert_eq!(
+            p.projects.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
+            ["p0", "p5", "p11"],
+            "newest first, and only the unread"
+        );
+    }
+
+    #[test]
     fn empty_input_is_an_empty_plan() {
         let p = plan_updates(&[], &|_| true, &|_| false, 0, false);
         assert!(p.is_empty());
@@ -403,11 +493,11 @@ mod tests {
         let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
         assert_eq!(p.reporting, 2, "two projects, three events");
         // sorted newest project first
-        assert_eq!(p.fresh[0].key, "atlas");
-        assert_eq!(p.fresh[0].newest_ms, 900);
-        assert_eq!(p.fresh[0].total, 2);
-        assert_eq!(p.fresh[0].lines[0].text, "newest", "newest line leads");
-        assert_eq!(p.fresh[1].key, "harbor");
+        assert_eq!(p.projects[0].key, "atlas");
+        assert_eq!(p.projects[0].newest_ms, 900);
+        assert_eq!(p.projects[0].total, 2);
+        assert_eq!(p.projects[0].lines[0].text, "newest", "newest line leads");
+        assert_eq!(p.projects[1].key, "harbor");
     }
 
     fn ev_sess(project: &str, sess: &str, ts_ms: u64, text: &str) -> TimelineEvent {
@@ -425,9 +515,9 @@ mod tests {
             .map(|i| ev_sess("ai-video", "s1", 9_000 - i, "where it got to"))
             .collect();
         let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
-        assert_eq!(p.fresh[0].total, 1, "one thread, one line");
-        assert_eq!(p.fresh[0].hidden_lines, 0, "and so nothing to hide");
-        assert_eq!(p.fresh[0].lines[0].ts_ms, 9_000, "the NEWEST is what it says");
+        assert_eq!(p.projects[0].total, 1, "one thread, one line");
+        assert_eq!(p.projects[0].hidden_lines, 0, "and so nothing to hide");
+        assert_eq!(p.projects[0].lines[0].ts_ms, 9_000, "the NEWEST is what it says");
     }
 
     #[test]
@@ -438,9 +528,9 @@ mod tests {
             ev_sess("atlas", "s2", 700, "b"),
         ];
         let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
-        assert_eq!(p.fresh[0].total, 2);
-        assert_eq!(p.fresh[0].lines[0].text, "a-new");
-        assert_eq!(p.fresh[0].lines[1].text, "b");
+        assert_eq!(p.projects[0].total, 2);
+        assert_eq!(p.projects[0].lines[0].text, "a-new");
+        assert_eq!(p.projects[0].lines[1].text, "b");
     }
 
     #[test]
@@ -453,7 +543,7 @@ mod tests {
         };
         let evs = vec![nosess(900, "map 1"), nosess(800, "map 2"), nosess(700, "map 3")];
         let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
-        assert_eq!(p.fresh[0].total, 3);
+        assert_eq!(p.projects[0].total, 3);
     }
 
     #[test]
@@ -463,9 +553,9 @@ mod tests {
         let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
         assert_eq!(p.reporting, 1);
         assert_eq!(shown(&p), 1);
-        assert_eq!(p.fresh[0].total, 40);
-        assert_eq!(p.fresh[0].lines.len(), LINES_PER_BLOCK);
-        assert_eq!(p.fresh[0].hidden_lines, 37);
+        assert_eq!(p.projects[0].total, 40);
+        assert_eq!(p.projects[0].lines.len(), LINES_PER_BLOCK);
+        assert_eq!(p.projects[0].hidden_lines, 37);
     }
 
     #[test]
@@ -474,19 +564,17 @@ mod tests {
         // per project (proj_seen_ms), not by one global "you left Standup" stamp.
         let evs = vec![ev("new", 900, "a"), ev("old", 100, "b")];
         let p = plan_updates(&evs, &|k| k == "new", &|_| false, 0, false);
-        assert_eq!(p.fresh.len(), 1);
-        assert_eq!(p.fresh[0].key, "new");
-        assert_eq!(p.earlier.len(), 1);
-        assert_eq!(p.earlier[0].key, "old");
+        assert_eq!(p.projects.len(), 1);
+        assert_eq!(p.projects[0].key, "new");
+        assert_eq!(p.reporting, 1, "a project you have read does not report at all");
     }
 
     #[test]
-    fn a_first_ever_visit_makes_everything_fresh() {
+    fn a_first_ever_visit_shows_everything() {
         // A project never opened has no proj_seen stamp, so project_unread says
-        // unread — dimming someone's entire first look would be wrong.
+        // unread — hiding someone's entire first look would be wrong.
         let p = plan_updates(&spread(4), &|_| true, &|_| false, 0, false);
-        assert_eq!(p.fresh.len(), 4);
-        assert!(p.earlier.is_empty());
+        assert_eq!(p.projects.len(), 4);
     }
 
     #[test]
@@ -503,7 +591,7 @@ mod tests {
         evs.push(ev("p0", 99_999, "the newest thing p0 did"));
         let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
         assert_eq!(p.density, Density::Digest);
-        let p0 = p.fresh.iter().find(|x| x.key == "p0").unwrap();
+        let p0 = p.projects.iter().find(|x| x.key == "p0").unwrap();
         assert_eq!(p0.lines.len(), 1);
         assert_eq!(p0.lines[0].text, "the newest thing p0 did");
         assert_eq!(p0.hidden_lines, 1);
@@ -518,8 +606,8 @@ mod tests {
         // spread() gives p0 the newest stamp, so the survivors are p0..p9 —
         // the cap must never drop a project that just reported in favour of
         // one that has been quiet for hours.
-        assert_eq!(p.fresh.first().unwrap().key, "p0");
-        assert!(!p.fresh.iter().any(|x| x.key == "p14"));
+        assert_eq!(p.projects.first().unwrap().key, "p0");
+        assert!(!p.projects.iter().any(|x| x.key == "p14"));
     }
 
     #[test]
@@ -549,21 +637,19 @@ mod tests {
         ];
         let p = plan_updates(&evs, &|k| k == "a" || k == "b", &|_| false, 0, false);
         assert_eq!(
-            p.fresh.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
-            ["a", "b"]
-        );
-        assert_eq!(
-            p.earlier.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
-            ["c", "d"]
+            p.projects.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
+            ["a", "b"],
+            "c and d have been read, so they are not in the plan at all"
         );
     }
 
     #[test]
-    fn a_project_whose_newest_event_ties_the_stamp_is_not_fresh() {
+    fn a_project_whose_newest_event_ties_the_stamp_is_not_shown() {
         // Strictly newer, matching project_unread's `last_update > seen`.
         let p = plan_updates(&[ev("a", 500, "")], &|_| false, &|_| false, 0, false);
-        assert!(p.fresh.is_empty());
-        assert_eq!(p.earlier.len(), 1);
+        assert!(p.projects.is_empty());
+        assert!(p.is_empty(), "read means gone, not demoted");
+        assert_eq!(p.reporting, 0);
     }
 
     // ── the time floor ────────────────────────────────────────────────────
@@ -596,20 +682,6 @@ mod tests {
         assert_eq!(update_floor_ms(0, NOW), NOW - MIN_WINDOW_MS);
     }
 
-    #[test]
-    fn the_window_says_which_rule_it_used() {
-        // checked recently -> the 48h minimum is what you are seeing
-        assert_eq!(window_label(NOW - 60_000, NOW), "the last 48 hours");
-        assert_eq!(window_label(0, NOW), "the last 48 hours");
-        // away longer -> it reaches back to your last look, and says so
-        assert_eq!(
-            window_label(NOW - 5 * 24 * H, NOW),
-            "since your last check, 5d ago"
-        );
-        // away far too long -> clamped, and says THAT rather than lying about
-        // showing everything since your last check
-        assert_eq!(window_label(NOW - 90 * 24 * H, NOW), "the last 14 days");
-    }
 
     #[test]
     fn events_older_than_the_floor_do_not_report_at_all() {
@@ -624,7 +696,7 @@ mod tests {
         let floor = update_floor_ms(0, NOW);
         let p = plan_updates(&evs, &|_| true, &|_| false, floor, false);
         assert_eq!(p.reporting, 1, "the ancient project must not report");
-        assert_eq!(p.fresh[0].key, "recent");
+        assert_eq!(p.projects[0].key, "recent");
     }
 
     // ── calibrated to production, not to imagination ──────────────────────
@@ -653,7 +725,7 @@ mod tests {
             Density::Digest,
             "9 projects is past BLOCK_MAX_PROJECTS, so the safety valve opens"
         );
-        assert!(p.fresh.iter().all(|x| x.lines.len() == 1 && x.hidden_lines == 4));
+        assert!(p.projects.iter().all(|x| x.lines.len() == 1 && x.hidden_lines == 4));
     }
 
     /// The TYPICAL day: 2 projects. This is what the screen looks like almost

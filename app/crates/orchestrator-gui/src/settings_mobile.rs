@@ -178,12 +178,15 @@ impl Orchestrator {
     /// Card 4 — pairing. Only ever describes something actually reachable.
     fn mobile_card_pairing(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let st = &self.bridge_status;
-        let host = bridgecfg::reachable_host(&st.endpoints);
+        // Every address, not just the first. A code naming one of two leaves the
+        // other unpairable, and the switches above have already told the user
+        // both of them exist.
+        let hosts = bridgecfg::pair_hosts(&st.endpoints);
         let token = self.bridge_token.clone();
 
         let body: AnyElement = if !st.running {
             hint("Turn the bridge on to pair a phone.").into_any_element()
-        } else if host.is_none() {
+        } else if hosts.is_empty() {
             // Never print a bare 127.0.0.1 under a label that says "Host": typed
             // into an iPhone that names the PHONE's own loopback, and the user
             // ends up debugging Tailscale, the firewall and the token — none of
@@ -208,21 +211,13 @@ impl Orchestrator {
             )
             .into_any_element()
         } else {
-            let url = bridgecfg::pair_url(
-                host.as_deref().unwrap_or_default(),
-                st_port(st),
-                &token,
-                st.fingerprint.as_deref(),
-            );
+            let url = bridgecfg::pair_url(&hosts, st_port(st), &token, st.fingerprint.as_deref());
             div()
                 .flex()
                 .flex_col()
                 .gap(px(12.))
                 .child(qr_block(&url))
-                .child(hint("Scan this in the Kod app on your phone. It carries the address, \
-                             the port, the token, and the fingerprint of this Mac's key — which \
-                             is how your phone knows it is Kod answering and not something else \
-                             on that address."))
+                .child(hint(bridgecfg::code_carries(&hosts)))
                 .child(
                     div()
                         .flex()

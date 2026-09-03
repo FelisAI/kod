@@ -118,9 +118,40 @@ final class PlanTests: XCTestCase {
         let group = ProjectsPlan(sessions: [
             s(1, "p", phase: .busy), s(2, "p", phase: .busy), s(3, "p", phase: .idle),
         ]).active.first
-        XCTAssertEqual(group?.subtitle, "3 sessions · 2 working · 1 idle")
+        // The working/idle split MOVED OUT of this grey line and into `liveMix`,
+        // where it is colour. It read "3 sessions · 2 working · 1 idle" before,
+        // which is the same sentence for a project mid-run and a project sitting
+        // still — you had to read it to tell them apart.
+        XCTAssertEqual(group?.subtitle, "3 sessions")
         XCTAssertEqual(group?.liveCount, 3)
         XCTAssertEqual(group?.attentionCount, 0)
+    }
+
+    /// A working project must not LOOK like an idle one. The counts were always
+    /// in the model; nothing rendered them as anything but grey text.
+    func testTheLiveMixDistinguishesWorkingFromIdleByColour() {
+        let working = ProjectsPlan(sessions: [
+            s(1, "p", phase: .busy), s(2, "p", phase: .busy), s(3, "p", phase: .idle),
+        ]).active.first!
+        XCTAssertEqual(working.liveMix.map(\.label), ["● 1", "● 2"], "idle then working")
+        XCTAssertEqual(working.liveMix.map(\.tint), [KodColor.green, KodColor.orange])
+
+        let quiet = ProjectsPlan(sessions: [s(1, "q", phase: .idle)]).active.first!
+        XCTAssertEqual(quiet.liveMix.map(\.tint), [KodColor.green])
+        XCTAssertNotEqual(working.liveMix.map(\.tint), quiet.liveMix.map(\.tint),
+                          "two projects in different states must not render the same")
+    }
+
+    /// Needs-you leads, in the same priority order the Mac's rail uses.
+    func testNeedsYouLeadsTheLiveMix() {
+        let g = ProjectsPlan(sessions: [
+            s(1, "p", phase: .awaiting), s(2, "p", phase: .busy), s(3, "p", phase: .idle),
+        ]).active.first!
+        XCTAssertEqual(g.liveMix.map(\.label), ["⚠ 1", "● 1", "● 1"])
+        XCTAssertEqual(g.liveMix.first?.tint, KodColor.amber)
+        // A state with nothing in it contributes no segment — the Mac's rule.
+        let only = ProjectsPlan(sessions: [s(1, "p", phase: .busy)]).active.first!
+        XCTAssertEqual(only.liveMix.map(\.label), ["● 1"])
     }
 
     func testBlankProjectGetsAPlaceholderBucket() {

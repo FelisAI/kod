@@ -36,6 +36,22 @@ struct BridgeSettings: Equatable {
     /// still means plaintext — the old behaviour, unchanged.
     var fingerprint: String? = nil
 
+    /// The SAME Mac's other addresses, in the order to try them after `host`.
+    ///
+    /// A Mac can be reachable in two places at once — its Wi-Fi address and its
+    /// tailnet one — and the pairing code carries both (`h`, then `h2`). Holding
+    /// only the first is what produced a phone that worked at a desk and not on
+    /// the sofa, or the reverse, with re-pairing as the only cure.
+    ///
+    /// They are alternates for one machine, not a list of machines: ONE
+    /// `fingerprint` covers all of them, which is sound precisely because the pin
+    /// is over the KEY and not the address. Anything answering at any of these
+    /// addresses that cannot present that key is refused.
+    ///
+    /// Defaulted so every existing call site still compiles and still means "one
+    /// address" — the old behaviour, unchanged.
+    var altHosts: [String] = []
+
     /// Must equal the bridge's `ws::DEFAULT_PORT`. It lives here once, as a named
     /// constant, because it previously existed as a bare 8765 in four places and
     /// silently drifted away from the port the bridge actually binds — so the app
@@ -47,18 +63,55 @@ struct BridgeSettings: Equatable {
 
     var displayEndpoint: String { "\(host):\(port)" }
 
+    /// Every address this Mac might answer at, primary first, blanks and repeats
+    /// removed. The one list every reachability question is asked of, so a second
+    /// address cannot be honoured by the dialler and forgotten by the safety check.
+    var allHosts: [String] {
+        var out: [String] = []
+        for h in [host] + altHosts {
+            let t = h.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            if !out.contains(where: { $0.caseInsensitiveCompare(t) == .orderedSame }) {
+                out.append(t)
+            }
+        }
+        return out
+    }
+
     /// Whether this connection is TLS. There is no separate "use TLS" switch on
     /// purpose: having the pin and using TLS are the same fact, so they cannot
     /// drift into the state where one is on and the other is off.
     var usesTLS: Bool { !(fingerprint ?? "").isEmpty }
 
-    /// Whether this host is on this device. Loopback is the ONLY place plaintext
+    /// Whether an address is on this device. Loopback is the ONLY place plaintext
     /// is acceptable, because nothing leaves the machine.
-    var isLoopback: Bool {
+    static func isLoopback(_ host: String) -> Bool {
         let h = host.trimmingCharacters(in: .whitespaces)
             .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
             .lowercased()
         return h == "127.0.0.1" || h == "::1" || h == "localhost" || h.hasPrefix("127.")
+    }
+
+    var isLoopback: Bool { BridgeSettings.isLoopback(host) }
+
+    /// RFC 1918 and link-local — the addresses iOS's Local Network permission
+    /// actually governs.
+    ///
+    /// A tailnet address is deliberately NOT one of them: 100.64/10 arrives over
+    /// a utun tunnel, which that permission does not cover. The distinction is
+    /// only used to word a failure, but it is the difference between telling
+    /// someone to check a permission that is the likely cause and sending them to
+    /// one that cannot be.
+    static func isPrivateLAN(_ host: String) -> Bool {
+        let octets = host.trimmingCharacters(in: .whitespaces).split(separator: ".")
+        guard octets.count == 4 else { return false }
+        let n = octets.compactMap { UInt8($0) }
+        guard n.count == 4 else { return false }
+        switch (n[0], n[1]) {
+        case (10, _), (192, 168), (169, 254): return true
+        case (172, 16...31): return true
+        default: return false
+        }
     }
 
     /// The client half of the rule the bridge enforces on its side: plaintext is
@@ -76,16 +129,51 @@ struct BridgeSettings: Equatable {
     /// A blank host is NOT this: nothing is configured, so nothing is about to be
     /// sent anywhere. Conflating the two would label a fresh install "not secure",
     /// which is alarming and useless.
+    /// Asked of EVERY address, not just the first. An alternate that is not
+    /// loopback is one this phone would put the bearer token on the wire for, so
+    /// a pinless settings object carrying one is exactly as unsafe as a pinless
+    /// primary — and a check that only looked at `host` would wave it through.
     var insecureBeyondThisDevice: Bool {
-        !host.trimmingCharacters(in: .whitespaces).isEmpty && !usesTLS && !isLoopback
+        !usesTLS && allHosts.contains { !BridgeSettings.isLoopback($0) }
     }
 
     /// Configured enough to be worth dialling AND safe to dial.
     var isUsable: Bool {
-        !host.trimmingCharacters(in: .whitespaces).isEmpty
+        !allHosts.isEmpty
             && port > 0 && port <= 65_535
             && !token.isEmpty
             && !insecureBeyondThisDevice
+    }
+
+    /// The settings a hand-edited form produces, given what was there before.
+    ///
+    /// A function rather than three lines inside a view, because the rule it
+    /// encodes is the difference between a phone that can be pointed at its Mac's
+    /// other address and one that cannot — and a view is not testable.
+    ///
+    /// THE PIN SURVIVES A CHANGE OF ADDRESS. It used to be dropped whenever the
+    /// host string changed, on the reasoning that a new address means a new
+    /// machine. It does not: the pin is a SHA-256 of the server's public KEY,
+    /// nothing here or in `PinnedTrust` ever looks at a hostname, and a Mac mints
+    /// that key once and serves it on every address it binds — which is the whole
+    /// reason the pin is over the key in the first place. So the old rule broke
+    /// the one gesture a stuck user reaches for (type the address that works),
+    /// and broke it destructively: `SettingsStore.save` REMOVES an absent pin, so
+    /// one tap deleted the device's only copy and left re-pairing as the only way
+    /// back.
+    ///
+    /// Keeping it is also the safer direction. An address that is not this Mac
+    /// cannot present this Mac's key, so it is refused by name
+    /// ("presenting a different key than the one you paired with") instead of
+    /// being dialled in the clear — which is what dropping the pin actually
+    /// arranged.
+    static func edited(host: String, port: Int, token: String,
+                       from previous: BridgeSettings) -> BridgeSettings {
+        var s = previous
+        s.host = host
+        s.port = port
+        s.token = token
+        return s.normalized()
     }
 
     /// Whitespace stripped from both credentials-adjacent fields. Kept as a value
@@ -93,7 +181,7 @@ struct BridgeSettings: Equatable {
     /// and remember on another.
     func normalized() -> BridgeSettings {
         let fp = (fingerprint ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return BridgeSettings(
+        var s = BridgeSettings(
             host: host.trimmingCharacters(in: .whitespacesAndNewlines),
             port: port,
             token: token.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -102,12 +190,26 @@ struct BridgeSettings: Equatable {
             // explains. Blank is absent.
             fingerprint: fp.isEmpty ? nil : fp
         )
+        // Carried over FIRST, then run back through `allHosts` — which trims,
+        // de-blanks and de-duplicates, including against the primary, so a code
+        // that repeated one address does not cost an attempt dialling it twice.
+        // Computing this off the freshly-built `s` alone would find no alternates
+        // to normalise and silently drop every one of them.
+        s.altHosts = altHosts
+        s.altHosts = Array(s.allHosts.dropFirst())
+        return s
     }
 
     /// ws://host:port/ — wss:// when there is a key to pin — with the bracket
     /// dance IPv6 needs, and tolerant of a host pasted with a scheme or a trailing
     /// slash already on it.
-    var url: URL? {
+    var url: URL? { url(for: host) }
+
+    /// The URL for ONE of this Mac's addresses. Takes the host rather than
+    /// reading `self.host`, because the dialler walks `allHosts` and a builder
+    /// that always described the primary would send every attempt to the same
+    /// place while the screen said otherwise.
+    func url(for host: String) -> URL? {
         var h = host.trimmingCharacters(in: .whitespaces)
         for prefix in ["ws://", "wss://", "http://", "https://"] where h.hasPrefix(prefix) {
             h = String(h.dropFirst(prefix.count))
@@ -125,6 +227,7 @@ struct BridgeSettings: Equatable {
 
 enum SettingsStore {
     private static let hostKey = "bridge.host"
+    private static let altHostsKey = "bridge.altHosts"
     private static let portKey = "bridge.port"
     private static let fingerprintKey = "bridge.fingerprint"
     private static let fallbackTokenKey = "bridge.token.fallback"
@@ -134,10 +237,12 @@ enum SettingsStore {
         let host = d.string(forKey: hostKey) ?? ""
         let port = d.object(forKey: portKey) as? Int ?? BridgeSettings.defaultPort
         let fingerprint = d.string(forKey: fingerprintKey)
-        return BridgeSettings(host: host,
-                              port: port,
-                              token: Keychain.load() ?? d.string(forKey: fallbackTokenKey) ?? "",
-                              fingerprint: fingerprint)
+        var s = BridgeSettings(host: host,
+                               port: port,
+                               token: Keychain.load() ?? d.string(forKey: fallbackTokenKey) ?? "",
+                               fingerprint: fingerprint)
+        s.altHosts = d.stringArray(forKey: altHostsKey) ?? []
+        return s
             // A stored "" would survive as "TLS with nothing to pin"; normalising
             // on the way out means only ONE of the two spellings ever reaches the
             // client.
@@ -155,6 +260,15 @@ enum SettingsStore {
         let d = UserDefaults.standard
         d.set(s.host, forKey: hostKey)
         d.set(s.port, forKey: portKey)
+        // REMOVED when empty rather than stored as [], for the same reason the
+        // fingerprint is: a phone paired with a two-address Mac and re-paired with
+        // a one-address one must not keep dialling an address the new pairing
+        // never mentioned.
+        if s.altHosts.isEmpty {
+            d.removeObject(forKey: altHostsKey)
+        } else {
+            d.set(s.altHosts, forKey: altHostsKey)
+        }
         if let fingerprint = s.fingerprint {
             d.set(fingerprint, forKey: fingerprintKey)
         } else {

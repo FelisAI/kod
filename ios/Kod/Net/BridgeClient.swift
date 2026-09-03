@@ -36,15 +36,31 @@ enum ConnectionState: Equatable {
     /// were never the problem. The address is typable by hand; the key is not, so
     /// the only way out is the pairing code — and the message has to say that.
     case insecure
-    case connecting
-    case connected
-    /// Carries WHY, not just how long: the failure text would otherwise flash
-    /// for one frame and be replaced by a countdown that explains nothing.
-    case reconnecting(seconds: Int, reason: String)
+    /// Dialling, and WHERE.
+    ///
+    /// The address is carried rather than read back off the settings because a
+    /// phone paired with a Mac that answers at two addresses walks them in turn.
+    /// A screen that always named the primary would say "connecting to
+    /// 192.168.0.71" while the socket was aimed at a tailnet address — and the
+    /// address it is actually dialling is the single most useful fact on the
+    /// screen when nothing is connecting.
+    case connecting(String)
+    case connected(String)
+    /// Carries WHY and WHERE, not just how long: the failure text would otherwise
+    /// flash for one frame and be replaced by a countdown that explains nothing.
+    ///
+    /// `.failed` used to be the only state that named the address, and it was
+    /// written and replaced inside a single main-actor turn — no suspension point
+    /// between it and the countdown below — so SwiftUI never drew it once. The
+    /// address has to be HERE to be seen at all.
+    case reconnecting(seconds: Int, reason: String, endpoint: String)
     case unauthorized(String)
-    case failed(String)
+    case failed(endpoint: String, reason: String)
 
-    var isConnected: Bool { self == .connected }
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
 }
 
 enum BridgeError: Error, Equatable {
@@ -82,6 +98,13 @@ final class BridgeClient {
     /// alone is not enough: it is set the instant the task is created, and a frame
     /// written before the handshake finishes is answered with `err` and dropped.
     private var ready = false
+    /// Whether the attempt that just ended ever reached `hello_ok`.
+    ///
+    /// `run` needs the difference: a socket that was accepted and then dropped
+    /// means this address is the right one and the backoff should stay short,
+    /// while one that was never answered means try the Mac's other address. It
+    /// cannot be `ready`, which the teardown clears on the way out.
+    private var established = false
 
     /// The plaintext path — loopback and dev only. No delegate, because there is
     /// no TLS to inspect and nothing to pin.
@@ -191,37 +214,78 @@ final class BridgeClient {
     // MARK: - The loop
 
     private func run(_ s: BridgeSettings) async {
+        // One Mac, possibly several addresses (`BridgeSettings.altHosts`). They
+        // are alternates, not peers: the same key is pinned for all of them, so
+        // dialling one this phone is not on costs a failed connect and nothing
+        // else.
+        let hosts = s.allHosts
+        guard !hosts.isEmpty else { onState(.unconfigured); return }
+
         var attempt = 0
         var reason = "connection lost"
+        // Where the last connection came from — the address a pass STARTS at. A
+        // phone that moved from a desk to a sofa should not spend the first dial
+        // of every pass on the address that stopped working, and one that never
+        // moves should never spend a dial on the other address at all.
+        var preferred = 0
+        var lastEndpoint = "\(hosts[0]):\(s.port)"
+
         while !Task.isCancelled {
-            let startedAt = Date()
-            do {
-                try await connectOnce(s)
-            } catch is CancellationError {
-                return
-            } catch BridgeError.unauthorized(let msg) {
-                // Terminal by design. Nothing about retrying makes a bad token good.
-                onState(.unauthorized(msg.isEmpty ? "token rejected" : msg))
-                return
-            } catch {
-                // A refused pin arrives here as NSURLErrorCancelled — the challenge
-                // WAS cancelled, by us — which renders as "cancelled" and reads
-                // like the user backgrounded the app. A key that is not the paired
-                // key is a security event, so the delegate's own words win over
-                // whatever URLSession called the resulting failure.
-                reason = pinning?.refusal ?? Self.describe(error)
-                onState(.failed(reason))
+            // ONE PASS over every address, starting from the one that last
+            // worked. Only after all of them have failed is it an outage worth
+            // backing off from — backing off per address would multiply the wait
+            // by the number of addresses for a phone that is simply on the other
+            // network.
+            for offset in 0..<hosts.count {
+                if Task.isCancelled { return }
+                let i = (preferred + offset) % hosts.count
+                let host = hosts[i]
+                let endpoint = "\(host):\(s.port)"
+                lastEndpoint = endpoint
+                let startedAt = Date()
+                established = false
+                do {
+                    try await connectOnce(s, host: host, endpoint: endpoint)
+                } catch is CancellationError {
+                    return
+                } catch BridgeError.unauthorized(let msg) {
+                    // Terminal by design, and NOT per-address: a bridge answered
+                    // and read the token, so the Mac WAS found. Nothing about
+                    // retrying makes a bad token good, and trying the next
+                    // address would only present the same bad credential twice.
+                    onState(.unauthorized(msg.isEmpty ? "token rejected" : msg))
+                    return
+                } catch {
+                    // A refused pin arrives here as NSURLErrorCancelled — the
+                    // challenge WAS cancelled, by us — which renders as
+                    // "cancelled" and reads like the user backgrounded the app. A
+                    // key that is not the paired key is a security event, so the
+                    // delegate's own words win over whatever URLSession called the
+                    // resulting failure.
+                    reason = pinning?.refusal ?? Self.describe(error, host: host)
+                    onState(.failed(endpoint: endpoint, reason: reason))
+                }
+                guard established else { continue }
+                // This address answered, so it is the one to start from next
+                // time, and the drop we are handling is a drop rather than an
+                // outage.
+                preferred = i
+                // Only a link that EXISTED can drop. Firing this for a dial that
+                // was never answered flushed the cache and told the composer its
+                // text "may not have arrived" about a socket that never opened.
+                onDisconnect()
+                // A connection that held for a while was healthy; the next drop
+                // should retry fast rather than inherit the long tail of an old
+                // outage.
+                if Date().timeIntervalSince(startedAt) > 30 { attempt = 0 }
+                break
             }
-            onDisconnect()
             if Task.isCancelled { return }
 
-            // A connection that held for a while was healthy; the next drop should
-            // retry fast rather than inherit the long tail of an old outage.
-            if Date().timeIntervalSince(startedAt) > 30 { attempt = 0 }
             let wait = Self.backoff[min(attempt, Self.backoff.count - 1)]
             attempt += 1
             for remaining in stride(from: wait, through: 1, by: -1) {
-                onState(.reconnecting(seconds: remaining, reason: reason))
+                onState(.reconnecting(seconds: remaining, reason: reason, endpoint: lastEndpoint))
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
             }
@@ -229,8 +293,8 @@ final class BridgeClient {
     }
 
     /// One connection, start to finish. Returns only by throwing.
-    private func connectOnce(_ s: BridgeSettings) async throws {
-        guard let url = s.url else { throw BridgeError.badURL }
+    private func connectOnce(_ s: BridgeSettings, host: String, endpoint: String) async throws {
+        guard let url = s.url(for: host) else { throw BridgeError.badURL }
         // Checked here rather than at the socket, because a fingerprint that
         // cannot be decoded would otherwise refuse every certificate and read as
         // "the Mac changed its key" — which would send the user hunting for an
@@ -238,7 +302,7 @@ final class BridgeClient {
         if let want = s.fingerprint, !want.isEmpty, KeyPin.decode(fingerprint: want) == nil {
             throw BridgeError.badPin
         }
-        onState(.connecting)
+        onState(.connecting(endpoint))
 
         let transport = session(for: s)
         // Clear any refusal left by the previous attempt, so the reason reported
@@ -256,13 +320,23 @@ final class BridgeClient {
             if socket === ws { socket = nil }
         }
 
-        try await ws.send(.string(ClientMessage.hello(token: s.token).json))
+        // UNDER A DEADLINE, like every read in this file. The header used to
+        // claim "every receive has a deadline" and it was true — but the write
+        // that comes FIRST had none, and `URLSessionWebSocketTask.send` on a task
+        // whose TCP connect has not completed does not throw, it BUFFERS. So an
+        // address that swallows packets — a Mac that is asleep, a Local Network
+        // permission that was denied — hung HERE, outside every timeout this file
+        // documents, until URLSession's own request timeout eventually fired. The
+        // ten seconds below is the one this code actually controls.
+        try await sendWithDeadline(ClientMessage.hello(token: s.token).json,
+                                   on: ws, timeout: Self.helloTimeout)
 
         switch try Wire.parse(frame: try await receive(ws, timeout: Self.helloTimeout)) {
         case .helloOk(let proto, let epoch, let serverTime, let input):
             onMessage(.helloOk(proto: proto, epoch: epoch, serverTime: serverTime, inputAllowed: input))
             ready = true
-            onState(.connected)
+            established = true
+            onState(.connected(endpoint))
         case .helloErr(let code, let message):
             if code == "unauthorized" { throw BridgeError.unauthorized(message) }
             throw BridgeError.handshake(message.isEmpty ? code : "\(code): \(message)")
@@ -301,6 +375,21 @@ final class BridgeClient {
         }
     }
 
+    /// `send()` with a deadline — see the call site for why the WRITE needs one.
+    private func sendWithDeadline(_ text: String,
+                                  on ws: URLSessionWebSocketTask,
+                                  timeout: TimeInterval) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await ws.send(.string(text)) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw BridgeError.timeout
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+
     /// `receive()` with a deadline. The loser of the race is abandoned; the socket
     /// is torn down by `connectOnce`'s defer either way, so no receive outlives it.
     private func receive(_ ws: URLSessionWebSocketTask, timeout: TimeInterval) async throws -> String {
@@ -322,17 +411,73 @@ final class BridgeClient {
         }
     }
 
-    private static func describe(_ error: Error) -> String {
+    /// The sentence a person reads. `host` is what was being dialled, and it is
+    /// load-bearing: the advice for silence from a Wi-Fi address is different
+    /// from the advice for silence from a tailnet one.
+    ///
+    /// Every non-`BridgeError` used to collapse to `localizedDescription`, which
+    /// renders "could not connect to the server" for a closed port, a sleeping
+    /// Mac, a denied permission and a wrong address alike — four different next
+    /// moves behind one sentence. The codes are read here so they can be told
+    /// apart.
+    static func describe(_ error: Error, host: String = "") -> String {
         switch error {
         case BridgeError.badURL: return "bad host or port"
-        case BridgeError.timeout: return "no answer from bridge"
+        case BridgeError.timeout: return silence(host: host)
         case BridgeError.handshake(let m): return m
         case BridgeError.oversized: return "oversized frame"
         case BridgeError.badPin: return "the paired key is unreadable — scan a fresh code from your Mac"
         default:
             let ns = error as NSError
-            return ns.localizedDescription
+            guard ns.domain == NSURLErrorDomain else { return ns.localizedDescription }
+            switch ns.code {
+            case NSURLErrorTimedOut:
+                return silence(host: host)
+            case NSURLErrorCannotConnectToHost:
+                // The port answered with a RST: something is reachable there and
+                // nothing is listening on this port. That is a different problem
+                // from silence and has a different fix.
+                return "nothing is listening on that port — is Kod running on your Mac with "
+                    + "“Serve my sessions to my phone” turned on?"
+            case NSURLErrorCannotFindHost:
+                return "that address does not resolve"
+            case NSURLErrorNotConnectedToInternet:
+                return "this phone is not on a network"
+            case NSURLErrorNetworkConnectionLost:
+                return "the network dropped mid-connection"
+            case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted,
+                 NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateNotYetValid:
+                return "the encrypted connection failed — scan a fresh code from your Mac"
+            default:
+                // The code is kept even when there is nothing to say about it. An
+                // unrecognised failure with a number attached can be looked up;
+                // one without cannot.
+                return "\(ns.localizedDescription) (\(ns.code))"
+            }
         }
+    }
+
+    /// Nothing answered at all: the failure with the most causes and the fewest
+    /// clues, so it is the one that has to name them.
+    ///
+    /// On iOS 14+ a PRIVATE address that swallows every packet is most often a
+    /// denied Local Network permission. The prompt appears once, "Don't Allow" is
+    /// remembered forever, and the system then blackholes the connection with no
+    /// error this app can see — from in here it is indistinguishable from a Mac
+    /// that is asleep. There is no API to ask which it was, so naming it is the
+    /// only help available, and leaving it unnamed is how someone spends an
+    /// evening on the wrong thing.
+    ///
+    /// A tailnet address gets the other sentence: 100.64/10 arrives over a utun
+    /// tunnel, which that permission does not govern at all. That asymmetry is
+    /// exactly why a Mac can be reachable over Tailscale and silent on Wi-Fi.
+    static func silence(host: String) -> String {
+        guard !host.isEmpty else { return "no answer — is your Mac awake?" }
+        if BridgeSettings.isPrivateLAN(host) {
+            return "no answer from \(host). Check that your Mac is awake and on this Wi-Fi — "
+                + "and that Kod is allowed under Settings › Kod › Local Network."
+        }
+        return "no answer from \(host) — is your Mac awake and on this network?"
     }
 }
 

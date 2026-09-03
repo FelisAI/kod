@@ -23,7 +23,9 @@ impl Orchestrator {
         // interpolating it directly printed a nine-digit number where "12m ago"
         // belonged.
         let age = crate::timefmt::ago_label(crate::timefmt::age_ms_since(p.newest_ms, now_ms));
-        let (fresh, count, hidden) = (p.fresh, p.total, p.hidden_lines);
+        // No `fresh` any more: every project the planner hands back is one you
+        // have NOT seen, so a "read" variant of this card would be unreachable.
+        let (count, hidden) = (p.total, p.hidden_lines);
         let jslug = p.key.clone();
         let lead = p
             .lines
@@ -54,7 +56,7 @@ impl Orchestrator {
                     .h(px(6.))
                     .rounded(px(3.))
                     .flex_none()
-                    .when(fresh, |d| d.bg(rgb(ACCENT))),
+                    .bg(rgb(ACCENT)),
             )
             .child(
                 div()
@@ -63,8 +65,8 @@ impl Orchestrator {
                     .min_w_0()
                     .truncate()
                     .text_size(px(12.5))
-                    .text_color(rgb(if fresh { TEXT_STRONG } else { MUTED }))
-                    .when(fresh, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .text_color(rgb(TEXT_STRONG))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child(SharedString::from(termview::trim(&name, 24))),
             )
             .when(digest, |r| {
@@ -74,7 +76,7 @@ impl Orchestrator {
                         .min_w_0()
                         .truncate()
                         .text_size(px(12.))
-                        .text_color(rgb(if fresh { TEXT } else { MUTED2 }))
+                        .text_color(rgb(TEXT))
                         .child(SharedString::from(lead)),
                 )
             })
@@ -113,7 +115,7 @@ impl Orchestrator {
             .rounded(px(if digest { 8. } else { 10. }))
             .bg(rgb(PANEL))
             .border_1()
-            .border_color(rgb(if fresh { 0x346B54 } else { HAIR }))
+            .border_color(rgb(0x346B54))
             .cursor_pointer()
             .hover(|h| h.border_color(rgb(0x36404A)))
             .child(head);
@@ -427,7 +429,13 @@ impl Orchestrator {
                 floor,
                 self.standup_updates_all,
             );
-            if !plan.is_empty() {
+            // RENDERED WHEN EMPTY TOO, so long as there is a "last looked" to
+            // measure from. Being caught up is the answer this tier exists to
+            // give, and an all-clear you can read in one line is worth more than
+            // the tier silently vanishing — which is indistinguishable from the
+            // standup being broken. Before a first check there is nothing
+            // truthful to say, so it stays away.
+            if !plan.is_empty() || self.standup_divider_ms > 0 {
                 let mut tier = div()
                     .flex()
                     .flex_col()
@@ -443,17 +451,16 @@ impl Orchestrator {
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(ACCENT))
                             .child("▲ WHAT HAPPENED")
-                            // Lead with the SPLIT, not the window. "what happened"
-                            // means "since I last looked" to the reader, and that
-                            // is the fresh group — the window is only how far back
-                            // we reach for CONTEXT so a recent check does not hand
-                            // you an empty screen. Naming the window here answered
-                            // a question nobody asked.
+                            // Lead with the COUNT, not the window. "what
+                            // happened" means "since I last looked" to the
+                            // reader; the window is only how far back the planner
+                            // reaches, and naming it here answered a question
+                            // nobody asked.
                             .child({
                                 let seen = crate::timefmt::ago_label(
                                     crate::timefmt::age_ms_since(self.standup_divider_ms, now_ms),
                                 );
-                                let n = plan.fresh.len();
+                                let n = plan.projects.len();
                                 div()
                                     .font_weight(FontWeight::NORMAL)
                                     .text_size(px(10.5))
@@ -469,47 +476,8 @@ impl Orchestrator {
                     );
                 // No NEW bar: the header already says "{n} new since you last
                 // looked", and a heading that repeats the line above it is chrome.
-                for pp in &plan.fresh {
+                for pp in &plan.projects {
                     tier = tier.child(self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx));
-                }
-                // EARLIER is CONTEXT, and context does not get to push the news
-                // off the screen: it collapses whenever anything is new. With
-                // nothing new it opens by default, because the alternative is a
-                // header saying "nothing new" above an empty screen.
-                if !plan.earlier.is_empty() {
-                    let open = self.standup_earlier_open || plan.fresh.is_empty();
-                    let n = plan.earlier.len();
-                    let win = crate::standup_plan::window_label(self.standup_divider_ms, now_ms);
-                    tier = tier.child(
-                        div()
-                            .id("upd-earlier")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(9.))
-                            .pt(px(8.))
-                            .cursor_pointer()
-                            .text_size(px(10.))
-                            .text_color(rgb(MUTED2))
-                            .hover(|h| h.text_color(rgb(MUTED)))
-                            .child(if open { "▾" } else { "▸" })
-                            .child(SharedString::from(format!(
-                                "EARLIER — {n} project{} you have already read, within {win}",
-                                if n == 1 { "" } else { "s" }
-                            )))
-                            .child(div().flex_1().h(px(1.)).bg(rgb(HAIR_SOFT)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.standup_earlier_open = !this.standup_earlier_open;
-                                cx.notify();
-                            })),
-                    );
-                    if open {
-                        for pp in &plan.earlier {
-                            tier = tier.child(
-                                self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx),
-                            );
-                        }
-                    }
                 }
                 if plan.hidden_projects > 0 {
                     let n = plan.hidden_projects;

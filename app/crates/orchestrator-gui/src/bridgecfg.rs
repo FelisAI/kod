@@ -15,24 +15,95 @@ use std::net::IpAddr;
 /// The pairing payload. A CONTRACT shared with the iOS app's `Pairing.parse`;
 /// changing the shape here breaks every phone already paired.
 ///
-/// One string carries host, port, token and key together, which is the whole
-/// point: the alternative is the user transcribing four fields into a phone, two
-/// of which are long random strings typed into a masked box.
+/// One string carries the addresses, port, token and key together, which is the
+/// whole point: the alternative is the user transcribing four fields into a
+/// phone, two of which are long random strings typed into a masked box.
+///
+/// ## Why more than one address
+///
+/// This Mac can be reachable at two addresses at once — its Wi-Fi one and its
+/// tailnet one — and a code that names only the first leaves the other
+/// unpairable. That was not a theoretical gap: with both switches on, the
+/// endpoint list is tailnet-first, so the code handed out the 100.x address and
+/// a phone with Tailscale off sat in a connect/timeout loop forever, while the
+/// pane above it cheerfully printed the Wi-Fi address the code did not carry.
+/// Typing that address in by hand was not a way out either — see the iOS side.
+///
+/// So every reachable address goes in, `h` first and then `h2`, `h3`. The phone
+/// tries them in order. `h` is the Wi-Fi one because pairing happens with the
+/// camera pointed at this screen: whoever is scanning is in the room, and the
+/// address that works in the room is the one an older phone — which reads `h`
+/// and ignores the rest — should get.
 ///
 /// `f` is the base64url SHA-256 of the server's public key, and it is the ONLY
 /// thing the phone uses to decide who answered — no CA will issue a certificate
 /// for 192.168.0.71, so the certificate is self-signed and hostname matching
-/// proves nothing. Present → the phone dials `wss://` and pins that key, and
-/// pinning the KEY rather than the address is why a DHCP renewal or a new
-/// Tailscale address breaks nothing. Absent → `ws://`, in the clear, which the
-/// phone accepts only for its own loopback. So omitting `f` is not a smaller
-/// code, it is a different promise: emit it only when there is genuinely no
-/// certificate.
-pub fn pair_url(host: &str, port: u16, token: &str, fingerprint: Option<&str>) -> String {
-    match fingerprint {
-        Some(f) => format!("kod://pair?h={host}&p={port}&t={token}&f={f}"),
-        None => format!("kod://pair?h={host}&p={port}&t={token}"),
+/// proves nothing. Present -> the phone dials `wss://` and pins that key, and
+/// pinning the KEY rather than the address is why ONE `f` covers every `h` here:
+/// they are all the same Mac. Absent -> `ws://`, in the clear, which the phone
+/// accepts only for its own loopback. So omitting `f` is not a smaller code, it
+/// is a different promise: emit it only when there is genuinely no certificate.
+pub fn pair_url(hosts: &[String], port: u16, token: &str, fingerprint: Option<&str>) -> String {
+    let mut url = String::from("kod://pair?");
+    for (i, h) in hosts.iter().take(MAX_PAIR_HOSTS).enumerate() {
+        // h, h2, h3 - not h1. `h` is the field every already-paired phone reads,
+        // and renaming it would brick them.
+        if i == 0 {
+            url.push_str(&format!("h={h}"));
+        } else {
+            url.push_str(&format!("&h{}={h}", i + 1));
+        }
     }
+    url.push_str(&format!("&p={port}&t={token}"));
+    if let Some(f) = fingerprint {
+        url.push_str(&format!("&f={f}"));
+    }
+    url
+}
+
+/// How many addresses a code may carry.
+///
+/// The QR encoder stops at version 10 / 213 bytes (`qr.rs`), and a payload past
+/// that is not a smaller code, it is no code at all. Three IPv4 addresses plus a
+/// token and a fingerprint lands near 190, which is the headroom this number is
+/// chosen for; `the_worst_case_pairing_payload_still_encodes` pins it. This Mac
+/// binds at most a tailnet address, a LAN address and whatever literals the CLI
+/// was given, so three is already more than the UI can produce.
+const MAX_PAIR_HOSTS: usize = 3;
+
+/// Every address a phone could dial, in the order it should try them.
+///
+/// Wi-Fi first, tailnet second, anything else after — see `pair_url` for why the
+/// order is the whole point. Loopback is dropped: printed on a phone it names the
+/// PHONE's own loopback, which sends someone debugging Tailscale, the firewall
+/// and the token, none of which are wrong.
+///
+/// Taken from what the daemon says it ACTUALLY bound rather than from a stored
+/// preference. That is the difference between a pairing card that works and one
+/// that hands out an address nothing is listening on: a stored `bridge_bind`
+/// records what the user asked for; `endpoints` records what the kernel gave.
+/// Only the second one can be dialled.
+pub fn pair_hosts(endpoints: &[String]) -> Vec<String> {
+    let mut lan = Vec::new();
+    let mut tailnet = Vec::new();
+    let mut other = Vec::new();
+    for h in hosts(endpoints) {
+        let Ok(ip) = h.parse::<IpAddr>() else {
+            // Not an address at all - a MagicDNS or .local name is the obvious
+            // next step, and it is dialable, so it is kept rather than dropped.
+            other.push(h.to_string());
+            continue;
+        };
+        match classify(ip) {
+            Some(true) => tailnet.push(h.to_string()),
+            Some(false) => lan.push(h.to_string()),
+            None => continue,
+        }
+    }
+    lan.append(&mut tailnet);
+    lan.append(&mut other);
+    lan.dedup();
+    lan
 }
 
 /// The `bridge_bind` value for a pair of switches: `""`, `"lan"`, `"tailscale"`
@@ -74,6 +145,43 @@ pub fn bind_switches(bind: &str) -> (bool, bool) {
         }
     }
     (lan, tailnet)
+}
+
+/// The sentence under the QR, naming every address the code actually carries.
+///
+/// It exists because the pane above already prints two addresses and the code
+/// used to carry one of them, silently — so a phone that would not connect gave
+/// the user nothing to compare against, and no reason to suspect the code rather
+/// than their network. Naming them makes a wrong one visible at a glance.
+pub fn code_carries(hosts: &[String]) -> String {
+    let named: Vec<String> = hosts
+        .iter()
+        .take(MAX_PAIR_HOSTS)
+        .map(|h| match h.parse::<IpAddr>().ok().and_then(classify) {
+            Some(true) => format!("{h} over Tailscale"),
+            Some(false) => format!("{h} on your Wi-Fi"),
+            None => h.clone(),
+        })
+        .collect();
+    let where_ = match named.len() {
+        0 => return "There is no address to pair with yet.".to_string(),
+        1 => named[0].clone(),
+        _ => format!("{} and {}", named[..named.len() - 1].join(", "), named[named.len() - 1]),
+    };
+    // The closing promise is only true when there IS more than one address, so it
+    // is only made then. A single-address code that claimed the phone would fall
+    // back to another one would be describing a feature the code cannot carry.
+    let fallback = if named.len() > 1 {
+        " Your phone tries them in that order, so one scan covers your Wi-Fi at your desk and \
+         Tailscale away from it."
+    } else {
+        ""
+    };
+    format!(
+        "Scan this in the Kod app on your phone. It carries {where_}, the port, the token, \
+         and the fingerprint of this Mac's key — which is how your phone knows it is Kod \
+         answering and not something else on that address.{fallback}"
+    )
 }
 
 /// What the daemon has ACTUALLY bound, split the two ways the access switches are
@@ -147,23 +255,6 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// The host a phone should dial, taken from what the daemon says it ACTUALLY bound
-/// rather than from a stored preference.
-///
-/// This is the difference between a pairing card that works and one that hands out
-/// an address nothing is listening on. A stored `bridge_bind` records what the user
-/// asked for; `endpoints` records what the kernel gave. Only the second one can be
-/// dialled.
-pub fn reachable_host(endpoints: &[String]) -> Option<String> {
-    hosts(endpoints)
-        .find(|h| {
-            h.parse::<IpAddr>()
-                .map(|ip| !ip.is_loopback())
-                .unwrap_or(false)
-        })
-        .map(|h| h.to_string())
-}
-
 /// The host half of each `addr:port` endpoint.
 ///
 /// `rsplit_once` and the bracket trim are both load-bearing: an IPv6 endpoint is
@@ -202,9 +293,14 @@ mod tests {
         assert_eq!(hex(&[]), "");
     }
 
+    /// Handy in tests: `pair_url` takes what `pair_hosts` returns.
+    fn one(h: &str) -> Vec<String> {
+        vec![h.to_string()]
+    }
+
     #[test]
     fn the_pairing_url_matches_the_contract_the_phone_parses() {
-        let u = pair_url("100.101.102.103", 8787, &"a".repeat(64), None);
+        let u = pair_url(&one("100.101.102.103"), 8787, &"a".repeat(64), None);
         assert!(u.starts_with("kod://pair?"));
         assert!(u.contains("h=100.101.102.103"));
         assert!(u.contains("p=8787"));
@@ -214,13 +310,16 @@ mod tests {
         // fingerprint that matches nothing, so the phone would refuse a loopback
         // pairing that is legitimately unencrypted.
         assert!(!u.contains("f="), "a keyless code must not carry an f: {u}");
+        // One address means no `h2`. An empty one would parse as a host of "",
+        // and the phone would spend an attempt dialling nothing.
+        assert!(!u.contains("h2="), "a single-address code must not carry an h2: {u}");
     }
 
     #[test]
     fn the_pairing_url_carries_the_key_to_pin_when_there_is_one() {
         // 43 chars is the real width: base64url of a SHA-256, unpadded.
         let f = "n4bQgYhMfWWaL_qgxVrQFaO_TxsrC4Is0V1sFbDwCgg";
-        let u = pair_url("192.168.0.71", 8787, &"a".repeat(64), Some(f));
+        let u = pair_url(&one("192.168.0.71"), 8787, &"a".repeat(64), Some(f));
         assert!(u.ends_with(&format!("&f={f}")), "{u}");
         // The pin is the phone's ONLY notion of who answered, so it must survive
         // the trip: a code that dropped it silently downgrades to trusting
@@ -231,6 +330,53 @@ mod tests {
         // case here is an IPv6 tailnet host, still ~173 — but a payload that
         // grows past the ceiling stops being a QR at all, so pin the headroom.
         assert!(u.len() < 200, "payload grew past what the encoder can carry: {}", u.len());
+    }
+
+    #[test]
+    fn a_code_carries_every_address_the_mac_is_reachable_at() {
+        // THE BUG THIS EXISTS FOR. With both switches on, the endpoint list is
+        // tailnet-first, so a code carrying one address handed out the 100.x one
+        // — and a phone with Tailscale off sat in a connect/timeout loop with no
+        // way to reach the Wi-Fi address the pane above was printing.
+        let f = "n4bQgYhMfWWaL_qgxVrQFaO_TxsrC4Is0V1sFbDwCgg";
+        let hosts = pair_hosts(&[
+            "127.0.0.1:18787".to_string(),
+            "100.68.100.56:18787".to_string(),
+            "192.168.0.71:18787".to_string(),
+        ]);
+        let u = pair_url(&hosts, 18787, &"a".repeat(64), Some(f));
+        assert!(u.contains("h=192.168.0.71"), "Wi-Fi must be `h`: {u}");
+        assert!(u.contains("h2=100.68.100.56"), "the tailnet address must survive: {u}");
+        assert!(!u.contains("127.0.0.1"), "loopback names the PHONE, not this Mac: {u}");
+        assert!(u.len() < 200, "two addresses must still encode: {}", u.len());
+    }
+
+    #[test]
+    fn wifi_comes_first_because_pairing_happens_in_the_room() {
+        // `h` is the field an already-paired phone reads and the only one an
+        // older build understands, so whichever address lands there is the one
+        // that has to work while someone is holding a camera up to this screen.
+        let eps = |a: &str, b: &str| vec![format!("{a}:18787"), format!("{b}:18787")];
+        for (a, b) in [
+            ("100.68.100.56", "192.168.0.71"),
+            ("192.168.0.71", "100.68.100.56"),
+        ] {
+            assert_eq!(
+                pair_hosts(&eps(a, b)),
+                vec!["192.168.0.71".to_string(), "100.68.100.56".to_string()],
+                "endpoint order must not decide which address a phone gets"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_never_carries_more_addresses_than_a_qr_can_hold() {
+        // Three IPv4 addresses, a 64-char token and a 43-char pin is the widest
+        // shape the UI can produce; the encoder stops at 213 bytes.
+        let hosts: Vec<String> = (1..=5).map(|i| format!("192.168.{i}.255")).collect();
+        let u = pair_url(&hosts, 65535, &"a".repeat(64), Some(&"a".repeat(43)));
+        assert!(u.contains("h4=") == false, "capped at three addresses: {u}");
+        assert!(u.len() < 213, "payload grew past what the encoder can carry: {}", u.len());
     }
 
     #[test]
@@ -294,9 +440,9 @@ mod tests {
     }
 
     #[test]
-    fn the_dialable_host_is_the_non_loopback_endpoint() {
+    fn the_dialable_hosts_are_the_non_loopback_endpoints() {
         let eps = vec!["127.0.0.1:8787".to_string(), "100.101.102.103:8787".to_string()];
-        assert_eq!(reachable_host(&eps).as_deref(), Some("100.101.102.103"));
+        assert_eq!(pair_hosts(&eps), vec!["100.101.102.103".to_string()]);
     }
 
     #[test]
@@ -305,15 +451,37 @@ mod tests {
         // "127.0.0.1" would be naming the PHONE's own loopback once typed in. The
         // honest answer is that there is nothing to dial, so the UI must say so
         // instead of printing an address.
-        assert_eq!(reachable_host(&["127.0.0.1:8787".to_string()]), None);
-        assert_eq!(reachable_host(&[]), None);
+        assert!(pair_hosts(&["127.0.0.1:8787".to_string()]).is_empty());
+        assert!(pair_hosts(&[]).is_empty());
     }
 
     #[test]
     fn an_ipv6_endpoint_is_unwrapped_rather_than_split_at_the_wrong_colon() {
         // rsplit_once(':') is right and split_once(':') would be wrong here.
         let eps = vec!["[fd7a:115c:a1e0::1]:8787".to_string()];
-        assert_eq!(reachable_host(&eps).as_deref(), Some("fd7a:115c:a1e0::1"));
+        assert_eq!(pair_hosts(&eps), vec!["fd7a:115c:a1e0::1".to_string()]);
+    }
+
+    #[test]
+    fn the_sentence_under_the_code_names_every_address_it_carries() {
+        // The point of this line is to be COMPARABLE with the switches above it:
+        // a code carrying an address the user is not on should be visible without
+        // decoding a QR by hand.
+        let hosts = pair_hosts(&[
+            "127.0.0.1:18787".to_string(),
+            "100.68.100.56:18787".to_string(),
+            "192.168.0.71:18787".to_string(),
+        ]);
+        let s = code_carries(&hosts);
+        assert!(s.contains("192.168.0.71 on your Wi-Fi"), "{s}");
+        assert!(s.contains("100.68.100.56 over Tailscale"), "{s}");
+        assert!(!s.contains("127.0.0.1"), "{s}");
+        assert!(s.contains("tries them in that order"), "{s}");
+        // One address must not read as a list, and must not promise a fallback
+        // the code cannot carry.
+        let single = code_carries(&["192.168.0.71".to_string()]);
+        assert!(single.contains("carries 192.168.0.71 on your Wi-Fi, the port"), "{single}");
+        assert!(!single.contains("tries them"), "{single}");
     }
 }
 
@@ -356,7 +524,7 @@ mod run_tests {
         // first sign of overflowing the ceiling would be a settings pane that
         // says it could not build a pairing code.
         let url = pair_url(
-            "fd7a:115c:a1e0:ab12:4843:cd96:6244:1a2b",
+            &["fd7a:115c:a1e0:ab12:4843:cd96:6244:1a2b".to_string()],
             65535,
             &"a".repeat(64),
             Some("n4bQgYhMfWWaL_qgxVrQFaO_TxsrC4Is0V1sFbDwCgg"),

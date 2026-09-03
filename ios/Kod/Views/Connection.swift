@@ -21,7 +21,7 @@ extension ConnectionState {
         switch self {
         case .connected: return "live"
         case .connecting: return "connecting"
-        case .reconnecting(let s, _): return "retry \(s)s"
+        case .reconnecting(let s, _, _): return "retry \(s)s"
         case .unauthorized: return "rejected"
         case .failed: return "offline"
         case .unconfigured: return "set up"
@@ -29,13 +29,21 @@ extension ConnectionState {
         }
     }
 
+    /// `endpoint` is the CONFIGURED address, used only by the states that have no
+    /// address of their own. Every state that is about a connection carries the
+    /// address it was actually about — a phone can be paired with a Mac at two
+    /// addresses, and naming the wrong one is worse than naming none.
     func longLabel(endpoint: String) -> String {
         switch self {
-        case .connected: return "connected to \(endpoint)"
-        case .connecting: return "connecting to \(endpoint)…"
-        case .reconnecting(let s, let why): return "\(why) — retrying in \(s)s"
+        case .connected(let at): return "connected to \(at)"
+        case .connecting(let at): return "connecting to \(at)…"
+        case .reconnecting(let s, let why, let at):
+            // The ADDRESS, not just the reason. This is the state a stuck phone
+            // spends almost all of its time in, and "which address is it even
+            // dialling" is the question it has to answer.
+            return "can't reach \(at) — \(why) Retrying in \(s)s."
         case .unauthorized(let m): return "token rejected — \(m)"
-        case .failed(let m): return "can't reach \(endpoint) — \(m)"
+        case .failed(let at, let m): return "can't reach \(at) — \(m)"
         case .unconfigured: return "no bridge configured"
         case .insecure:
             return "won't send your token in the clear to \(endpoint)"
@@ -60,6 +68,10 @@ struct ConnectionChip: View {
                     .foregroundStyle(KodColor.muted)
             }
         }
+        // Its LABEL is the connection state, which is the point of the chip and
+        // useless as an address — a UI test cannot tap "the way in" if the way in
+        // is named after whatever went wrong today.
+        .accessibilityIdentifier("connection-chip")
     }
 }
 
@@ -71,10 +83,16 @@ struct ConnectionBanner: View {
         if !model.connection.isConnected {
             HStack(spacing: 8) {
                 Circle().fill(model.connection.tint).frame(width: 6, height: 6)
+                // THREE lines, not one. Every reason worth printing here is
+                // longer than the ~47 characters this row can hold at 12pt, and
+                // the half that got cut was always the half that said what to do
+                // about it — "…pair again from Kod on your Mac", "…allowed under
+                // Settings › Kod › Local Network".
                 Text(model.connection.longLabel(endpoint: model.settings.displayEndpoint))
                     .font(KodFont.meta)
                     .foregroundStyle(KodColor.muted)
-                    .lineLimit(1)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 6)
                 Button(action: { model.retry() }) {
                     Text("retry")
@@ -110,6 +128,7 @@ struct ConnectionView: View {
                     TierHeading(text: "OR ENTER IT BY HAND", color: KodColor.muted2)
 
                     field("HOST", text: $host, placeholder: "192.168.1.20", keyboard: .URL)
+                    alternates
                     field("PORT", text: $port, placeholder: "\(BridgeSettings.defaultPort)", keyboard: .numberPad)
                     secureField("TOKEN", text: $token)
 
@@ -135,12 +154,37 @@ struct ConnectionView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(KodColor.panel, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
+            // THE TOOLBAR BUTTON COMMITS.
+            //
+            // It used to be a bare "Done" wired to `dismiss()`, with the only
+            // writer at the BOTTOM of a scroll view — under three fields and a
+            // paragraph, i.e. off-screen with a keyboard up. So the button in the
+            // position iOS has meant "commit" since 2007 silently threw away a
+            // typed address and token, and the app went on dialling the old one.
+            // Nothing on any screen said so.
+            //
+            // Now the trailing button says which of the two it is, and there is a
+            // Cancel to discard on purpose rather than by accident.
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if isDirty {
+                        Button("Cancel") { dismiss() }.foregroundStyle(KodColor.muted)
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }.foregroundStyle(KodColor.accent)
+                    Button(isDirty ? "Save" : "Done") {
+                        if isDirty { save() } else { dismiss() }
+                    }
+                    .fontWeight(isDirty ? .semibold : .regular)
+                    .foregroundStyle(canCommit ? KodColor.accent : KodColor.muted2)
+                    .disabled(!canCommit)
                 }
             }
         }
+        // A swipe would otherwise be a third way to lose the token silently — the
+        // one gesture with no label on it at all. Only while there is something
+        // to lose: an unedited sheet still swipes away.
+        .interactiveDismissDisabled(isDirty)
         .presentationBackground(KodColor.bg)
         .sheet(isPresented: $showScanner) {
             ScannerView(onPaired: paired)
@@ -149,6 +193,24 @@ struct ConnectionView: View {
             host = model.settings.host
             port = String(model.settings.port)
             token = model.settings.token
+        }
+    }
+
+    /// The Mac's OTHER addresses, which came from the pairing code and are tried
+    /// after the one above.
+    ///
+    /// Read-only, and shown rather than hidden: without this the phone silently
+    /// dials an address that appears nowhere on the screen, and "connecting to
+    /// 100.68.100.56" under a HOST field reading 192.168.0.71 looks like a bug
+    /// rather than the fallback working.
+    @ViewBuilder
+    private var alternates: some View {
+        if !model.settings.altHosts.isEmpty {
+            Text("Also tries \(model.settings.altHosts.joined(separator: ", ")) — the same Mac, "
+                 + "from the pairing code. Whichever answers first is used.")
+                .font(KodFont.meta)
+                .foregroundStyle(KodColor.muted2)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -194,24 +256,28 @@ struct ConnectionView: View {
         !host.trimmingCharacters(in: .whitespaces).isEmpty && Int(port) != nil && !token.isEmpty
     }
 
+    /// Whether the form holds anything the model does not. `model.settings` is
+    /// normalised on the way in (`AppModel.apply`), so these comparisons are
+    /// against stored values and not against whatever whitespace was typed.
+    private var isDirty: Bool {
+        host.trimmingCharacters(in: .whitespacesAndNewlines) != model.settings.host
+            || Int(port) != model.settings.port
+            || token.trimmingCharacters(in: .whitespacesAndNewlines) != model.settings.token
+    }
+
+    /// Whether the trailing button does anything. Dismissing is always allowed;
+    /// saving something incomplete is not.
+    private var canCommit: Bool { isDirty ? canSave : true }
+
     private func save() {
         guard let p = Int(port) else { return }
-        // CARRY THE PIN FORWARD. This form edits host, port and token; it has no
-        // field for the fingerprint and no way to obtain one, so rebuilding the
-        // settings without it silently DROPPED it — and because a settings save
-        // removes an absent pin from storage, one tap here turned a pinned wss://
-        // link into cleartext ws:// carrying the bearer token, permanently, with
-        // nothing on any screen saying the connection was no longer pinned.
-        //
-        // A pin belongs to a host, so it is dropped only when the host actually
-        // changes — at which point the old key certainly does not describe the new
-        // machine, and re-scanning is the only honest way back.
-        let newHost = host.trimmingCharacters(in: .whitespaces)
-        let keptPin = newHost.caseInsensitiveCompare(model.settings.host) == .orderedSame
-            ? model.settings.fingerprint
-            : nil
-        model.apply(settings: BridgeSettings(host: newHost, port: p, token: token,
-                                             fingerprint: keptPin))
+        // The rule that used to live here — drop the pin whenever the host changes
+        // — is gone, and `BridgeSettings.edited` says why at length. Short version:
+        // the pin is over the KEY, so it identifies the Mac and not the address,
+        // and dropping it made typing the address that works the one action that
+        // guaranteed nothing would work again.
+        model.apply(settings: BridgeSettings.edited(host: host, port: p, token: token,
+                                                    from: model.settings))
         dismiss()
     }
 
@@ -243,8 +309,15 @@ struct ConnectionView: View {
                         .font(KodFont.meta)
                         .foregroundStyle(KodColor.muted2)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("Typing an address by hand only works for 127.0.0.1, which "
-                         + "is this phone, not your Mac.")
+                    // It used to say "typing an address by hand only works for
+                    // 127.0.0.1", which was true and is not any more: the key is
+                    // kept when the address is edited, because it identifies the
+                    // Mac and not the address. This state now means this phone has
+                    // never held a key at all, so scanning is genuinely the only
+                    // way in — say that, and nothing wider.
+                    Text("Once you have scanned a code, you can retype the address "
+                         + "here freely — the key stays, and it is the key that "
+                         + "identifies your Mac.")
                         .font(KodFont.meta)
                         .foregroundStyle(KodColor.muted2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -258,6 +331,7 @@ struct ConnectionView: View {
         VStack(alignment: .leading, spacing: 6) {
             TierHeading(text: label, color: KodColor.muted)
             TextField(placeholder, text: text)
+                .accessibilityIdentifier("bridge-\(label.lowercased())")
                 .keyboardType(keyboard)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -274,6 +348,7 @@ struct ConnectionView: View {
         VStack(alignment: .leading, spacing: 6) {
             TierHeading(text: label, color: KodColor.muted)
             SecureField("paste KOD_BRIDGE_TOKEN", text: text)
+                .accessibilityIdentifier("bridge-token")
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .font(.system(size: 16, design: .monospaced))

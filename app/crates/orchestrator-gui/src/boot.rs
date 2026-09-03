@@ -374,10 +374,9 @@ pub(crate) fn run() {
                     let auto_continue = setting_flag(
                         store.lock().ok().and_then(|s| s.get_setting("auto_continue")),
                     );
-                    let ac_fire_on_reset = setting_flag(
-                        store.lock().ok().and_then(|s| s.get_setting("ac_fire_on_reset")),
-                    );
-                    host.set_auto_continue(auto_continue, ac_fire_on_reset);
+                    // `true`: the second flag was a switch between "works" and
+                    // "does nothing" (settings::render_settings_automation).
+                    host.set_auto_continue(auto_continue, true);
                     // THE MOBILE BRIDGE (#74). Same contract as auto-continue
                     // directly above, and load-bearing for the same reason: the
                     // daemon is storage-free, so it learns the bridge config ONLY
@@ -455,7 +454,6 @@ pub(crate) fn run() {
                         standup_updates_all: false,
                         standup_live_open: false,
                         standup_block_open: std::collections::HashSet::new(),
-                        standup_earlier_open: false,
                         paste_seq: 0,
                         infos_cache: std::collections::HashMap::new(),
                         map_drag: None,
@@ -474,6 +472,11 @@ pub(crate) fn run() {
                         map_root_cache: std::collections::HashMap::new(),
                         outline_open_pending: None,
                         standup_divider_ms: standup_seen0,
+                        rail_forget_armed: None,
+                        proj_open: None,
+                        proj_visit_ms: 0,
+                        proj_arrived: Vec::new(),
+                        proj_arrived_all: false,
                         prev_screen: Screen::Standup,
                         settings_window: None,
                         settings_focus: None,
@@ -506,7 +509,6 @@ pub(crate) fn run() {
                         summaries_on,
                         toast_secs,
                         auto_continue,
-                        ac_fire_on_reset,
                         sum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         sum_cooldown_until: Arc::new(AtomicU64::new(0)),
                         sum_job_times: Vec::new(),

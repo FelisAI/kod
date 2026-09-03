@@ -410,20 +410,10 @@ impl Orchestrator {
         if let Ok(store) = self.store.lock() {
             let _ = store.set_setting("auto_continue", if on { "1" } else { "0" });
         }
-        self.host.set_auto_continue(on, self.ac_fire_on_reset);
-        cx.notify();
-    }
-
-    /// Persist + apply the fire-on-reset config (audit B2 / task #31). Default OFF:
-    /// with it off the master auto-continue arms but never FIRES (its cleared-banner
-    /// edge is unreachable for an idle session); on, it fires when the resolved reset
-    /// instant arrives + the session is quiet.
-    fn set_ac_fire_on_reset(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.ac_fire_on_reset = on;
-        if let Ok(store) = self.store.lock() {
-            let _ = store.set_setting("ac_fire_on_reset", if on { "1" } else { "0" });
-        }
-        self.host.set_auto_continue(self.auto_continue, on);
+        // ALWAYS `true` for the second argument — see `render_settings_automation`.
+        // It was a second switch, and with it off the master one armed and never
+        // fired.
+        self.host.set_auto_continue(on, true);
         cx.notify();
     }
 
@@ -655,9 +645,21 @@ impl Orchestrator {
             ))
     }
 
-    /// Automation — the two unattended-resume switches (docs/019 / task #31).
-    /// They are one setting in two halves: the master arms it, `fire_on_reset`
-    /// is what actually makes it fire, so they belong on the same page.
+    /// Automation — the unattended-resume switch (docs/019 / task #31).
+    ///
+    /// ONE switch. There were two: a master, and "Fire on the reset clock",
+    /// which had to ALSO be on or the master armed and never fired — its own
+    /// help text admitted "an idle session never repaints its grid, so
+    /// auto-continue effectively won't fire on its own". Both shipped Off, so
+    /// the feature could not run as delivered and the only place that was
+    /// written down was under the second switch, which you had to find first.
+    ///
+    /// It was never a safety valve either. Every other condition in the fire
+    /// gate (`session::ac_decide`) is a real guard — the reset instant has
+    /// passed, the session is quiet, nothing is mid-output, no dialog is open,
+    /// the composer is empty, and it gives up after six hours. That switch only
+    /// chose between "works" and "does nothing", which is not a choice worth
+    /// putting in front of anyone.
     fn render_settings_automation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let auto_on = self.auto_continue;
         let auto_continue = setting_toggle_row(
@@ -669,28 +671,17 @@ impl Orchestrator {
                 this.set_auto_continue(!this.auto_continue, cx)
             }),
         );
-        let fire_on = self.ac_fire_on_reset;
-        let fire_on_reset = setting_toggle_row(
-            "ac-fire-on-reset-toggle",
-            fire_on,
-            if fire_on { "On" } else { "Off" },
-            "",
-            cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.set_ac_fire_on_reset(!this.ac_fire_on_reset, cx)
-            }),
-        );
 
-        settings_body()
-            .child(settings_section(
-                "Auto-continue on limit reset",
-                "Unattended: when a session is blocked on a usage limit, resume it automatically the moment its window resets — even with the app closed. Requires the background daemon (the default run mode); it has no effect in in-process mode. Off by default.",
-                auto_continue,
-            ))
-            .child(settings_section(
-                "Fire on the reset clock",
-                "How auto-continue decides the block is over. Off (default): only resume once the limit banner actually disappears — the safest signal, but an idle session never repaints its grid, so auto-continue effectively won't fire on its own. On: resume when the estimated reset time arrives and the session is quiet. Turn this on to make auto-continue actually resume unattended.",
-                fire_on_reset,
-            ))
+        settings_body().child(settings_section(
+            "Auto-continue on limit reset",
+            "When a session is blocked on a usage limit, resume it the moment its window \
+             resets — even with the app closed. It waits for the reset time the CLI \
+             reported, and only types when the session is quiet and you have nothing \
+             half-written in it; if you answer the session yourself first, it backs off. \
+             Gives up after six hours. Needs the background daemon, which is the default. \
+             Off to start.",
+            auto_continue,
+        ))
     }
 
     /// Background AI (#57) — renamed from "In-app LLM", which named a thing the

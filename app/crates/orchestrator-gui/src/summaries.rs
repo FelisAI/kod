@@ -186,6 +186,78 @@ impl Orchestrator {
                 .and_then(|s| s.get_setting("standup_seen_ms"))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            // The expansion latches belong to a SITTING at the standup, not to the
+            // process. Both were one-way: nothing ever cleared them, so a single
+            // "show all ▸" disabled PROJECT_CAP for the rest of the day and one
+            // "+N more" kept that block fully expanded forever. A cap a click can
+            // permanently switch off is not a cap, it is a default that decays.
+            // Re-entering Standup asks the question again — which is what the
+            // divider reload directly above already does for freshness.
+            self.standup_updates_all = false;
+            self.standup_block_open.clear();
+        }
+        // The PER-PROJECT half of the same ledger, on the same principle: stamp
+        // when you LEAVE a project, because being in it is what makes its updates
+        // read. Stamping on arrival — which is all `select_project` used to do —
+        // was already stale by the time you looked away: the summariser writes
+        // `at_ms = now` for a session you are sitting there watching, so the block
+        // came back to the standup with its dot lit as if you had never opened it.
+        //
+        // On this tick and NOT in render, both halves of it. `render_workspace`
+        // carries a comment about a per-frame SQLite hit being the per-keystroke
+        // latency it had to fix, and Agent mode is the typing path.
+        let open_now: Option<String> = if self.screen == Screen::Workspace {
+            let slug = self.project().slug.clone();
+            (!slug.is_empty()).then_some(slug)
+        } else {
+            None
+        };
+        let change =
+            crate::standup_plan::visit_change(self.proj_open.as_deref(), open_now.as_deref());
+        if let Some(left) = change.left {
+            self.mark_project_read(&left);
+        }
+        if change.restart {
+            self.proj_open = open_now;
+            // The window is "since this project was last marked READ", not "since
+            // this tick noticed you arrived". `select_project` stamps the ledger
+            // the instant you click, up to a tick before this runs; anchoring on
+            // `now` here would leave a half-second in which a summary is invisible
+            // to the strip AND marked read on the way out — precisely the
+            // dishonesty the leave-stamp exists to avoid.
+            let anchor = self
+                .proj_open
+                .clone()
+                .map(|slug| self.project_seen_ms(&slug))
+                .unwrap_or(0);
+            // 0 is "never opened", not "opened at the epoch". Anchoring there
+            // would make a first visit open with every summary the project has
+            // ever had, under a heading claiming they arrived while you were
+            // standing here. A first look starts empty, like the standup's does.
+            self.proj_visit_ms = if anchor == 0 {
+                crate::render_sidebar::wall_now_ms()
+            } else {
+                anchor
+            };
+            self.proj_arrived.clear();
+            self.proj_arrived_all = false;
+        }
+        if let Some(slug) = self.proj_open.clone() {
+            // What the leave-stamp above is only honest BECAUSE of: everything it
+            // will mark read has been on screen since it arrived.
+            let rows = {
+                let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+                store.summaries_since(&slug, self.proj_visit_ms).unwrap_or_default()
+            };
+            let arrived: Vec<String> = rows
+                .into_iter()
+                .map(|r| r.headline)
+                .filter(|h| !h.trim().is_empty())
+                .collect();
+            if arrived != self.proj_arrived {
+                self.proj_arrived = arrived;
+                cx.notify();
+            }
         }
         self.prev_screen = self.screen;
         if let Some((slug, at)) = self.outline_open_pending.clone() {

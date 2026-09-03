@@ -1180,8 +1180,17 @@ impl Net {
 
 /// The non-loopback addresses a [`Bind`] means right now.
 ///
-/// Tailnet first, because the pairing card shows the first one and a tailnet
-/// address is the one that still works after the phone leaves the house.
+/// Tailnet first, because a tailnet address is the one that still works after the
+/// phone leaves the house — it is the more durable of the two, so it leads the
+/// list a `serve` banner and a status line are read off.
+///
+/// It is NOT the one the pairing card leads with, and this comment used to say it
+/// was. The card takes every address and puts the Wi-Fi one first
+/// (`bridgecfg::pair_hosts`), because pairing happens with a camera pointed at
+/// the Mac's screen and an older phone reads only the first. While THIS order
+/// decided the card, a Mac bound to both networks handed out its 100.x address
+/// and nothing else — so a phone without Tailscale had nowhere to go, and no way
+/// to be told so.
 ///
 /// A symbolic name that resolves to nothing is an ERROR, not an empty list. The
 /// alternative is a bridge that was asked to be reachable, came up loopback-only

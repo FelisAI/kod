@@ -5,6 +5,7 @@
 //  know what needs the user.
 
 import Foundation
+import SwiftUI
 
 enum TimeFmt {
     /// "12m", "3h", "2d" — for a badge next to a title, where "ago" is implied.
@@ -138,14 +139,31 @@ struct ProjectGroup: Identifiable, Equatable {
     var attentionCount: Int { sessions.filter(\.needsYou).count }
     var hasLive: Bool { liveCount > 0 }
 
-    /// "4 sessions · 2 working · 1 idle" — counts only. Deliberately no "updated
-    /// 2m ago": the moment a row shows recency, the list starts flapping.
+    /// "4 sessions" — and nothing about WHAT they are doing, because that now
+    /// rides in `liveMix` as colour. It used to read "4 sessions · 2 working · 1
+    /// idle" in one grey line, which made a project mid-run look exactly like a
+    /// project sitting still: you had to READ the row to find out, and the whole
+    /// point of this screen is seeing the shape of everything at a glance.
+    ///
+    /// Still deliberately no "updated 2m ago": the moment a row shows recency,
+    /// the list starts flapping.
     var subtitle: String {
         var parts = ["\(sessions.count) session\(sessions.count == 1 ? "" : "s")"]
-        if busyCount > 0 { parts.append("\(busyCount) working") }
-        if idleCount > 0 { parts.append("\(idleCount) idle") }
         if !hasLive { parts.append("no live session") }
         return parts.joined(separator: " · ")
+    }
+
+    /// One segment per NON-ZERO state, in the same priority order and the same
+    /// colours the desktop rail uses (`render_sidebar::rail_active_project`):
+    /// needs-you, then idle, then working. Collapsing to only the strongest
+    /// signal reads as a lie — the Mac learned that one by showing "● 1" green
+    /// while two sessions worked invisibly.
+    var liveMix: [(label: String, tint: Color)] {
+        var out: [(String, Color)] = []
+        if attentionCount > 0 { out.append(("⚠ \(attentionCount)", KodColor.amber)) }
+        if idleCount > 0 { out.append(("● \(idleCount)", KodColor.green)) }
+        if busyCount > 0 { out.append(("● \(busyCount)", KodColor.orange)) }
+        return out
     }
 }
 

@@ -446,6 +446,196 @@ impl Store {
         Ok(())
     }
 
+    /// FORGET a project: erase Kod's record of it, and stop the scanner putting
+    /// it straight back.
+    ///
+    /// THE DIRECTORY ON DISK IS NEVER TOUCHED. Nothing in here opens, moves or
+    /// removes a file; the only thing that disappears is what Kod remembers.
+    ///
+    /// The mirror of `rename_project_key`, built from the same parts for the same
+    /// reason: the table sweep is driven off the LIVE SCHEMA, so a table added
+    /// next year cannot silently strand its rows.
+    ///
+    /// THREE TABLES CANNOT BE SWEPT THAT WAY. They carry no `project_key` at all
+    /// and reach a project only through a join — and foreign keys are OFF in this
+    /// store (`PRAGMA foreign_keys` reads 0), so NOTHING cascades. Each is
+    /// deleted explicitly, and BEFORE the row it hangs off, because the id lists
+    /// are the only route back to them:
+    ///
+    ///   * `part_anchor(part_id, glob)` — per-node file globs. Left behind these
+    ///     are worse than clutter: `part.id` is a plain rowid with no
+    ///     AUTOINCREMENT, so a node in ANOTHER project can later be handed a
+    ///     freed id and inherit the forgotten project's globs, which drive
+    ///     touch-linking.
+    ///   * `note_part(note_id, part_id)` — the cross-cutting decision link. TWO
+    ///     edges, both cut: a link can name a part here and a note elsewhere.
+    ///   * `memory_span(source_id -> memory_source.id)` — much the largest; a
+    ///     real store holds 829 spans against 189 sources.
+    ///
+    /// `app_settings` is a key-value store whose KEYS embed the slug, so it gets
+    /// the same anchored-at-the-first-colon treatment as the rename (see there
+    /// for why unanchored matching is a bug) — plus `drift_snooze:<part_id>`,
+    /// which is suffixed with a NODE id rather than a slug and so matches no slug
+    /// rule at all.
+    ///
+    /// Recording the key as forgotten is not bookkeeping, it is the half that
+    /// makes the feature work. The rail is NOT built from this store: it is a
+    /// merge of the store with a live scan of `~/.claude/projects` and the codex
+    /// rollouts (`orchestrator_core::live_projects_with_store`). Erasing the rows
+    /// alone would delete the history and leave the project sitting in the rail,
+    /// rediscovered and blank, within seconds — strictly worse than not deleting.
+    /// It goes in the SAME transaction for that reason: rows gone and key not
+    /// recorded is the one outcome with no way back.
+    pub fn forget_project(&mut self, key: &str) -> rusqlite::Result<()> {
+        if key.is_empty() {
+            return Ok(());
+        }
+        let tables = self.tables_with_project_key()?;
+        let tx = self.conn.transaction()?;
+
+        // The join-only tables, cut with SUBQUERIES rather than id lists
+        // materialised in Rust — and that is not a style preference. `part.id`
+        // and `part_note.id` are INTEGER while `memory_source.id` is TEXT, so one
+        // typed `query_map` over all three read the text ids as i64, and
+        // `filter_map(|r| r.ok())` dropped every one of them ON THE FLOOR: the
+        // sweep then deleted no spans at all and reported success. A subquery
+        // cannot get the type wrong. These run FIRST, while the parent rows they
+        // select from are still here to be selected.
+        tx.execute(
+            "DELETE FROM part_anchor WHERE part_id IN (SELECT id FROM part WHERE project_key=?1)",
+            params![key],
+        )?;
+        tx.execute(
+            "DELETE FROM note_part WHERE part_id IN (SELECT id FROM part WHERE project_key=?1)",
+            params![key],
+        )?;
+        tx.execute(
+            "DELETE FROM note_part WHERE note_id IN (SELECT id FROM part_note WHERE project_key=?1)",
+            params![key],
+        )?;
+
+
+        tx.execute(
+            "DELETE FROM memory_span \
+             WHERE source_id IN (SELECT id FROM memory_source WHERE project_key=?1)",
+            params![key],
+        )?;
+
+        // `drift_snooze:<part_id>` is keyed by NODE id, so no slug rule reaches
+        // it, and this is the one place that genuinely needs the ids in Rust —
+        // to build the setting key. Collected as a Result, NOT filter_map'd: a
+        // type that stops matching must fail loudly here rather than quietly
+        // leave rows behind.
+        let part_ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM part WHERE project_key=?1")?;
+            let v = stmt
+                .query_map(params![key], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?;
+            v
+        };
+        for id in &part_ids {
+            tx.execute(
+                "DELETE FROM app_settings WHERE key=?1",
+                params![format!("drift_snooze:{id}")],
+            )?;
+        }
+        for t in &tables {
+            tx.execute(&format!("DELETE FROM {t} WHERE project_key=?1"), params![key])?;
+        }
+        // `project` keys on `key`, not `project_key`, so the sweep above — which
+        // is driven off that column name — does not reach it.
+        tx.execute("DELETE FROM project WHERE key=?1", params![key])?;
+
+        let doomed: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT key FROM app_settings")?;
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows.into_iter()
+                // global settings have no `:` and are never project-scoped.
+                .filter(|k| k.split_once(':').map(|(_, slug)| slug == key).unwrap_or(false))
+                .collect()
+        };
+        for k in doomed {
+            tx.execute("DELETE FROM app_settings WHERE key=?1", params![k])?;
+        }
+
+        // the rail order is a JSON array OF SLUGS (#28) — drop the element.
+        let order: Option<String> = tx
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='project_order'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        if let Some(json) = order {
+            if let Ok(mut slugs) = serde_json::from_str::<Vec<String>>(&json) {
+                let before = slugs.len();
+                slugs.retain(|s| s != key);
+                if slugs.len() != before {
+                    if let Ok(next) = serde_json::to_string(&slugs) {
+                        tx.execute(
+                            "INSERT OR REPLACE INTO app_settings(key,value) VALUES('project_order',?1)",
+                            params![next],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // `forgotten_projects` carries no `:`, so the suffix sweep above cannot
+        // eat the very list it is writing.
+        let mut forgotten: Vec<String> = tx
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='forgotten_projects'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        if !forgotten.iter().any(|k| k == key) {
+            forgotten.push(key.to_string());
+            if let Ok(next) = serde_json::to_string(&forgotten) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO app_settings(key,value) VALUES('forgotten_projects',?1)",
+                    params![next],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        // brain_fts carries project_key but is CONTENTLESS-by-rebuild — marking
+        // it dirty is how those rows go too.
+        self.mark_dirty();
+        Ok(())
+    }
+
+    /// Project keys the user has forgotten. The scan keeps finding these on
+    /// disk; the rail must not show them.
+    pub fn forgotten_projects(&self) -> Vec<String> {
+        self.get_setting("forgotten_projects")
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    /// Un-forget: the escape hatch, and the reason forgetting is allowed to be
+    /// irreversible about the RECORD. Adding the folder back explicitly must
+    /// bring the project back — otherwise a forgotten project is one no gesture
+    /// in the app can ever recover, and the only way back is a SQL editor.
+    /// The history is still gone; what returns is the project.
+    pub fn unforget_project(&self, key: &str) -> rusqlite::Result<()> {
+        let mut forgotten = self.forgotten_projects();
+        let before = forgotten.len();
+        forgotten.retain(|k| k != key);
+        if forgotten.len() == before {
+            return Ok(());
+        }
+        let json = serde_json::to_string(&forgotten).unwrap_or_else(|_| "[]".into());
+        self.set_setting("forgotten_projects", &json)
+    }
+
     /// Every table carrying a `project_key` column, read from the live schema.
     /// `brain_fts*` is excluded on purpose: it is rebuilt wholesale from the
     /// base tables on the next search (see `rename_project_key`).

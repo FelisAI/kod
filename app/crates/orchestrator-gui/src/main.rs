@@ -278,13 +278,13 @@ struct Orchestrator {
     /// the collapsed strip is the point, and a persisted 'expanded' would
     /// restore the wall of rows every morning.
     standup_live_open: bool,
+    /// The project whose "Forget this project" is ARMED, if any. Transient by
+    /// design: an armed destructive control must not survive a switch away and
+    /// still be armed when you come back.
+    rail_forget_armed: Option<String>,
     /// Project blocks in ▲ WHAT HAPPENED whose "+N more" has been opened.
     /// Transient: an expanded block is an answer to one question, not a setting.
     standup_block_open: std::collections::HashSet<String>,
-    /// The EARLIER group in ▲ WHAT HAPPENED is expanded. Collapsed by default
-    /// whenever there IS something new — already-read projects are context, and
-    /// context does not get to push the news off the screen.
-    standup_earlier_open: bool,
     /// Bumped per pasted image so two pastes in the same millisecond cannot
     /// land on the same temp filename and silently overwrite each other.
     paste_seq: u64,
@@ -359,6 +359,24 @@ struct Orchestrator {
     /// the Standup seen-ledger (docs/012 §3): divider ts for THIS visit
     /// (loaded on enter, stamped to the store on leave via prev_screen).
     standup_divider_ms: u64,
+    /// Which project the workspace is showing, and when that visit began. The
+    /// pair drives the per-project read ledger, which stamps on LEAVE — see
+    /// `standup_plan::visit_change`.
+    proj_open: Option<String>,
+    proj_visit_ms: u64,
+    /// Summary headlines that landed since this visit began, oldest first.
+    ///
+    /// Refreshed by the 500ms tick and NEVER queried from `render`. The workspace
+    /// render is the TYPING PATH: `render_workspace` already carries a comment
+    /// about a per-frame SQLite hit there being the per-keystroke latency bug it
+    /// had to fix, and adding a query for this strip would have put it straight
+    /// back. Half a second of lag before the strip appears costs nothing; a
+    /// stutter on every keystroke costs everything.
+    proj_arrived: Vec<String>,
+    /// The arrived-while-here strip is expanded past its cap. Transient, and
+    /// reset whenever the visit restarts — an expansion is an answer to one
+    /// question, not a preference.
+    proj_arrived_all: bool,
     prev_screen: Screen,
     /// the open Settings window (#54), if any. `WindowHandle` is Copy and keeps
     /// the window alive exactly zero — it is an id, so a stale one is harmless:
@@ -478,10 +496,6 @@ struct Orchestrator {
     /// `auto_continue`; pushed to the storage-free daemon on change + on attach.
     /// Default OFF — it resumes a blocked session unattended.
     auto_continue: bool,
-    /// config (default OFF): when auto_continue is on, FIRE on the resolved reset
-    /// INSTANT (the working behavior) rather than the never-reached cleared-banner
-    /// edge (audit B2 / task #31).
-    ac_fire_on_reset: bool,
     sum_running: Arc<std::sync::atomic::AtomicBool>,
     sum_cooldown_until: Arc<AtomicU64>,
     sum_job_times: Vec<u64>,
@@ -1146,8 +1160,12 @@ impl Orchestrator {
             .position(|p| p.slug == slug)
             .unwrap_or(self.selected);
         self.active_session.insert(slug.to_string(), id);
-        // Opening it IS reviewing it (#13).
+        // Opening it IS reviewing it (#13) — the session, and the project it
+        // belongs to. This lands on Screen::Workspace with that project selected,
+        // exactly as `select_project` does, so leaving the project's updates
+        // marked unread meant its ▲ WHAT HAPPENED block survived being read.
         self.sess_unreviewed.remove(&id);
+        self.mark_project_read(slug);
         self.screen = Screen::Workspace;
         self.mode = Mode::Agent;
         if self.search.session != Some(id) {
@@ -1175,6 +1193,7 @@ impl Orchestrator {
         self.focused_part = None;
         self.rail_new = None;
         self.rail_new_err = None;
+        self.rail_forget_armed = None;
         // the suggestions gap-drawer is per-project (see the field's doc); a
         // stale open state must not carry a prior project's drawer into this one.
         self.suggest_open = false;
@@ -1189,15 +1208,81 @@ impl Orchestrator {
         // docs/019 slice 1c: opening a project is where the machine offers to
         // dissolve its own Tech husk — gated once, surfaced as a review card.
         self.maybe_seed_dissolve_tech(slug);
-        // #50: opening a project marks its updates READ — stamp the seen time
-        // (persisted) + update the in-memory cache so the rail's unread cue clears.
+        // #50: opening a project marks its updates READ.
+        self.mark_project_read(slug);
+        cx.notify();
+    }
+
+    /// FORGET a project: erase Kod's record and stop the scan resurrecting it.
+    ///
+    /// REFUSED while the project has a live session, re-checked HERE and not only
+    /// in the view: a session can be spawned between the frame that drew the
+    /// confirm and the click on it. The refusal is silent-but-safe — the strip
+    /// that offers this only renders the button when the count is zero, so
+    /// reaching this branch means the world changed under the pointer.
+    ///
+    /// THE FOLDER ON DISK IS NEVER TOUCHED. Nothing on this path removes a file.
+    pub(crate) fn forget_project(&mut self, slug: &str, cx: &mut Context<Self>) {
+        if self.cached_infos(slug).iter().any(|s| s.alive) {
+            self.rail_forget_armed = None;
+            cx.notify();
+            return;
+        }
+        {
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = store.forget_project(slug) {
+                self.term_error = Some(format!("could not forget that project: {e}"));
+                self.rail_forget_armed = None;
+                cx.notify();
+                return;
+            }
+        }
+        self.rail_forget_armed = None;
+        // caches keyed by slug, dropped so a project re-added later cannot
+        // inherit the forgotten one's read stamp.
+        self.proj_seen.borrow_mut().remove(slug);
+        // LEAVE THE WORKSPACE. `selected` is an INDEX into `self.projects`, and
+        // the rescan below is about to shorten that vector under it — staying put
+        // would leave the stage pointed at whatever slid into the slot.
+        self.screen = Screen::Standup;
+        self.start_scan(cx);
+        cx.notify();
+    }
+
+    /// DISMISS the "arrived while you were here" strip.
+    ///
+    /// It clears by MARKING THE PROJECT READ and re-anchoring the visit to now,
+    /// not by hiding a banner: the strip is a view of `summaries_since(slug,
+    /// proj_visit_ms)`, recomputed every tick, so anything that merely hid it
+    /// would have it back within 500ms. Dismissing is therefore the same claim
+    /// leaving the project makes — "I have seen these" — just made early, which
+    /// is why it stamps the same ledger.
+    pub(crate) fn dismiss_arrived(&mut self, cx: &mut Context<Self>) {
+        let Some(slug) = self.proj_open.clone() else { return };
+        self.mark_project_read(&slug);
+        self.proj_visit_ms = crate::render_sidebar::wall_now_ms();
+        self.proj_arrived.clear();
+        self.proj_arrived_all = false;
+        cx.notify();
+    }
+
+    /// Stamp a project as READ — persisted, plus the in-memory cache so the
+    /// rail's unread cue and the standup's FRESH border clear in the same frame.
+    ///
+    /// ITS OWN FUNCTION because there is more than one way to open a project and
+    /// they have to agree. This lived inline in `select_project`, so clicking a
+    /// ▲ WHAT HAPPENED block marked its project read while clicking a ⚠ NEEDS YOU
+    /// card for the SAME project — which lands on the same project, on the same
+    /// screen, via `focus_session` — did not. The block was still there, still
+    /// bordered green, when you came back. Reading is reading whichever door you
+    /// came through.
+    fn mark_project_read(&self, slug: &str) {
         let seen_now = crate::render_sidebar::wall_now_ms();
         {
             let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             let _ = store.set_setting(&format!("proj_seen_ms:{slug}"), &seen_now.to_string());
         }
         self.proj_seen.borrow_mut().insert(slug.to_string(), seen_now);
-        cx.notify();
     }
 
     /// #50: does this project have a timeline update NEWER than the last time the
@@ -1242,13 +1327,18 @@ impl Orchestrator {
         if let Some(v) = self.proj_seen.borrow().get(slug) {
             return *v;
         }
-        let v = self
-            .store
-            .lock()
-            .ok()
-            .and_then(|s| s.get_setting(&format!("proj_seen_ms:{slug}")))
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        // RECOVER from a poisoned mutex, like every neighbouring call site. `.ok()`
+        // turned a poisoned lock into `None` into a cached 0 — and 0 is "never
+        // opened", so one panic anywhere holding this lock would have marked every
+        // project permanently unread, on both the rail and the standup, for the
+        // life of the process. The failure this whole file is about, but forever.
+        let v = {
+            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            store
+                .get_setting(&format!("proj_seen_ms:{slug}"))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
         self.proj_seen.borrow_mut().insert(slug.to_string(), v);
         v
     }
@@ -1553,7 +1643,16 @@ impl Render for Orchestrator {
             || self.cmd.open // the command bar owns focus while open (docs/019 COMMAND BAR)
             || self.root_focus.is_focused(window)
             || self.palette_focus.is_focused(window)
-            || (self.screen == Screen::Workspace && self.mode == Mode::Agent);
+            // The Agent stage owns the keystream — EXCEPT while a rail editor is
+            // open. `rail_new`'s keys are routed by the ROOT listener, so leaving
+            // focus on the PTY sends Esc and Backspace to the agent instead: the
+            // New-project field then cannot be cancelled or corrected, and only in
+            // Workspace/Agent — which is exactly why it looked intermittent.
+            // Opening the field focuses root once; without this the very next
+            // render hands focus straight back.
+            || (self.screen == Screen::Workspace
+                && self.mode == Mode::Agent
+                && self.rail_new.is_none());
         if !owns_focus_elsewhere {
             self.root_focus.focus(window);
         }
@@ -1562,6 +1661,24 @@ impl Render for Orchestrator {
             Screen::Standup => self.render_standup(cx).into_any_element(),
             Screen::Workspace => self.render_workspace(cx).into_any_element(),
         };
+        // Clicking OUT of the New-project field abandons it, exactly as Esc does.
+        // Scoped to the main pane rather than the root on purpose: a root handler
+        // fires in the capture phase, before the field's own, so clicking INTO the
+        // field would cancel it. Bubble phase here, and only outside the rail, so
+        // the field can never cancel itself.
+        let main = div()
+            .size_full()
+            .child(main)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if this.rail_new.is_some() {
+                        this.cancel_rail_new();
+                        cx.notify();
+                    }
+                }),
+            )
+            .into_any_element();
         div()
             .track_focus(&self.root_focus)
             .size_full()

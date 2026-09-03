@@ -5,6 +5,88 @@ use crate::*;
 
 
 impl Orchestrator {
+    /// The strip listing summaries that landed since this project was opened.
+    ///
+    /// Reads a FIELD and never the store. `proj_arrived` is refreshed on the
+    /// 500ms tick precisely so this is free on the typing path — `render_workspace`
+    /// below documents what a per-frame SQLite hit here used to cost per
+    /// keystroke.
+    fn arrived_here_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let n = self.proj_arrived.len();
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .px(px(14.))
+            .py(px(7.))
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(HAIR_SOFT))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(ACCENT))
+                    .child(SharedString::from(format!(
+                        "▲ {n} UPDATE{} SINCE YOU OPENED THIS",
+                        if n == 1 { "" } else { "S" }
+                    )))
+                    .child(div().flex_1())
+                    // DISMISSABLE. Without this the strip sat at the top of the
+                    // workspace for as long as you stayed in the project, with no
+                    // gesture that would clear it — it only emptied when you left,
+                    // which is the one moment you are no longer looking at it.
+                    .child(
+                        div()
+                            .id("arrived-dismiss")
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(rgb(MUTED2))
+                            .hover(|h| h.text_color(rgb(TEXT)))
+                            .child("Mark read")
+                            .on_click(cx.listener(|this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                                this.dismiss_arrived(cx)
+                            })),
+                    ),
+            );
+        // Newest first, capped until asked otherwise — a project left open all day
+        // must not grow a wall at the top of its own workspace.
+        let keep = if self.proj_arrived_all { n } else { 3 };
+        for line in self.proj_arrived.iter().rev().take(keep) {
+            strip = strip.child(
+                div()
+                    // NO min_w_0(): this is a flex COLUMN, and on its children
+                    // min-width:0 removes the width floor entirely so truncate()
+                    // renders nothing but an ellipsis. That bug has shipped twice
+                    // in this codebase already.
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(SharedString::from(line.clone())),
+            );
+        }
+        if n > keep {
+            // CLICKABLE — the standup learned this the hard way and said so:
+            // a count you cannot open is a complaint, not a control. I shipped
+            // the dead version here anyway.
+            strip = strip.child(
+                div()
+                    .id("arrived-more")
+                    .py(px(2.))
+                    .cursor_pointer()
+                    .text_size(px(10.5))
+                    .text_color(rgb(MUTED2))
+                    .hover(|h| h.text_color(rgb(ACCENT)))
+                    .child(SharedString::from(format!("+{} more — show ▸", n - keep)))
+                    .on_click(cx.listener(|this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                        this.proj_arrived_all = true;
+                        cx.notify();
+                    })),
+            );
+        }
+        strip.into_any_element()
+    }
 
     /// The REAL Flow map (docs/016) — renders the persisted DESIGN tree from
     /// the store. Three states: a pending seed proposal (accept-diff), the seed
@@ -203,7 +285,14 @@ impl Orchestrator {
                                         .on_click(cx.listener(
                                             |this, _: &ClickEvent, window, cx| {
                                                 this.mode = Mode::Agent;
-                                                this.term_focus.focus(window);
+                                                // Not while a rail editor is open:
+                                                // the New-project field routes its
+                                                // keys through the root listener, so
+                                                // handing the PTY focus here sends
+                                                // Esc and Backspace to the agent.
+                                                if this.rail_new.is_none() {
+                                                    this.term_focus.focus(window);
+                                                }
                                                 cx.notify();
                                             },
                                         )),
@@ -301,7 +390,7 @@ impl Orchestrator {
         let cmd_bar = self.render_cmd_bar(&name, cx);
 
         // The stage shows EXACTLY one mode: the focused AGENT (its terminal/stream)
-        // or a context view (Map/Flow/Brain). No peek/expand drawer (#9 slice 2).
+        // or the Map + Outline context view. No peek/expand drawer (#9 slice 2).
         let mut root = div()
             .flex_1()
             .flex()
@@ -310,12 +399,24 @@ impl Orchestrator {
             .relative()
             .child(header);
         // A spawn/dispatch error surfaces here at the workspace root so it is
-        // visible in EVERY mode (Agent / Brain / Recover / Map) — not just the map
+        // visible in EVERY mode (Agent / Map + Outline / Recover) — not just the map
         // stage, which is compiled out in the OSS build. Without this a failed
         // ⌘T / "+" new-session (mkdir or name-collision in spawn_cwd) that lands on
         // the Agent stage would be a silent dead key (review).
         if let Some(err) = self.term_error.clone() {
             root = root.child(self.term_error_banner(err, cx));
+        }
+        // ▲ WHAT LANDED WHILE YOU HAVE BEEN HERE — at the workspace root for the
+        // same reason as the banner above: a summary can come from ANY session in
+        // this project, not just the one on the stage, so it must be visible in
+        // every mode.
+        //
+        // This is what makes stamping the read-ledger on LEAVE honest
+        // (`standup_plan::visit_change`). Leaving marks these read, so they have
+        // to have been in front of you first — otherwise the standup would bury a
+        // summary nobody ever saw.
+        if !self.proj_arrived.is_empty() {
+            root = root.child(self.arrived_here_strip(cx));
         }
         root = match mode {
             Mode::Agent => root.child(self.render_agent_stage(&slug, cx)),

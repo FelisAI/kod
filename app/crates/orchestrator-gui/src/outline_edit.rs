@@ -781,6 +781,19 @@ impl Orchestrator {
         }
     }
 
+    /// Abandon the New-project field, discarding what was typed.
+    ///
+    /// ONE function because there are two ways to leave: Esc, and clicking
+    /// somewhere else. They used to be a single inline arm on Esc, so clicking
+    /// away cleared nothing at all — the field stayed open, kept the rail's
+    /// highlight, and looked like it still held focus. Anything that ends the
+    /// editor without committing belongs here.
+    pub(crate) fn cancel_rail_new(&mut self) {
+        self.rail_new = None;
+        self.rail_new_err = None;
+        self.rail_new_menu_open = false;
+    }
+
     pub(crate) fn route_inline_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -822,10 +835,7 @@ impl Orchestrator {
                 }
             },
             "escape" => match target {
-                InlineTarget::RailIdea => {
-                    self.rail_new = None;
-                    self.rail_new_err = None;
-                }
+                InlineTarget::RailIdea => self.cancel_rail_new(),
                 InlineTarget::Outline => {
                     self.outline_edit = outlinepane::EditState::default();
                     // an Esc'd dbl-click-create leaves no pin behind.

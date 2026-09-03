@@ -18,6 +18,10 @@ enum KodColor {
     static let accent = Color(hex: 0x7EE2C0)
     static let amber = Color(hex: 0xE6C07A)
     static let green = Color(hex: 0x5BB99B)
+    /// WORKING. Same hex as the desktop's ORANGE (theme.rs) on purpose: the two
+    /// apps show the same live mix, and a project that reads "busy" in orange on
+    /// the Mac must not read green on the phone.
+    static let orange = Color(hex: 0xE08A4E)
     static let red = Color(hex: 0xE68A8A)
 
     /// The colour a phase dot takes. Busy is green because green means "running";
