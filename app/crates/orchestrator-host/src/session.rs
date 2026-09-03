@@ -335,6 +335,33 @@ pub struct AcInputs {
 /// we've given up waking on is a block we no longer believe).
 pub(crate) const AC_GIVEUP_MS: i64 = 6 * 3600 * 1000;
 
+/// How many rows up from the bottom `scan_limit` reads looking for the banner.
+///
+/// SIX WAS NOT ENOUGH, and being too small is a total failure rather than a
+/// degraded one: the banner is never seen, so no limit is ever recorded, no chip
+/// is ever drawn and auto-continue never arms — the whole feature is inert with
+/// nothing anywhere reporting why. That is what it did in the wild, on
+/// Claude Code 2.1.258. Captured from a real blocked session:
+///
+///     ⎿  You've hit your session limit · resets 2:20pm (America/Los_Angeles)
+///        /login to switch to an API usage-billed account.
+///
+///     ✻ Crunched for 5m 40s · done 1:05 PM
+///     <claude's input composer: a multi-row bordered box + a hint line>
+///
+/// The banner is ordinary conversation output, NOT the pinned footer the older
+/// comments here assumed, so the composer alone pushes it past six rows. The
+/// wording still parses perfectly — that was never the problem, and it took a
+/// paste of the real screen to see it, after two wrong conclusions drawn from
+/// the CLI binary and from its transcripts.
+///
+/// Kept modest rather than "the whole screen": every extra row is another
+/// chance for a SPENT banner further up the scrollback to be re-read as a live
+/// one. `UsageLimit::is_expired` catches the ones whose reset has passed; this
+/// bound is what keeps a still-future one from being re-detected after the user
+/// has already resumed by hand.
+const LIMIT_SCAN_ROWS: usize = 24;
+
 /// THE auto-continue gate (docs/019 slice 2) — PURE and exhaustively tested.
 /// This is the safety boundary: every reason NOT to type into a live session
 /// lives here, so the actuation is a trivial executor. Rules apply IN ORDER.
@@ -851,7 +878,7 @@ impl HostedSession {
         }
         self.last_limit_scan_ms.store(now, Ordering::Relaxed);
         let mut g = self.inner.lock().unwrap();
-        let parsed = parse_usage_limit(&g.emu.bottom_plain(6), now);
+        let parsed = parse_usage_limit(&g.emu.bottom_plain(LIMIT_SCAN_ROWS), now);
         let old = g.usage_limit.take();
         g.usage_limit = parsed.map(|new| UsageLimit::carry_forward(new, old.as_ref()));
 
@@ -1764,6 +1791,47 @@ mod tests {
             reset_at_unix: None,
             since_ms,
         }
+    }
+
+    /// THE REAL SCREEN, from a session that actually blocked on Claude Code
+    /// 2.1.258 — and the reason nothing ever fired: the banner parses fine, it
+    /// simply sits above the composer, outside the six rows that used to be read.
+    #[test]
+    fn the_banner_is_above_claudes_composer_and_six_rows_could_not_reach_it() {
+        // Sized so the capture fills the grid, as it does on a real screen —
+        // a tall emulator with content at the TOP puts blank rows at the bottom
+        // and measures nothing.
+        let mut emu = Emulator::new(10, 120);
+        let screen = "\
+\u{23BF}  You've hit your session limit \u{b7} resets 2:20pm (America/Los_Angeles)\r\n\
+   /login to switch to an API usage-billed account.\r\n\
+\r\n\
+\u{273B} Crunched for 5m 40s \u{b7} done 1:05 PM\r\n\
+\r\n\
+\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256E}\r\n\
+\u{2502} >                    \u{2502}\r\n\
+\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256F}\r\n\
+  ? for shortcuts\r\n";
+        emu.advance(screen.as_bytes());
+        let now = 1_788_200_000_000u64;
+
+        // What shipped: six rows reach the composer and the hint line, and stop.
+        assert!(
+            parse_usage_limit(&emu.bottom_plain(6), now).is_none(),
+            "six rows must NOT reach the banner — if this starts passing the \
+             composer shrank, and the constant should be re-derived, not deleted"
+        );
+        // What the constant is set to now.
+        let u = parse_usage_limit(&emu.bottom_plain(LIMIT_SCAN_ROWS), now)
+            .expect("the banner is right there, seven rows up");
+        assert!(u.hit, "a session limit is a hard block, not a warning");
+        assert_eq!(u.reset_clock, "2:20pm");
+        assert_eq!(u.reset_tz, "America/Los_Angeles");
+        assert!(
+            u.reset_at_unix.is_some(),
+            "without a resolved instant `ac_decide` can never arm, so detection \
+             alone would still leave the feature inert"
+        );
     }
 
     /// A usage limit was live-only: parsed off the grid every second, held in
