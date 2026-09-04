@@ -658,10 +658,30 @@ impl Orchestrator {
         // BEFORE the store lock: `watched_session` takes &self, and the guard
         // holds a borrow of self.store for the rest of this function.
         let watched = self.watched_session();
-        // A session that ended is gone from the rail, so its ledger entry could
-        // never be cleared by a click. Prune here rather than leak forever.
-        let live: std::collections::HashSet<_> = infos.iter().map(|i| i.id).collect();
-        self.sess_unreviewed.retain(|id, _| live.contains(id));
+        // WHO IS STILL WAITING FOR YOU.
+        //
+        // Two ways an entry stops being true, and only one of them used to be
+        // handled:
+        //
+        //  * the session ENDED — it is gone from the rail, so a click could never
+        //    clear it; prune here rather than leak forever.
+        //  * the session WENT BACK TO WORK. A turn genuinely ended, so the flag
+        //    was right when it was set — and then something resumed the session
+        //    without you (a background task finishing, a queued message, a hook).
+        //    It is no longer waiting on anybody, and the rail went on advertising
+        //    "⏎ ready" over a session that was visibly busy. That misread as a
+        //    broken detector; the detection was fine, nothing ever retracted it.
+        //
+        // Idle is the only phase that means waiting. Cleared HERE, before this
+        // tick's events are folded in below, so a TurnEnd arriving on a tick
+        // where the phase snapshot still says Busy survives to be re-checked on
+        // the next one rather than being dropped the instant it is set.
+        let waiting: std::collections::HashSet<_> = infos
+            .iter()
+            .filter(|i| i.alive && i.phase == orchestrator_host::Phase::Idle)
+            .map(|i| i.id)
+            .collect();
+        self.sess_unreviewed.retain(|id, _| waiting.contains(id));
         let Ok(store) = self.store.lock() else { return };
         // anchors/names per project, loaded once per touched project (not per
         // tick — most ticks have no new events at all).

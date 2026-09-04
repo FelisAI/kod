@@ -165,7 +165,15 @@ impl Orchestrator {
                 let focused = is_sel && self.active_session.get(&slug).copied() == Some(id);
                 // finished a turn you have not opened (#13). Never on the row
                 // you are already on, and never competing with needs-you amber.
-                let unreviewed = !focused && !needs_action && self.session_unreviewed(id);
+                // …and only while it is actually IDLE. The ledger is cleared the
+                // moment a session goes back to work, so this is belt-and-braces
+                // — but "⏎ ready" over a row whose dot is visibly busy is the
+                // exact contradiction that read as a broken detector, and one
+                // condition is cheaper than trusting a ledger to never lag.
+                let unreviewed = !focused
+                    && !needs_action
+                    && ph == orchestrator_host::Phase::Idle
+                    && self.session_unreviewed(id);
                 let raw = if info.title.is_empty() {
                     info.kind.label().to_string()
                 } else {
