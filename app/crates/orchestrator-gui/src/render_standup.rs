@@ -426,6 +426,14 @@ impl Orchestrator {
         // Below ⚠ NEEDS YOU on purpose: a session sitting on a permission prompt
         // is blocked and cannot proceed without you, while a finished turn is
         // merely your move. Both are "you", in that order.
+        // The cli-session ids in READY. ▲ WHAT HAPPENED drops their summaries
+        // below: a finished turn is now reported ONCE, on the row that can act on
+        // it, instead of twice — as a ready session here and as project news one
+        // tier down, a beat apart and phrased differently.
+        let ready_sess: std::collections::HashSet<String> = ready
+            .iter()
+            .filter_map(|(_, i)| i.cli_session_id.clone())
+            .collect();
         if ready_n > 0 {
             let now_ms = crate::render_sidebar::wall_now_ms();
             let mut tier = div()
@@ -491,12 +499,29 @@ impl Orchestrator {
                         )
                         .child(
                             div()
+                                .flex_none()
+                                .max_w(px(110.))
+                                .truncate()
+                                .text_size(px(11.5))
+                                .text_color(rgb(MUTED2))
+                                .child(SharedString::from(name)),
+                        )
+                        // WHAT IT SAID. Without this the row named a session and
+                        // a wait and left you to open it to find out whether it
+                        // mattered — while the same sentence sat one tier below
+                        // under ▲ WHAT HAPPENED. Now it is here, on the row that
+                        // can act on it.
+                        .child(
+                            div()
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .text_size(px(12.))
-                                .text_color(rgb(MUTED))
-                                .child(SharedString::from(name)),
+                                .text_color(rgb(TEXT))
+                                .child(SharedString::from(termview::trim(
+                                    info.last_message.trim(),
+                                    150,
+                                ))),
                         )
                         .child(
                             div()
@@ -530,7 +555,20 @@ impl Orchestrator {
         // another lock AND a chance for the two to disagree.
         let timeline: Vec<orchestrator_store::TimelineEvent> = if self.scanned {
             let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            store.timeline(120)
+            store
+                .timeline(120)
+                .into_iter()
+                // A session sitting in ⏎ READY already reports its own last turn,
+                // on a row that opens it. Reporting it again here as project news
+                // is the same fact twice, one tier apart, phrased differently —
+                // which is what made the two tiers read as duplicates. Only its
+                // SUMMARIES are dropped: a decision or a map change from the same
+                // session is genuinely other news and stays.
+                .filter(|e| {
+                    !(e.kind == orchestrator_store::TimelineKind::Summary
+                        && ready_sess.contains(&e.sess))
+                })
+                .collect()
         } else {
             Vec::new()
         };

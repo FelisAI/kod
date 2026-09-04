@@ -691,7 +691,22 @@ impl Orchestrator {
             let Some(sess) = info.cli_session_id.as_deref() else {
                 continue;
             };
-            let last = self.last_persisted_seq.get(&info.id).copied().unwrap_or(0);
+            // FIRST SIGHT of this session in this process. `last_persisted_seq` is
+            // in-memory, so a freshly-started GUI has none and replays the
+            // daemon's whole event ring — which used to re-flag every session
+            // that had ever finished a turn as "ready", including every one the
+            // user had already been into. A queue that is wrong the moment you
+            // open the app is worse than no queue.
+            //
+            // Nothing here knows what was reviewed BEFORE this process started —
+            // that would need a per-session seen stamp in the store, the shape
+            // `proj_seen_ms` uses — so the honest move is to claim nothing:
+            // adopt the backlog silently, and let the ledger fill from turns that
+            // end while we are watching. At 12-27 turn-ends an hour it refills
+            // within minutes.
+            let known = self.last_persisted_seq.get(&info.id).copied();
+            let first_sight = known.is_none();
+            let last = known.unwrap_or(0);
             let events: Vec<_> = self
                 .host
                 .events_for(info.id)
@@ -726,7 +741,7 @@ impl Orchestrator {
                         // phase edge would light up every row within a minute and
                         // the cue would mean nothing. A TurnEnd is the assistant
                         // actually finishing what it had to say.
-                        if watched != Some(info.id) {
+                        if watched != Some(info.id) && !first_sight {
                             self.sess_unreviewed.insert(info.id, e.at_ms);
                         }
                         // MAP VERBS (docs/019 T11): the session steers its own
