@@ -60,7 +60,12 @@ impl Orchestrator {
             )
             .child(
                 div()
-                    .flex_none()
+                    // SHRINKABLE. `flex_none` sets flex-shrink to 0, so this column held its
+                    // full width no matter how narrow the pane got and the row overflowed
+                    // instead of truncating — the Standup lost its right-hand side on a
+                    // small window. It still PREFERS this width (grow stays 0); it may now
+                    // give ground, which is what `min_w_0` + `truncate` were always for.
+                    .flex_shrink()
                     .w(px(if digest { 104. } else { 150. }))
                     .min_w_0()
                     .truncate()
@@ -208,7 +213,9 @@ impl Orchestrator {
                 )
                 .child(
                     div()
-                        .flex_none()
+                        // shrinkable — see `update_block` for why `flex_none` here
+                        // cost the Standup its right-hand side on a narrow window.
+                        .flex_shrink()
                         .w(px(150.))
                         .min_w_0()
                         .truncate()
@@ -218,7 +225,8 @@ impl Orchestrator {
                 )
                 .child(
                     div()
-                        .flex_none()
+                        .flex_shrink()
+                        .min_w_0()
                         .max_w(px(110.))
                         .truncate()
                         .text_size(px(11.5))
@@ -468,7 +476,7 @@ impl Orchestrator {
                         .bg(rgb(0x201414)).border_1().border_color(rgb(0x5a2c2c))
                         .cursor_pointer().hover(|h| h.border_color(rgb(0x7a3c3c)))
                         .child(div().flex_none().whitespace_nowrap().w(px(14.)).text_size(px(11.)).text_color(rgb(0xE68A8A)).child("⛔"))
-                        .child(div().flex_none().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
+                        .child(div().flex_shrink().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
                             .child(SharedString::from(termview::session_label(&info))))
                         .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(rgb(MUTED2)).bg(rgb(CARD)).rounded(px(5.)).px(px(6.)).py(px(1.))
                             .child(SharedString::from(termview::trim(&name, 20))))
@@ -809,7 +817,7 @@ impl Orchestrator {
                             .bg(rgb(PANEL)).border_1().border_color(rgb(HAIR))
                             .cursor_pointer().hover(|h| h.border_color(rgb(0x36404A)))
                             .child(div().flex_none().whitespace_nowrap().w(px(14.)).text_size(px(11.)).text_color(rgb(gcol)).child(glyph))
-                            .child(div().flex_none().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
+                            .child(div().flex_shrink().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
                                 .child(SharedString::from(termview::session_label(&info))))
                             .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(rgb(MUTED2)).bg(rgb(CARD)).rounded(px(5.)).px(px(6.)).py(px(1.))
                                 .child(SharedString::from(termview::trim(&name, 20))))
