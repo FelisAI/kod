@@ -682,6 +682,15 @@ impl Store {
             "INSERT OR REPLACE INTO app_settings(key,value) VALUES(?1,?2)",
             params![key, value],
         )?;
+        // `write_gen` is documented as bumped on EVERY store write the GUI renders
+        // from, and this was its one silent exception. Settings are rendered from:
+        // `proj_seen_ms:<slug>` alone decides whether a project reports in
+        // ▲ WHAT HAPPENED and whether the rail bolds its title. The memos keyed on
+        // write_gen therefore held a view that a setting write had already
+        // invalidated, and only survived because a separate in-memory cache was
+        // updated alongside every such write by hand — one forgotten call site
+        // away from a stale screen with nothing to explain it.
+        self.bump_gen();
         Ok(())
     }
 

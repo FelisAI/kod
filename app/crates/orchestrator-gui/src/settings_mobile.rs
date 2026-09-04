@@ -446,6 +446,22 @@ impl Orchestrator {
     pub(crate) fn set_bridge_bind(&mut self, bind: String, cx: &mut Context<Self>) {
         self.bridge_err = None;
         if bind == self.bridge_bind {
+            // THE STORED STRING ALREADY SAYS THIS — and returning here swallowed
+            // the click.
+            //
+            // These switches are drawn from what is actually BOUND, not from the
+            // stored key (that is the whole design of this pane: a control that
+            // cannot show an exposure which does not exist). So the two disagree
+            // exactly when a bind was REFUSED: `lan,tailscale` stored, Tailscale
+            // not up, so the daemon bound only LAN and the Tailnet switch draws
+            // Off. Clicking it recomputes `bind_tokens(lan, !tailnet)` — which is
+            // the string already stored — and the click did nothing at all, with
+            // no error and no movement, forever.
+            //
+            // A user clicking a switch is asking for what is ON SCREEN to become
+            // true, not for a string to change. So retry the bind.
+            self.push_bridge(cx);
+            cx.notify();
             return;
         }
         let previous = std::mem::replace(&mut self.bridge_bind, bind.clone());

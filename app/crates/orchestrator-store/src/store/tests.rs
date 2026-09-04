@@ -3381,6 +3381,24 @@
         )));
     }
 
+    /// `write_gen` is the GUI's per-frame memo key, documented as bumped on every
+    /// store write it renders from. `set_setting` was the silent exception — and
+    /// settings ARE rendered from: `proj_seen_ms:<slug>` alone decides whether a
+    /// project reports in ▲ WHAT HAPPENED and whether the rail bolds its title.
+    #[test]
+    fn writing_a_setting_advances_the_render_generation() {
+        let s = Store::open_in_memory().unwrap();
+        let before = s.write_gen();
+        s.set_setting("proj_seen_ms:path:/tmp/p", "123").unwrap();
+        assert!(
+            s.write_gen() > before,
+            "a memo keyed on write_gen would hold a view this write just invalidated"
+        );
+        let mid = s.write_gen();
+        s.set_setting("proj_seen_ms:path:/tmp/p", "456").unwrap();
+        assert!(s.write_gen() > mid, "overwriting an existing key is still a write");
+    }
+
     /// FORGETTING IS DESTRUCTIVE, so this asserts both halves: nothing of the
     /// forgotten project survives ANYWHERE, and nothing of its neighbour moves.
     ///
