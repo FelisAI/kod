@@ -661,7 +661,7 @@ impl Orchestrator {
         // A session that ended is gone from the rail, so its ledger entry could
         // never be cleared by a click. Prune here rather than leak forever.
         let live: std::collections::HashSet<_> = infos.iter().map(|i| i.id).collect();
-        self.sess_unreviewed.retain(|id| live.contains(id));
+        self.sess_unreviewed.retain(|id, _| live.contains(id));
         let Ok(store) = self.store.lock() else { return };
         // anchors/names per project, loaded once per touched project (not per
         // tick — most ticks have no new events at all).
@@ -707,7 +707,7 @@ impl Orchestrator {
                         // the cue would mean nothing. A TurnEnd is the assistant
                         // actually finishing what it had to say.
                         if watched != Some(info.id) {
-                            self.sess_unreviewed.insert(info.id);
+                            self.sess_unreviewed.insert(info.id, e.at_ms);
                         }
                         // MAP VERBS (docs/019 T11): the session steers its own
                         // chip. Fenced + minimal — see apply_map_verb.

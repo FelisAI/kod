@@ -244,6 +244,27 @@ impl Orchestrator {
                                             .text_color(rgb(AMBER))
                                             .child("needs you"),
                                     )
+                                })
+                                // SAME IDIOM AS "needs you", because it is the
+                                // same kind of fact: this row wants you.
+                                //
+                                // A brightness step was the whole signal before,
+                                // and a step on a MUTED→TEXT→TEXT_STRONG ladder
+                                // is not something you notice — it is something
+                                // you can verify once you already suspect it. The
+                                // ladder stays (it reads at a glance down the
+                                // column); this is what makes a single row say so
+                                // on its own. Green, not amber: your move, not
+                                // your blocker.
+                                .when(unreviewed, |c| {
+                                    c.child(
+                                        div()
+                                            .flex_none()
+                                            .whitespace_nowrap()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(ACCENT))
+                                            .child("⏎ ready"),
+                                    )
                                 }),
                         )
                         // the limit pill gets its OWN line: the rail has vertical

@@ -450,7 +450,7 @@ pub(crate) fn run() {
                         term_focus: cx.focus_handle(),
                         root_focus: cx.focus_handle(),
                         active_session: std::collections::HashMap::new(),
-                        sess_unreviewed: std::collections::HashSet::new(),
+                        sess_unreviewed: std::collections::HashMap::new(),
                         standup_updates_all: false,
                         standup_live_open: false,
                         standup_block_open: std::collections::HashSet::new(),

@@ -73,7 +73,10 @@ mod timefmt;
 mod triage;
 mod winchrome;
 
-use changeset::{changeset_kept, op_asserts_done, op_with_name_edit, plan_changeset_accept};
+use changeset::{
+    changeset_accept_label, changeset_kept, op_asserts_done, op_requires_individual_review,
+    op_with_name_edit, plan_changeset_accept,
+};
 use features::MAP_ENABLED;
 use session_discovery::{fresh_session_discovery_next, restore_row_kind, FreshDiscovery};
 use spawn::ProfilePick;
@@ -292,7 +295,15 @@ struct Orchestrator {
     /// not a phase: phase is whatever the agent is doing now, this is whether
     /// YOU have caught up with it. Set in `persist_events` on a TurnEnd whose
     /// session you were not watching; cleared by `select_session`.
-    sess_unreviewed: std::collections::HashSet<SessionId>,
+    /// … mapped to WHEN that turn ended. The stamp is what lets "ready" be
+    /// ordered by how long it has been waiting, which is what keeps the surface
+    /// honest without a classifier: a session that finished twenty seconds ago
+    /// sinks to the bottom (you are probably about to open it anyway) while one
+    /// that has waited ninety minutes floats to the top. Measured over 14 days,
+    /// 47% of turn-ends are continued within five minutes and 19% sit past half
+    /// an hour — so the interesting variable was never WHETHER a turn end is
+    /// yours to answer, it is how long it has gone unanswered.
+    sess_unreviewed: std::collections::HashMap<SessionId, u64>,
     /// per-frame snapshot of every project's live sessions — populated ONCE at the
     /// top of render() so the sidebar/header/stage don't each re-lock the host
     /// 13-24×/frame (review fix). Read via cached_infos(); ~16ms stale in handlers.
@@ -1070,7 +1081,13 @@ impl Orchestrator {
 
     /// This session finished a turn you have not opened since (#13).
     pub(crate) fn session_unreviewed(&self, id: SessionId) -> bool {
-        self.sess_unreviewed.contains(&id)
+        self.sess_unreviewed.contains_key(&id)
+    }
+
+    /// When this session finished the turn it is still waiting on, in wall-clock
+    /// ms. `None` when it is not waiting.
+    pub(crate) fn session_ready_since(&self, id: SessionId) -> Option<u64> {
+        self.sess_unreviewed.get(&id).copied()
     }
 
     fn active_session_id(&self) -> Option<SessionId> {
@@ -1504,6 +1521,12 @@ fn has_temp_ref(op: &DiffOp) -> bool {
         } | DiffOp::Move {
             parent: PartRef::Temp(_),
             ..
+        } | DiffOp::AddDecision {
+            part: PartRef::Temp(_),
+            ..
+        } | DiffOp::RestoreNoteTarget {
+            part: PartRef::Temp(_),
+            ..
         }
     )
 }
@@ -1511,13 +1534,16 @@ fn has_temp_ref(op: &DiffOp) -> bool {
 /// Does a diff op target/parent the given node? (outline per-op filter, #10)
 fn op_touches(op: &DiffOp, id: PartId) -> bool {
     match op {
-        DiffOp::Add { parent, .. } => *parent == PartRef::Id(id),
+        DiffOp::Add { parent, .. } | DiffOp::AddDecision { part: parent, .. } => {
+            *parent == PartRef::Id(id)
+        }
         DiffOp::SetStatus { id: t, .. }
         | DiffOp::Rename { id: t, .. }
         | DiffOp::Remove { id: t }
         | DiffOp::SetDetail { id: t, .. }
         | DiffOp::SetKind { id: t, .. } => *t == id,
         DiffOp::Move { id: t, parent, .. } => *t == id || *parent == PartRef::Id(id),
+        DiffOp::RemoveDecision { .. } | DiffOp::RestoreNoteTarget { .. } => false,
     }
 }
 
@@ -1550,6 +1576,15 @@ fn describe_op(op: &DiffOp, name_of: &dyn Fn(PartId) -> String) -> String {
         DiffOp::Remove { id } => format!("remove {}", name_of(*id)),
         DiffOp::SetDetail { id, .. } => format!("describe {}", name_of(*id)),
         DiffOp::SetKind { id, kind } => format!("{} becomes {}", name_of(*id), kind.as_str()),
+        DiffOp::AddDecision { part, text, .. } => match part {
+            PartRef::Id(id) => format!("record decision on {}: {text}", name_of(*id)),
+            PartRef::Temp(_) => format!("record decision on new node: {text}"),
+            PartRef::Root => format!("record map decision: {text}"),
+        },
+        DiffOp::RemoveDecision { note_id } => format!("remove memory decision #{note_id}"),
+        DiffOp::RestoreNoteTarget { note_id, .. } => {
+            format!("restore internal note #{note_id} target")
+        }
     }
 }
 

@@ -210,6 +210,10 @@ impl Orchestrator {
         let mut needs: Vec<(usize, String, String, SessionInfo)> = Vec::new();
         let mut working: Vec<(String, SessionInfo)> = Vec::new();
         let mut idle: Vec<(String, SessionInfo)> = Vec::new();
+        // Finished a turn while you were elsewhere and not opened since — your
+        // move. Pulled OUT of `idle` rather than tagged inside it, so a session
+        // still lands in exactly one tier.
+        let mut ready: Vec<(String, SessionInfo)> = Vec::new();
         let mut blocked: Vec<(String, SessionInfo)> = Vec::new();
         let mut live_n = 0usize;
         if self.scanned {
@@ -250,6 +254,9 @@ impl Orchestrator {
                         orchestrator_host::Phase::Busy => {
                             working.push((p.name.clone(), info.clone()))
                         }
+                        _ if self.session_unreviewed(info.id) => {
+                            ready.push((p.name.clone(), info.clone()))
+                        }
                         _ => idle.push((p.name.clone(), info.clone())),
                     }
                 }
@@ -257,7 +264,18 @@ impl Orchestrator {
         }
         // oldest ask first — the one you've been ignoring longest leads (#4).
         needs.sort_by_key(|(_, _, _, info)| info.phase_since_ms);
+        // LONGEST WAIT FIRST, and that ordering is the whole noise strategy.
+        //
+        // Measured over 14 days of real history: 47% of turn-ends are continued
+        // within five minutes, 19% sit past half an hour, and NO session behaves
+        // like a self-continuing loop. So there is no class of turn-end to filter
+        // out — the interesting variable is not whether a finished turn is yours
+        // to answer, it is how long it has gone unanswered. Sorting by that lets
+        // the tier answer the question itself: what you are about to open anyway
+        // sinks to the bottom, what you have forgotten rises.
+        ready.sort_by_key(|(_, info)| self.session_ready_since(info.id).unwrap_or(u64::MAX));
         let need_n = needs.len();
+        let ready_n = ready.len();
         let work_n = working.len();
         let idle_n = idle.len();
         // session-centric headline (the Deck reframe: sessions are the home).
@@ -274,6 +292,9 @@ impl Orchestrator {
             let mut parts = Vec::new();
             if need_n > 0 {
                 parts.push(format!("⚠ {need_n} need you"));
+            }
+            if ready_n > 0 {
+                parts.push(format!("⏎ {ready_n} ready for you"));
             }
             if work_n > 0 {
                 parts.push(format!("● {work_n} working"));
@@ -390,6 +411,104 @@ impl Orchestrator {
             );
             for (_i, name, slug, info) in needs {
                 tier = tier.child(self.needs_card(name, slug, info, cx));
+            }
+            feed = feed.child(tier);
+        }
+        // ── ⏎ READY — finished a turn while you were elsewhere, waiting on your
+        // next instruction.
+        //
+        // The state for this always existed (`sess_unreviewed`, set on TurnEnd and
+        // deliberately not on the Busy→Idle edge, which fires between every tool
+        // call). Its ENTIRE surfacing was one step on a rail brightness ladder, so
+        // the only way to find out a session was waiting was to remember to go and
+        // look — which is the overhead this screen exists to remove.
+        //
+        // Below ⚠ NEEDS YOU on purpose: a session sitting on a permission prompt
+        // is blocked and cannot proceed without you, while a finished turn is
+        // merely your move. Both are "you", in that order.
+        if ready_n > 0 {
+            let now_ms = crate::render_sidebar::wall_now_ms();
+            let mut tier = div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(7.))
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(ACCENT))
+                        .child("⏎ READY")
+                        .child(
+                            div()
+                                .text_color(rgb(MUTED2))
+                                .child(SharedString::from(ready_n.to_string())),
+                        ),
+                );
+            for (name, info) in ready {
+                // The wait is the POINT of this row, so it is the thing on the
+                // right rather than a phase word every row would share.
+                let waited = self
+                    .session_ready_since(info.id)
+                    .map(|t| crate::timefmt::ago_label(now_ms.saturating_sub(t)))
+                    .unwrap_or_default();
+                let (jslug, jid) = (info.project_slug.clone(), info.id);
+                tier = tier.child(
+                    div()
+                        .id(SharedString::from(format!("ready-{}", info.id.0)))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(12.))
+                        .py(px(7.))
+                        .rounded(px(9.))
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(HAIR))
+                        .cursor_pointer()
+                        .hover(|h| h.border_color(rgb(0x346B54)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(14.))
+                                .text_size(px(11.))
+                                .text_color(rgb(ACCENT))
+                                .child("⏎"),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(150.))
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .text_color(rgb(TEXT_STRONG))
+                                .child(SharedString::from(termview::session_label(&info))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(MUTED))
+                                .child(SharedString::from(name)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED2))
+                                .child(SharedString::from(format!("ready {waited}"))),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.focus_session(&jslug, jid, window, cx)
+                        })),
+                );
             }
             feed = feed.child(tier);
         }
