@@ -1782,8 +1782,10 @@ mod tests {
     }
 
     fn ul(hit: bool, since_ms: u64, clock: &str, tz: &str) -> UsageLimit {
+        use crate::usage_limit::LimitWindow;
         UsageLimit {
             hit,
+            window: LimitWindow::Unknown,
             percent: None,
             reset_clock: clock.into(),
             reset_tz: tz.into(),
