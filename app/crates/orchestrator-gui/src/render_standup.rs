@@ -424,18 +424,24 @@ impl Orchestrator {
         };
         let now_ms = crate::timefmt::now_ms();
         if self.scanned {
-            let floor = crate::standup_plan::update_floor_ms(self.standup_divider_ms, now_ms);
-            // NEW vs EARLIER comes from the PER-PROJECT ledger, so this tier and
-            // the rail (which bolds unread titles the same way, #50) can never
-            // disagree on screen about whether you have read something. The
-            // global stamp still sets `floor` above — how far back to look.
+            // BOTH halves are now per project, and that is the point. Read-ness
+            // always was (`proj_seen_ms`, #50, which is also what bolds an unread
+            // title in the rail, so the two surfaces cannot disagree). The reach
+            // back was NOT: one global `standup_seen_ms` floor was applied to
+            // every project, so glancing at the Standup clamped it to 48 hours and
+            // a project never opened, whose only activity was three days ago,
+            // vanished — unread, in a tier that claims to show what you have not
+            // seen.
+            let floor_for = |k: &str| {
+                crate::standup_plan::project_floor_ms(self.project_seen_ms(k), now_ms)
+            };
             let is_fresh = |k: &str| self.project_unread(k);
             let is_expanded = |k: &str| self.standup_block_open.contains(k);
             let plan = crate::standup_plan::plan_updates(
                 &timeline,
                 &is_fresh,
                 &is_expanded,
-                floor,
+                &floor_for,
                 self.standup_updates_all,
             );
             // RENDERED WHEN EMPTY TOO, so long as there is a "last looked" to

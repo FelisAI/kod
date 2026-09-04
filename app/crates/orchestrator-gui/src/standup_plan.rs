@@ -41,19 +41,33 @@ pub(crate) const MIN_WINDOW_MS: u64 = 48 * 3600 * 1000;
 /// fortnight it stops being a standup and becomes an archive.
 pub(crate) const MAX_WINDOW_MS: u64 = 14 * 24 * 3600 * 1000;
 
-/// The oldest event ▲ WHAT HAPPENED will show.
+
+/// How far back the tier reaches FOR ONE PROJECT, from that project's own
+/// last-read stamp.
 ///
-/// WHY A FLOOR AT ALL: the timeline is capped by COUNT (120 rows), not by time,
-/// and 278 summaries across 47 days of real history means those 120 rows reach
-/// back about three weeks. Without a floor the tier would file a project that
-/// last reported three weeks ago under "EARLIER", next to this morning.
-pub(crate) fn update_floor_ms(seen_ms: u64, now_ms: u64) -> u64 {
-    let at_least = now_ms.saturating_sub(MIN_WINDOW_MS);
-    let at_most = now_ms.saturating_sub(MAX_WINDOW_MS);
-    // seen_ms == 0 is the first-ever visit: fall back to the minimum window
-    // rather than showing everything the store has ever held.
-    let want = if seen_ms == 0 { at_least } else { seen_ms.min(at_least) };
-    want.max(at_most)
+/// The floor used to be global: one value from `standup_seen_ms`, applied to
+/// every project. Read-ness has always been per project, so the two disagreed —
+/// glance at the Standup and the floor clamps to 48 hours, hiding a project you
+/// have never opened whose only activity was three days ago. It is unread, the
+/// tier claims to show what you have not seen, and it was invisible. Measured on
+/// a real store: gouge, orchestrator and ai-undercover-game, all unread, all
+/// hidden.
+///
+/// `seen == 0` means NEVER OPENED, and that is the case the global version got
+/// exactly backwards. There it meant "first launch ever", so it clamped to the
+/// 48-hour minimum to avoid dumping the whole archive on a new user. Per project
+/// it means "you have not seen any of this", so the honest reach is the full
+/// window — the tier only ever plans UNREAD projects now, so this cannot flood
+/// the screen with things already read, and PROJECT_CAP still bounds the rest.
+pub(crate) fn project_floor_ms(seen_ms: u64, now_ms: u64) -> u64 {
+    let oldest = now_ms.saturating_sub(MAX_WINDOW_MS);
+    if seen_ms == 0 {
+        return oldest;
+    }
+    // Reach back to when this project was last read — but never past the archive
+    // horizon, and never less than the minimum window, so a project read moments
+    // before a fresh event still shows that event with a little context around it.
+    seen_ms.min(now_ms.saturating_sub(MIN_WINDOW_MS)).max(oldest)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +178,10 @@ pub(crate) fn plan_updates(
     events: &[TimelineEvent],
     is_fresh: &dyn Fn(&str) -> bool,
     is_expanded: &dyn Fn(&str) -> bool,
-    floor_ms: u64,
+    // `floor_for`: the oldest event to consider, PER PROJECT — see
+    // `project_floor_ms`. A single global floor is what made an unread project
+    // older than the minimum window invisible.
+    floor_for: &dyn Fn(&str) -> u64,
     show_all: bool,
 ) -> UpdatePlan {
     // group by project, newest first within each — dropping anything older than
@@ -173,7 +190,7 @@ pub(crate) fn plan_updates(
     let mut order: Vec<String> = Vec::new();
     let mut by_key: std::collections::HashMap<String, Vec<&TimelineEvent>> =
         std::collections::HashMap::new();
-    for e in events.iter().filter(|e| e.ts_ms >= floor_ms) {
+    for e in events.iter().filter(|e| e.ts_ms >= floor_for(&e.project_key)) {
         let slot = by_key.entry(e.project_key.clone()).or_insert_with(|| {
             order.push(e.project_key.clone());
             Vec::new()
@@ -445,13 +462,66 @@ mod tests {
 
 
 
+    /// THE BUG THIS FIXES, measured on a real store: gouge, orchestrator and
+    /// ai-undercover-game were all unread and all invisible, because the reach
+    /// back came from the GLOBAL stamp while read-ness came from the per-project
+    /// one. Glance at the Standup and the floor clamps to 48 hours; a project you
+    /// have never opened whose only activity was three days ago is then hidden by
+    /// a tier whose whole claim is to show what you have not seen.
+    #[test]
+    fn a_project_you_have_never_opened_is_reached_all_the_way_back() {
+        // seen == 0 is NEVER OPENED here. The global version read the same zero
+        // as "first launch ever" and clamped to the 48-hour minimum — exactly
+        // backwards for a per-project stamp.
+        assert_eq!(project_floor_ms(0, NOW), NOW - MAX_WINDOW_MS);
+
+        let evs = vec![ev("never-opened", NOW - 3 * 24 * H, "moved three days ago")];
+        let global = plan_updates(&evs, &|_| true, &|_| false, &|_| NOW - MIN_WINDOW_MS, false);
+        assert!(global.is_empty(), "precondition: the old global floor hid it");
+
+        let per_project =
+            plan_updates(&evs, &|_| true, &|_| false, &|_| project_floor_ms(0, NOW), false);
+        assert_eq!(per_project.projects.len(), 1, "unread and inside the archive window");
+    }
+
+    #[test]
+    fn the_reach_stops_at_the_archive_horizon_and_never_shortens_below_the_minimum() {
+        // Read a while ago: reach back to when you read it, so you see everything
+        // since — that is the whole question the tier answers.
+        assert_eq!(project_floor_ms(NOW - 5 * 24 * H, NOW), NOW - 5 * 24 * H);
+        // Read moments ago: still reach the minimum window, so a project that goes
+        // unread again shows its fresh event with a little context around it.
+        assert_eq!(project_floor_ms(NOW - 60_000, NOW), NOW - MIN_WINDOW_MS);
+        // Read a very long time ago (or never, above): the archive horizon caps it.
+        assert_eq!(project_floor_ms(NOW - 90 * 24 * H, NOW), NOW - MAX_WINDOW_MS);
+    }
+
+    #[test]
+    fn each_project_is_floored_against_its_own_stamp_not_one_shared_number() {
+        // `fresh` reads its own project's stamp; so must the reach. Two projects,
+        // the same event age, different last-read times — one reports, one does not.
+        let evs = vec![
+            ev("read-recently", NOW - 3 * 24 * H, "old news to you"),
+            ev("never-opened", NOW - 3 * 24 * H, "you have not seen this"),
+        ];
+        let floor_for = |k: &str| {
+            project_floor_ms(if k == "read-recently" { NOW - 60_000 } else { 0 }, NOW)
+        };
+        let p = plan_updates(&evs, &|_| true, &|_| false, &floor_for, false);
+        assert_eq!(
+            p.projects.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
+            ["never-opened"],
+            "one shared floor cannot express two different last-read times"
+        );
+    }
+
     /// THE SEMANTIC, PINNED: ▲ WHAT HAPPENED is what you have NOT seen.
     #[test]
     fn reading_everything_empties_the_tier_rather_than_relabelling_it() {
         // Five projects all within the window, all already read — the exact shape
         // measured on the real store when this was reported. It used to plan five
         // "earlier" blocks and render them expanded.
-        let p = plan_updates(&spread(5), &|_| false, &|_| false, 0, false);
+        let p = plan_updates(&spread(5), &|_| false, &|_| false, &|_| 0, false);
         assert!(p.projects.is_empty());
         assert!(p.is_empty(), "caught up means an empty plan, not a demoted pile");
         assert_eq!(p.reporting, 0);
@@ -464,7 +534,7 @@ mod tests {
         // to the 3. Counting all 12 flipped density to Digest and put a
         // "+N more projects" footer over a screen with three rows on it.
         let unread = ["p0", "p5", "p11"];
-        let p = plan_updates(&spread(12), &|k| unread.contains(&k), &|_| false, 0, false);
+        let p = plan_updates(&spread(12), &|k| unread.contains(&k), &|_| false, &|_| 0, false);
         assert_eq!(p.reporting, 3);
         assert_eq!(p.density, Density::Blocks, "3 <= BLOCK_MAX_PROJECTS");
         assert_eq!(p.hidden_projects, 0, "3 is nowhere near PROJECT_CAP");
@@ -477,7 +547,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_an_empty_plan() {
-        let p = plan_updates(&[], &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&[], &|_| true, &|_| false, &|_| 0, false);
         assert!(p.is_empty());
         assert_eq!(p.reporting, 0);
         assert_eq!(p.hidden_projects, 0);
@@ -490,7 +560,7 @@ mod tests {
             ev("atlas", 900, "newest"),
             ev("harbor", 400, "only"),
         ];
-        let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.reporting, 2, "two projects, three events");
         // sorted newest project first
         assert_eq!(p.projects[0].key, "atlas");
@@ -514,7 +584,7 @@ mod tests {
         let evs: Vec<_> = (0..54)
             .map(|i| ev_sess("ai-video", "s1", 9_000 - i, "where it got to"))
             .collect();
-        let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.projects[0].total, 1, "one thread, one line");
         assert_eq!(p.projects[0].hidden_lines, 0, "and so nothing to hide");
         assert_eq!(p.projects[0].lines[0].ts_ms, 9_000, "the NEWEST is what it says");
@@ -527,7 +597,7 @@ mod tests {
             ev_sess("atlas", "s1", 800, "a-old"),
             ev_sess("atlas", "s2", 700, "b"),
         ];
-        let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.projects[0].total, 2);
         assert_eq!(p.projects[0].lines[0].text, "a-new");
         assert_eq!(p.projects[0].lines[1].text, "b");
@@ -542,7 +612,7 @@ mod tests {
             e
         };
         let evs = vec![nosess(900, "map 1"), nosess(800, "map 2"), nosess(700, "map 3")];
-        let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.projects[0].total, 3);
     }
 
@@ -550,7 +620,7 @@ mod tests {
     fn height_grows_with_projects_not_events() {
         // The whole point. Forty events on ONE project is still one block.
         let evs: Vec<_> = (0..40).map(|i| ev("atlas", 1000 + i, "x")).collect();
-        let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.reporting, 1);
         assert_eq!(shown(&p), 1);
         assert_eq!(p.projects[0].total, 40);
@@ -563,7 +633,7 @@ mod tests {
         // The whole reason for the predicate: "have I read this?" is answered
         // per project (proj_seen_ms), not by one global "you left Standup" stamp.
         let evs = vec![ev("new", 900, "a"), ev("old", 100, "b")];
-        let p = plan_updates(&evs, &|k| k == "new", &|_| false, 0, false);
+        let p = plan_updates(&evs, &|k| k == "new", &|_| false, &|_| 0, false);
         assert_eq!(p.projects.len(), 1);
         assert_eq!(p.projects[0].key, "new");
         assert_eq!(p.reporting, 1, "a project you have read does not report at all");
@@ -573,15 +643,15 @@ mod tests {
     fn a_first_ever_visit_shows_everything() {
         // A project never opened has no proj_seen stamp, so project_unread says
         // unread — hiding someone's entire first look would be wrong.
-        let p = plan_updates(&spread(4), &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&spread(4), &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.projects.len(), 4);
     }
 
     #[test]
     fn blocks_up_to_the_threshold_digest_past_it() {
-        let at = plan_updates(&spread(BLOCK_MAX_PROJECTS), &|_| true, &|_| false, 0, false);
+        let at = plan_updates(&spread(BLOCK_MAX_PROJECTS), &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(at.density, Density::Blocks);
-        let over = plan_updates(&spread(BLOCK_MAX_PROJECTS + 1), &|_| true, &|_| false, 0, false);
+        let over = plan_updates(&spread(BLOCK_MAX_PROJECTS + 1), &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(over.density, Density::Digest);
     }
 
@@ -589,7 +659,7 @@ mod tests {
     fn a_digest_row_carries_exactly_one_line() {
         let mut evs = spread(BLOCK_MAX_PROJECTS + 1);
         evs.push(ev("p0", 99_999, "the newest thing p0 did"));
-        let p = plan_updates(&evs, &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.density, Density::Digest);
         let p0 = p.projects.iter().find(|x| x.key == "p0").unwrap();
         assert_eq!(p0.lines.len(), 1);
@@ -599,7 +669,7 @@ mod tests {
 
     #[test]
     fn the_project_cap_drops_the_stalest_and_reports_the_remainder() {
-        let p = plan_updates(&spread(PROJECT_CAP + 5), &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&spread(PROJECT_CAP + 5), &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.reporting, PROJECT_CAP + 5);
         assert_eq!(shown(&p), PROJECTS_WHEN_CAPPED);
         assert_eq!(p.hidden_projects, PROJECT_CAP + 5 - PROJECTS_WHEN_CAPPED);
@@ -612,7 +682,7 @@ mod tests {
 
     #[test]
     fn exactly_at_the_cap_nothing_is_hidden() {
-        let p = plan_updates(&spread(PROJECT_CAP), &|_| true, &|_| false, 0, false);
+        let p = plan_updates(&spread(PROJECT_CAP), &|_| true, &|_| false, &|_| 0, false);
         assert_eq!(p.hidden_projects, 0);
         assert_eq!(shown(&p), PROJECT_CAP);
     }
@@ -621,7 +691,7 @@ mod tests {
     fn show_all_defeats_both_caps_at_once() {
         // Having asked for everything, being handed digests would be a second
         // cap the user cannot see.
-        let p = plan_updates(&spread(PROJECT_CAP + 5), &|_| true, &|_| false, 0, true);
+        let p = plan_updates(&spread(PROJECT_CAP + 5), &|_| true, &|_| false, &|_| 0, true);
         assert_eq!(p.density, Density::Blocks);
         assert_eq!(p.hidden_projects, 0);
         assert_eq!(shown(&p), PROJECT_CAP + 5);
@@ -635,7 +705,7 @@ mod tests {
             ev("c", 200, ""),
             ev("d", 100, ""),
         ];
-        let p = plan_updates(&evs, &|k| k == "a" || k == "b", &|_| false, 0, false);
+        let p = plan_updates(&evs, &|k| k == "a" || k == "b", &|_| false, &|_| 0, false);
         assert_eq!(
             p.projects.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
             ["a", "b"],
@@ -646,7 +716,7 @@ mod tests {
     #[test]
     fn a_project_whose_newest_event_ties_the_stamp_is_not_shown() {
         // Strictly newer, matching project_unread's `last_update > seen`.
-        let p = plan_updates(&[ev("a", 500, "")], &|_| false, &|_| false, 0, false);
+        let p = plan_updates(&[ev("a", 500, "")], &|_| false, &|_| false, &|_| 0, false);
         assert!(p.projects.is_empty());
         assert!(p.is_empty(), "read means gone, not demoted");
         assert_eq!(p.reporting, 0);
@@ -656,31 +726,9 @@ mod tests {
     const H: u64 = 3600 * 1000;
     const NOW: u64 = 1_000 * 24 * H; // an arbitrary "now" far from zero
 
-    #[test]
-    fn checking_a_minute_ago_still_shows_the_last_two_days() {
-        // The failure this prevents: you glance at Standup at 9am, and at 10am
-        // it has hidden everything that happened overnight because it is "seen".
-        let f = update_floor_ms(NOW - 60_000, NOW);
-        assert_eq!(f, NOW - MIN_WINDOW_MS);
-    }
 
-    #[test]
-    fn being_away_a_while_reaches_back_to_your_last_look() {
-        let f = update_floor_ms(NOW - 5 * 24 * H, NOW);
-        assert_eq!(f, NOW - 5 * 24 * H);
-    }
 
-    #[test]
-    fn being_away_a_long_time_is_clamped_to_a_fortnight() {
-        // Past this it stops being a standup and becomes an archive.
-        let f = update_floor_ms(NOW - 90 * 24 * H, NOW);
-        assert_eq!(f, NOW - MAX_WINDOW_MS);
-    }
 
-    #[test]
-    fn a_first_visit_gets_the_minimum_window_not_all_of_history() {
-        assert_eq!(update_floor_ms(0, NOW), NOW - MIN_WINDOW_MS);
-    }
 
 
     #[test]
@@ -693,8 +741,8 @@ mod tests {
             ev("recent", NOW - H, "today"),
             ev("ancient", NOW - 30 * 24 * H, "three weeks ago"),
         ];
-        let floor = update_floor_ms(0, NOW);
-        let p = plan_updates(&evs, &|_| true, &|_| false, floor, false);
+        let floor = NOW - MIN_WINDOW_MS;
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| floor, false);
         assert_eq!(p.reporting, 1, "the ancient project must not report");
         assert_eq!(p.projects[0].key, "recent");
     }
@@ -716,7 +764,7 @@ mod tests {
                 ));
             }
         }
-        let p = plan_updates(&evs, &|_| true, &|_| false, update_floor_ms(0, NOW), false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| NOW - MIN_WINDOW_MS, false);
         assert_eq!(p.reporting, 9, "all nine projects report");
         assert_eq!(shown(&p), 9, "and none is capped away — 9 is under PROJECT_CAP");
         assert_eq!(p.hidden_projects, 0);
@@ -738,7 +786,7 @@ mod tests {
             ev("atlas", NOW - 2 * H, "b"),
             ev("harbor", NOW - 3 * H, "c"),
         ];
-        let p = plan_updates(&evs, &|_| true, &|_| false, update_floor_ms(0, NOW), false);
+        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| NOW - MIN_WINDOW_MS, false);
         assert_eq!(p.reporting, 2);
         assert_eq!(p.density, Density::Blocks);
     }
