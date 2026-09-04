@@ -812,14 +812,6 @@ impl Orchestrator {
 
 
 
-    /// One source of truth for "needs you" — a hosted session awaiting a real
-    /// decision (M3). Drives both the sidebar badge and the Standup header.
-    fn needs_you_count(&self) -> usize {
-        self.projects
-            .iter()
-            .filter(|p| self.live_overlay(&p.slug).2 > 0)
-            .count()
-    }
 
 
 

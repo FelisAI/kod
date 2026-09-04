@@ -197,6 +197,35 @@ impl Orchestrator {
 
 
 
+    /// The shape of the Standup without building it — what the rail's Standup
+    /// button reports. Same `standup_bucket` the tiers use, so the two cannot
+    /// disagree about what is waiting.
+    pub(crate) fn standup_counts(&self) -> StandupCounts {
+        let mut c = StandupCounts::default();
+        if !self.scanned {
+            return c;
+        }
+        for p in &self.projects {
+            for info in self.cached_infos(&p.slug) {
+                if !info.alive {
+                    continue;
+                }
+                match standup_bucket(
+                    info.usage_limit.as_ref().is_some_and(|u| u.hit),
+                    info.phase,
+                    self.session_unreviewed(info.id),
+                ) {
+                    Bucket::Blocked => c.blocked += 1,
+                    Bucket::Needs => c.needs += 1,
+                    Bucket::Working => c.working += 1,
+                    Bucket::Ready => c.ready += 1,
+                    Bucket::Idle => c.idle += 1,
+                }
+            }
+        }
+        c
+    }
+
     /// One ⏎ card: a session that finished a turn while you were elsewhere, what
     /// it said, and how long it has been waiting.
     ///
@@ -394,26 +423,20 @@ impl Orchestrator {
                     // Still exactly ONE tier per session — an asking session lands in
                     // ⚠ NEEDS YOU only — and that row renders the usage chip, so the
                     // limit is surfaced rather than traded away for the ask.
-                    if blocked_tier_claims(
+                    // `live_n` above already counted it, so the "N agents live"
+                    // headline is unchanged whichever tier claims it.
+                    match standup_bucket(
                         info.usage_limit.as_ref().is_some_and(|u| u.hit),
-                        info.phase == orchestrator_host::Phase::AwaitingDecision,
+                        info.phase,
+                        self.session_unreviewed(info.id),
                     ) {
-                        blocked.push((p.name.clone(), info.clone()));
-                        // don't ALSO fall through into working/idle. Still counted in
-                        // `live_n` above, so the "N agents live" headline is unchanged.
-                        continue;
-                    }
-                    match info.phase {
-                        orchestrator_host::Phase::AwaitingDecision => {
+                        Bucket::Blocked => blocked.push((p.name.clone(), info.clone())),
+                        Bucket::Needs => {
                             needs.push((i, p.name.clone(), p.slug.clone(), info.clone()))
                         }
-                        orchestrator_host::Phase::Busy => {
-                            working.push((p.name.clone(), info.clone()))
-                        }
-                        _ if self.session_unreviewed(info.id) => {
-                            ready.push((p.name.clone(), info.clone()))
-                        }
-                        _ => idle.push((p.name.clone(), info.clone())),
+                        Bucket::Working => working.push((p.name.clone(), info.clone())),
+                        Bucket::Ready => ready.push((p.name.clone(), info.clone())),
+                        Bucket::Idle => idle.push((p.name.clone(), info.clone())),
                     }
                 }
             }
@@ -1686,6 +1709,56 @@ pub(crate) fn resume_promise(auto_on: bool, has_reset_instant: bool) -> &'static
     }
 }
 
+/// Which Standup tier a live session belongs to. EXACTLY ONE, always.
+///
+/// A free function because two surfaces now ask: the Standup itself, to build
+/// its tiers, and the rail's Standup button, to say what is waiting without
+/// opening it. This file already carries a scar from that shape — the comment on
+/// the ⛔ branch records the day the Dock badge, the toast, the notification and
+/// the sidebar dot each decided for themselves what "needs you" meant, and
+/// "Dock-badge 1" and "nothing needs you" were reachable in the same instant. So
+/// there is one definition and both callers use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bucket {
+    /// a hard usage-limit hit with no ask on top of it — wait it out.
+    Blocked,
+    /// sitting on a real permission prompt; cannot proceed without you.
+    Needs,
+    /// working.
+    Working,
+    /// finished a turn you have not opened — your move.
+    Ready,
+    /// alive and quiet, wanting nothing.
+    Idle,
+}
+
+pub(crate) fn standup_bucket(
+    limit_hit: bool,
+    phase: orchestrator_host::Phase,
+    unreviewed: bool,
+) -> Bucket {
+    if blocked_tier_claims(limit_hit, phase == orchestrator_host::Phase::AwaitingDecision) {
+        return Bucket::Blocked;
+    }
+    match phase {
+        orchestrator_host::Phase::AwaitingDecision => Bucket::Needs,
+        orchestrator_host::Phase::Busy => Bucket::Working,
+        _ if unreviewed => Bucket::Ready,
+        _ => Bucket::Idle,
+    }
+}
+
+/// How many live sessions sit in each tier, for a caller that wants the shape of
+/// the Standup without building it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StandupCounts {
+    pub blocked: usize,
+    pub needs: usize,
+    pub working: usize,
+    pub ready: usize,
+    pub idle: usize,
+}
+
 pub(crate) fn blocked_tier_claims(limit_hit: bool, awaiting_decision: bool) -> bool {
     limit_hit && !awaiting_decision
 }
@@ -1766,7 +1839,36 @@ fn sub_heading(text: &'static str, color: u32) -> impl IntoElement {
 /// The standup's one grey line (pure — no store, no window).
 #[cfg(test)]
 mod tests {
-    use super::resume_promise;
+    use super::{resume_promise, standup_bucket, Bucket};
+
+    /// ONE definition, two surfaces. This file already carries the scar: the ⛔
+    /// branch records the day the Dock badge, the toast, the notification and the
+    /// sidebar dot each decided for themselves what "needs you" meant, and
+    /// "Dock-badge 1" and "nothing needs you" were reachable in the same instant.
+    #[test]
+    fn every_live_session_lands_in_exactly_one_tier() {
+        use orchestrator_host::Phase;
+        let b = standup_bucket;
+
+        // A hard limit hit waits it out — UNLESS there is a real ask on top of
+        // it, which you can clear in seconds and which therefore wins.
+        assert_eq!(b(true, Phase::Idle, false), Bucket::Blocked);
+        assert_eq!(b(true, Phase::Busy, false), Bucket::Blocked);
+        assert_eq!(b(true, Phase::AwaitingDecision, false), Bucket::Needs);
+
+        // Blocked outranks ready: a capped session is not your move.
+        assert_eq!(b(true, Phase::Idle, true), Bucket::Blocked);
+        // …and so does working. A session mid-turn is not waiting on you, even
+        // if it finished an earlier one — that is the retraction the ledger does,
+        // asserted here so the two cannot drift apart.
+        assert_eq!(b(false, Phase::Busy, true), Bucket::Working);
+
+        assert_eq!(b(false, Phase::AwaitingDecision, false), Bucket::Needs);
+        assert_eq!(b(false, Phase::Idle, true), Bucket::Ready);
+        assert_eq!(b(false, Phase::Idle, false), Bucket::Idle);
+        // Spawning is not idle-with-nothing-to-say, but it wants nothing either.
+        assert_eq!(b(false, Phase::Spawning, false), Bucket::Idle);
+    }
 
     /// A blocked row that does not say what will happen is why its owner believed
     /// auto-continue had never been built: the feature's whole job is this moment,

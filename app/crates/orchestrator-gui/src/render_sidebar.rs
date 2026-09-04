@@ -562,7 +562,6 @@ impl Orchestrator {
 
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // one source of truth (real M3 needs-you), matching the Standup header.
-        let needs = self.needs_you_count();
         let on_standup = self.screen == Screen::Standup;
         let s = div()
             // user-resizable (#52); the drag gutter itself is an absolutely
@@ -602,7 +601,30 @@ impl Orchestrator {
                             .child("kod"),
                     ),
             )
-            .child(
+            .child({
+                let sc = self.standup_counts();
+                // most urgent first — the glyph reports the loudest thing there is.
+                let sc_glyph: (&'static str, u32) = if sc.blocked > 0 {
+                    ("⛔", 0xE68A8A)
+                } else if sc.needs > 0 {
+                    ("⚠", AMBER)
+                } else if sc.ready > 0 {
+                    ("⏎", ACCENT)
+                } else if sc.working > 0 {
+                    ("●", ORANGE)
+                } else {
+                    ("◌", if on_standup { ACCENT } else { MUTED2 })
+                };
+                let mut sc_pills: Vec<(String, u32, u32)> = Vec::new();
+                if sc.blocked > 0 {
+                    sc_pills.push((format!("⛔ {}", sc.blocked), 0x2A1616, 0xE68A8A));
+                }
+                if sc.needs > 0 {
+                    sc_pills.push((format!("⚠ {}", sc.needs), 0x1A1408, AMBER));
+                }
+                if sc.ready > 0 {
+                    sc_pills.push((format!("⏎ {}", sc.ready), 0x10231C, ACCENT));
+                }
                 div()
                     .id("standup")
                     .flex()
@@ -621,34 +643,46 @@ impl Orchestrator {
                         this.screen = Screen::Standup;
                         cx.notify();
                     }))
+                    // THE GLYPH IS THE STATE, not decoration. It used to be "◳",
+                    // which names nothing — the one place you look to decide
+                    // whether to look was carrying a shape with no meaning. It is
+                    // now whatever is most urgent behind the button, so the button
+                    // answers its own question before you press it.
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(13.))
-                            .text_color(rgb(if on_standup { ACCENT } else { MUTED }))
-                            .child("◳"),
+                            .text_color(rgb(sc_glyph.1))
+                            .child(sc_glyph.0),
                     )
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(px(13.))
                             .text_color(rgb(if on_standup { TEXT_STRONG } else { TEXT }))
                             .child("Standup"),
                     )
-                    // prominent amber pill, not a near-invisible number (#4).
-                    .when(needs > 0, |r| {
-                        r.child(
-                            div()
-                                .bg(rgb(AMBER))
-                                .text_color(rgb(0x1A1408))
-                                .rounded(px(20.))
-                                .px(px(8.))
-                                .py(px(1.))
-                                .text_size(px(10.5))
-                                .font_weight(FontWeight::BOLD)
-                                .child(SharedString::from(format!("⚠ {needs}"))),
-                        )
-                    }),
-            );
+                    // One pill per non-zero ACTIONABLE tier, in urgency order —
+                    // the same three the Standup pins above the fold. Working and
+                    // idle are reassurance and stay off: this button is for
+                    // deciding whether something wants you, and a count that is
+                    // never zero would answer that with noise.
+                    .children(sc_pills.into_iter().map(|(txt, fg, bg)| {
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .bg(rgb(bg))
+                            .text_color(rgb(fg))
+                            .rounded(px(20.))
+                            .px(px(7.))
+                            .py(px(1.))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::from(txt))
+                    }))
+            });
         // Recover is a per-project control-bar action, not global nav. Projects:
         // the ones the app owns LIVE sessions in float to an ACTIVE group on top
         // (needs-you pinned first); the rest sit below (#9).
