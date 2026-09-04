@@ -109,7 +109,7 @@ impl Orchestrator {
                 card_action(
                     SharedString::from(format!("upd-open-{}", p.key)),
                     "open ▸",
-                    ACCENT,
+                    true,
                 )
                 .on_click(cx.listener({
                     let k = p.key.clone();
@@ -122,7 +122,7 @@ impl Orchestrator {
                 card_action(
                     SharedString::from(format!("upd-read-{}", p.key)),
                     "mark read",
-                    TEXT,
+                    false,
                 )
                 .on_click(cx.listener({
                     let k = p.key.clone();
@@ -288,7 +288,7 @@ impl Orchestrator {
                     card_action(
                         SharedString::from(format!("ready-open-{}", info.id.0)),
                         "open ▸",
-                        ACCENT,
+                        true,
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.focus_session(&jslug, jid, window, cx)
@@ -298,7 +298,7 @@ impl Orchestrator {
                     card_action(
                         SharedString::from(format!("ready-dismiss-{}", info.id.0)),
                         "dismiss",
-                        TEXT,
+                        false,
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.dismiss_ready(jid, cx)
@@ -1696,25 +1696,40 @@ pub(crate) fn standup_thread_hint(summaries_on: bool, _thread_empty: bool) -> Op
 /// recency (the alive-stamp is a live-view concern); `drifted` is a live-only
 /// signal, so it stays 0 here (the map view carries it). `None` = no parts yet.
 
-/// A small text action on a card. Plain words, not icons: these rows already
-/// carry a glyph, a name, a project, a sentence and a clock, and a row of
-/// unlabelled symbols on top of that is a puzzle rather than a control.
-fn card_action(
-    id: impl Into<ElementId>,
-    label: &'static str,
-    tint: u32,
-) -> Stateful<Div> {
+/// A real button on a card: a chip with a background, a border and a hit target
+/// you can actually land on.
+///
+/// The first version was 10.5px text with 2px of padding and no box — a
+/// hyperlink pretending to be a control. It was hard to see and hard to hit,
+/// which for the two actions that let you clear this screen without opening
+/// anything is the whole value gone.
+///
+/// 26px tall and 12px of horizontal padding: comfortably clickable with a mouse
+/// without turning a dense row into a toolbar. `primary` tints the one that
+/// carries the row's main verb; the other stays quiet so the pair reads as an
+/// action and its alternative rather than as two equal choices.
+fn card_action(id: impl Into<ElementId>, label: &'static str, primary: bool) -> Stateful<Div> {
+    let (fg, edge) = if primary {
+        (ACCENT, 0x346B54)
+    } else {
+        (MUTED, HAIR)
+    };
     div()
         .id(id)
         .flex_none()
+        .flex()
+        .items_center()
         .whitespace_nowrap()
-        .px(px(6.))
-        .py(px(2.))
-        .rounded(px(5.))
+        .h(px(26.))
+        .px(px(12.))
+        .rounded(px(7.))
+        .bg(rgb(CARD2))
+        .border_1()
+        .border_color(rgb(edge))
         .cursor_pointer()
-        .text_size(px(10.5))
-        .text_color(rgb(MUTED2))
-        .hover(|h| h.text_color(rgb(tint)).bg(rgb(CARD2)))
+        .text_size(px(11.5))
+        .text_color(rgb(fg))
+        .hover(|h| h.bg(rgb(CARD)).border_color(rgb(fg)).text_color(rgb(fg)))
         .child(label)
 }
 
