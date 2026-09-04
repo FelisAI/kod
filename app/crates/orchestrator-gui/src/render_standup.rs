@@ -100,38 +100,7 @@ impl Orchestrator {
                         )
                     })),
             )
-            // EXPLICIT ACTIONS. "open ▸" was a LABEL — it looked like a button,
-            // did nothing, and the real control was the whole card, so reading a
-            // block risked being pulled into a project. And the useful one was
-            // missing: a block you have read and want gone meant opening the
-            // project just to make it stop reporting.
-            .child(
-                card_action(
-                    SharedString::from(format!("upd-open-{}", p.key)),
-                    "open ▸",
-                    true,
-                )
-                .on_click(cx.listener({
-                    let k = p.key.clone();
-                    move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
-                        this.select_project(&k, cx)
-                    }
-                })),
-            )
-            .child(
-                card_action(
-                    SharedString::from(format!("upd-read-{}", p.key)),
-                    "mark read",
-                    false,
-                )
-                .on_click(cx.listener({
-                    let k = p.key.clone();
-                    move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
-                        this.mark_project_read(&k);
-                        cx.notify();
-                    }
-                })),
-            );
+            ;
 
         let mut card = div()
             .id(SharedString::from(format!("upd-{}", p.key)))
@@ -163,38 +132,84 @@ impl Orchestrator {
                     .child(SharedString::from(text)),
             );
         }
-        if hidden > 0 {
-            // CLICKABLE. A count you cannot open is a complaint, not a control —
-            // "+53 more" told you what you were missing and gave you no way to
-            // see it. `stop_propagation` so opening the block does not also
-            // navigate to the project.
-            let ekey = p.key.clone();
-            card = card.child(
-                div()
-                    .id(SharedString::from(format!("upd-more-{}", p.key)))
-                    .pl(px(15.))
-                    .py(px(2.))
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED2))
-                    .hover(|h| h.text_color(rgb(ACCENT)))
-                    .child(SharedString::from(format!("+{hidden} more — show ▸")))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.standup_block_open.insert(ekey.clone());
-                        cx.stop_propagation();
+        // ONE FOOTER for every control on this card.
+        //
+        // The two buttons used to sit in the HEADER, competing with the project
+        // name, the count and the age — all of which are `flex_none` or already
+        // shrunk, so on a narrow window the row simply overflowed. A footer costs
+        // one line and takes the whole width, so nothing on this card has to
+        // fight for room any more.
+        let ekey = p.key.clone();
+        let (kopen, kread) = (p.key.clone(), p.key.clone());
+        card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(9.))
+                .pt(px(2.))
+                .child(
+                    // CLICKABLE. A count you cannot open is a complaint, not a
+                    // control — "+53 more" told you what you were missing and
+                    // gave you no way to see it.
+                    div()
+                        .id(SharedString::from(format!("upd-more-{}", p.key)))
+                        .flex_shrink()
+                        .min_w_0()
+                        .truncate()
+                        .pl(px(15.))
+                        .py(px(2.))
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED2))
+                        .hover(|h| h.text_color(rgb(ACCENT)))
+                        .when(hidden == 0, |d| d.invisible())
+                        .child(SharedString::from(format!("+{hidden} more — show ▸")))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.standup_block_open.insert(ekey.clone());
+                            cx.notify();
+                        })),
+                )
+                .child(div().flex_1().min_w_0())
+                .child(
+                    card_action(
+                        SharedString::from(format!("upd-open-{}", p.key)),
+                        "open ▸",
+                        true,
+                    )
+                    .on_click(cx.listener(move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                        this.select_project(&kopen, cx)
+                    })),
+                )
+                .child(
+                    card_action(
+                        SharedString::from(format!("upd-read-{}", p.key)),
+                        "mark read",
+                        false,
+                    )
+                    .on_click(cx.listener(move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                        this.mark_project_read(&kread);
                         cx.notify();
                     })),
-            );
-        }
-        card
+                ),
+        )
     }
 
 
 
-    /// One ⏎ row: a session that finished a turn while you were elsewhere, what
+    /// One ⏎ card: a session that finished a turn while you were elsewhere, what
     /// it said, and how long it has been waiting.
-    /// One ⏎ row: a session that finished a turn while you were elsewhere, what
-    /// it said, and how long it has been waiting.
+    ///
+    /// TWO LINES, and that is a width fix rather than a style choice. On one line
+    /// this had a glyph, a 150px name, a 110px project, the message, a clock and
+    /// two buttons all competing; the message is the only flexible one, so it was
+    /// the only thing that could give — and on a narrower window it collapsed to
+    /// nothing while six fixed things sat there jammed together. The sentence you
+    /// actually read was the first casualty of every resize.
+    ///
+    /// So: who/where/when on top, what it said and what you can do about it
+    /// below, where the message has a whole line to itself and only the buttons
+    /// to yield to.
     fn ready_row(
         &self,
         name: String,
@@ -202,108 +217,107 @@ impl Orchestrator {
         now_ms: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The wait is the POINT of this row, so it is the thing on the right
-        // rather than a phase word every row would share.
+        // The wait is the POINT of this card, so it holds the end of the top line
+        // rather than being a phase word every row would share.
         let waited = self
             .session_ready_since(info.id)
             .map(|t| crate::timefmt::ago_label(now_ms.saturating_sub(t)))
             .unwrap_or_default();
         let (jslug, jid) = (info.project_slug.clone(), info.id);
-            div()
-                .id(SharedString::from(format!("ready-{}", info.id.0)))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.))
-                .px(px(12.))
-                .py(px(7.))
-                .rounded(px(9.))
-                .bg(rgb(PANEL))
-                .border_1()
-                .border_color(rgb(HAIR))
-                .hover(|h| h.border_color(rgb(0x346B54)))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(14.))
-                        .text_size(px(11.))
-                        .text_color(rgb(ACCENT))
-                        .child("⏎"),
-                )
-                .child(
-                    div()
-                        // shrinkable — see `update_block` for why `flex_none` here
-                        // cost the Standup its right-hand side on a narrow window.
-                        .flex_shrink()
-                        .w(px(150.))
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.5))
-                        .text_color(rgb(TEXT_STRONG))
-                        .child(SharedString::from(termview::session_label(&info))),
-                )
-                .child(
-                    div()
-                        .flex_shrink()
-                        .min_w_0()
-                        .max_w(px(110.))
-                        .truncate()
-                        .text_size(px(11.5))
-                        .text_color(rgb(MUTED2))
-                        .child(SharedString::from(name)),
-                )
-                // WHAT IT SAID. Without this the row named a session and
-                // a wait and left you to open it to find out whether it
-                // mattered — while the same sentence sat one tier below
-                // under ▲ WHAT HAPPENED. Now it is here, on the row that
-                // can act on it.
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.))
-                        .text_color(rgb(TEXT))
-                        .child(SharedString::from(termview::trim(
-                            info.last_message.trim(),
-                            150,
-                        ))),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED2))
-                        .child(SharedString::from(format!("ready {waited}"))),
-                )
-                // EXPLICIT ACTIONS, and the body no longer navigates.
-                //
-                // The whole row used to be one click target that opened the
-                // session, which makes reading the row a risk: you click to look
-                // and get pulled out of whatever you were doing. And the action
-                // most worth having was missing entirely — clearing a row you have
-                // read and decided needs nothing meant opening it anyway, which is
-                // the context switch this screen exists to save.
-                .child(
-                    card_action(
-                        SharedString::from(format!("ready-open-{}", info.id.0)),
-                        "open ▸",
-                        true,
+        div()
+            .id(SharedString::from(format!("ready-{}", info.id.0)))
+            .flex()
+            .flex_col()
+            .gap(px(5.))
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(9.))
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(HAIR))
+            .hover(|h| h.border_color(rgb(0x346B54)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(9.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(14.))
+                            .text_size(px(11.))
+                            .text_color(rgb(ACCENT))
+                            .child("⏎"),
                     )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.focus_session(&jslug, jid, window, cx)
-                    })),
-                )
-                .child(
-                    card_action(
-                        SharedString::from(format!("ready-dismiss-{}", info.id.0)),
-                        "dismiss",
-                        false,
+                    .child(
+                        div()
+                            .flex_shrink()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(rgb(TEXT_STRONG))
+                            .child(SharedString::from(termview::session_label(info))),
                     )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.dismiss_ready(jid, cx)
-                    })),
-                )
+                    .child(
+                        div()
+                            .flex_shrink()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.5))
+                            .text_color(rgb(MUTED2))
+                            .child(SharedString::from(name)),
+                    )
+                    .child(div().flex_1().min_w_0())
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED2))
+                            .child(SharedString::from(format!("ready {waited}"))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(9.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .pl(px(23.))
+                            .text_size(px(12.))
+                            .text_color(rgb(TEXT))
+                            .child(SharedString::from(termview::trim(
+                                info.last_message.trim(),
+                                200,
+                            ))),
+                    )
+                    .child(
+                        card_action(
+                            SharedString::from(format!("ready-open-{}", info.id.0)),
+                            "open ▸",
+                            true,
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.focus_session(&jslug, jid, window, cx)
+                        })),
+                    )
+                    .child(
+                        card_action(
+                            SharedString::from(format!("ready-dismiss-{}", info.id.0)),
+                            "dismiss",
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.dismiss_ready(jid, cx)
+                        })),
+                    ),
+            )
             .into_any_element()
     }
 
