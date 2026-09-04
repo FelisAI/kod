@@ -672,16 +672,26 @@ impl Orchestrator {
         //    "⏎ ready" over a session that was visibly busy. That misread as a
         //    broken detector; the detection was fine, nothing ever retracted it.
         //
-        // Idle is the only phase that means waiting. Cleared HERE, before this
-        // tick's events are folded in below, so a TurnEnd arriving on a tick
-        // where the phase snapshot still says Busy survives to be re-checked on
-        // the next one rather than being dropped the instant it is set.
-        let waiting: std::collections::HashSet<_> = infos
-            .iter()
-            .filter(|i| i.alive && i.phase == orchestrator_host::Phase::Idle)
-            .map(|i| i.id)
-            .collect();
-        self.sess_unreviewed.retain(|id, _| waiting.contains(id));
+        // The test is NOT "is it idle right now". It is "has it started something
+        // since the turn we are holding ended" — which is what the stamp is for.
+        //
+        // A bare `phase == Idle` looked equivalent and is not, in both directions.
+        // The phase is derived from terminal activity and can still read Busy for
+        // a moment AFTER the Stop hook has fired, which would drop the flag on the
+        // very next tick, one tick after setting it — every completion silently
+        // eaten. And a session genuinely back at work is Busy with a phase that
+        // BEGAN after our stamp, which is the case worth catching.
+        //
+        // So: keep it while it is idle, or while whatever non-idle phase it is
+        // showing started before the turn ended (a stale reading, not new work).
+        self.sess_unreviewed.retain(|id, stamped| {
+            infos.iter().any(|i| {
+                i.id == *id
+                    && i.alive
+                    && (i.phase == orchestrator_host::Phase::Idle
+                        || i.phase_since_ms <= *stamped)
+            })
+        });
         let Ok(store) = self.store.lock() else { return };
         // anchors/names per project, loaded once per touched project (not per
         // tick — most ticks have no new events at all).
@@ -784,7 +794,16 @@ impl Orchestrator {
                     _ => {}
                 }
             }
-            if max_seq > last {
+            // RECORDED EVEN WHEN THIS TICK BROUGHT NOTHING.
+            //
+            // `first_sight` has to mean "the first tick we saw this session", not
+            // "until it first speaks". Writing the cursor only on new events left
+            // a session that was quiet when the GUI started with no entry at all,
+            // so it stayed first-sight indefinitely — and its very NEXT TurnEnd
+            // was swallowed as backlog. Every session's first completion after a
+            // restart went unreported, which is the missing "⏎ ready" that got
+            // this looked at.
+            if max_seq > last || first_sight {
                 self.last_persisted_seq.insert(info.id, max_seq);
             }
         }
