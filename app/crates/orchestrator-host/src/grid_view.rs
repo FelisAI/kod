@@ -42,28 +42,85 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-/// One link per run: the URL a run belongs to, or `None`. (OSC-8 `StyleRun.uri`
-/// will take precedence here once slice-3b step 4 adds it; for now it's
-/// regex-only.) Output length == `runs.len()` so the renderer indexes by run idx.
-pub fn row_links(runs: &[StyleRun], plain: &str) -> Vec<Option<String>> {
+/// A row's runs SPLIT so that each one is entirely inside a link or entirely
+/// outside it, paired with the link for each.
+///
+/// It used to answer "does this run overlap a URL?" per run, and its own comment
+/// admitted the consequence: "a URL split across runs makes every covered run
+/// link". The reverse is the one that bit — a plain-text line is normally ONE
+/// run, so a URL anywhere in it marked the whole run, and the renderer
+/// underlined the entire line. Cutting the runs instead keeps the invariant the
+/// renderer already relies on (a run is uniform in style AND in link), so the
+/// underline lands on exactly the URL.
+///
+/// `Cow` because the overwhelming majority of rows contain no link at all: those
+/// take the fast path below and borrow, allocating nothing per frame.
+///
+/// OSC-8 wins where present and is NOT re-cut: the emulator already breaks runs
+/// at hyperlink boundaries, so such a run is exactly the linked text.
+pub fn row_runs_and_links<'a>(
+    runs: &'a [StyleRun],
+    plain: &str,
+) -> (std::borrow::Cow<'a, [StyleRun]>, Vec<Option<String>>) {
     // fast path (most rows): no scheme in the text AND no OSC-8 uri → nothing to
     // link, so skip the full char scan. (Keeps per-frame cost off the common row.)
     if !plain.contains("://") && runs.iter().all(|r| r.uri.is_none()) {
-        return vec![None; runs.len()];
+        return (std::borrow::Cow::Borrowed(runs), vec![None; runs.len()]);
     }
     let urls = detect_urls(plain);
-    let mut out = Vec::with_capacity(runs.len());
+    let mut out_runs: Vec<StyleRun> = Vec::with_capacity(runs.len() + urls.len() * 2);
+    let mut out_links: Vec<Option<String>> = Vec::with_capacity(out_runs.capacity());
+    // a free function, not a closure: a closure capturing both vectors would hold
+    // one mutable borrow for the whole loop, and the OSC-8 arm below pushes too.
+    fn push(
+        runs: &mut Vec<StyleRun>,
+        links: &mut Vec<Option<String>>,
+        run: &StyleRun,
+        chars: &[char],
+        a: usize,
+        b: usize,
+        link: Option<String>,
+    ) {
+        if a >= b {
+            return;
+        }
+        let mut piece = run.clone();
+        piece.text = chars[a..b].iter().collect();
+        runs.push(piece);
+        links.push(link);
+    }
     let mut col = 0usize;
     for run in runs {
-        let len = run.text.chars().count();
-        let (start, end) = (col, col + len);
-        // an OSC-8 hyperlink wins; else the first regex-detected URL whose char-span
-        // overlaps this run (a URL split across runs makes every covered run link).
-        let link = run.uri.clone().or_else(|| urls.iter().find(|(s, e, _)| *s < end && *e > start).map(|(_, _, u)| u.clone()));
-        out.push(link);
+        let chars: Vec<char> = run.text.chars().collect();
+        let (start, end) = (col, col + chars.len());
         col = end;
+        // An OSC-8 run is already exactly the linked text — never re-cut it, and
+        // never let a regex hit inside it split the author's own span.
+        if run.uri.is_some() {
+            out_runs.push(run.clone());
+            out_links.push(run.uri.clone());
+            continue;
+        }
+        if chars.is_empty() {
+            out_runs.push(run.clone());
+            out_links.push(None);
+            continue;
+        }
+        // Cut at every detected URL boundary that falls inside this run. `urls`
+        // arrives in scan order, so `cut` only moves forward.
+        let mut cut = start;
+        for (us, ue, u) in &urls {
+            let (a, b) = ((*us).max(start), (*ue).min(end));
+            if a >= b {
+                continue;
+            }
+            push(&mut out_runs, &mut out_links, run, &chars, cut - start, a - start, None);
+            push(&mut out_runs, &mut out_links, run, &chars, a - start, b - start, Some(u.clone()));
+            cut = b;
+        }
+        push(&mut out_runs, &mut out_links, run, &chars, cut - start, end - start, None);
     }
-    out
+    (std::borrow::Cow::Owned(out_runs), out_links)
 }
 
 /// The URL at grid cell `(row, col)`, or `None`. Mirrors `row_links` /
@@ -75,7 +132,7 @@ pub fn link_at(snap: &GridSnapshot, row: usize, col: usize) -> Option<String> {
     let runs = snap.rows.get(row)?;
     let plains = snap.plain_lines();
     let plain = plains.get(row)?;
-    let links = row_links(runs, plain);
+    let (runs, links) = row_runs_and_links(runs, plain);
     let mut c = 0usize;
     for (i, run) in runs.iter().enumerate() {
         let len = run.text.chars().count();
@@ -263,20 +320,75 @@ mod tests {
         assert_eq!(emoji, vec![(2, 13, "https://a.b".into())]);
     }
 
+    /// Text and link, per run, as `(text, Option<url>)` — the pair the renderer
+    /// walks.
+    fn pairs(runs: &[StyleRun], plain: &str) -> Vec<(String, Option<String>)> {
+        let (rs, ls) = row_runs_and_links(runs, plain);
+        rs.iter().map(|r| r.text.clone()).zip(ls).collect()
+    }
+
+    /// THE BUG: a whole line underlined because a URL sat somewhere in it.
     #[test]
-    fn row_links_maps_runs_to_overlapping_url() {
-        // runs concatenate to "go https://x.io now"
-        let runs = [run("go "), run("https://x.io"), run(" now")];
-        let links = row_links(&runs, "go https://x.io now");
-        assert_eq!(links, vec![None, Some("https://x.io".into()), None]);
-        // a URL split across two runs → both link.
-        let split = [run("https://"), run("x.io")];
-        let l2 = row_links(&split, "https://x.io");
-        assert_eq!(l2, vec![Some("https://x.io".into()), Some("https://x.io".into())]);
-        assert_eq!(row_links(&[run("plain")], "plain"), vec![None]);
-        // OSC-8 uri wins over (and without) any regex match.
-        assert_eq!(row_links(&[run_uri("click", "https://osc8")], "click"), vec![Some("https://osc8".into())]);
-        assert_eq!(row_links(&[run_uri("https://regex", "https://osc8")], "https://regex"), vec![Some("https://osc8".into())]);
+    fn only_the_url_is_linked_not_the_line_it_sits_in() {
+        // The shape that actually ships: uniform styling, so the WHOLE LINE is
+        // one run. It used to come back linked end to end, and the renderer
+        // underlined all of it.
+        assert_eq!(
+            pairs(&[run("go https://x.io now")], "go https://x.io now"),
+            vec![
+                ("go ".into(), None),
+                ("https://x.io".into(), Some("https://x.io".into())),
+                (" now".into(), None),
+            ]
+        );
+
+        // Already-split runs still line up one-to-one.
+        assert_eq!(
+            pairs(&[run("go "), run("https://x.io"), run(" now")], "go https://x.io now"),
+            vec![
+                ("go ".into(), None),
+                ("https://x.io".into(), Some("https://x.io".into())),
+                (" now".into(), None),
+            ]
+        );
+
+        // A URL split across runs by STYLING keeps both halves linked — they are
+        // both inside the URL, which is the case the old per-run test covered.
+        assert_eq!(
+            pairs(&[run("https://"), run("x.io")], "https://x.io"),
+            vec![
+                ("https://".into(), Some("https://x.io".into())),
+                ("x.io".into(), Some("https://x.io".into())),
+            ]
+        );
+
+        // Two URLs in one run, with text between and around.
+        assert_eq!(
+            pairs(&[run("a https://x.io b https://y.io c")], "a https://x.io b https://y.io c"),
+            vec![
+                ("a ".into(), None),
+                ("https://x.io".into(), Some("https://x.io".into())),
+                (" b ".into(), None),
+                ("https://y.io".into(), Some("https://y.io".into())),
+                (" c".into(), None),
+            ]
+        );
+
+        assert_eq!(pairs(&[run("plain")], "plain"), vec![("plain".into(), None)]);
+    }
+
+    #[test]
+    fn an_osc8_run_is_never_recut_and_wins_over_a_regex_hit() {
+        // The emulator already breaks runs at hyperlink boundaries, so such a run
+        // IS the linked text — cutting it again would split the author's own span.
+        assert_eq!(
+            pairs(&[run_uri("click", "https://osc8")], "click"),
+            vec![("click".into(), Some("https://osc8".into()))]
+        );
+        assert_eq!(
+            pairs(&[run_uri("https://regex", "https://osc8")], "https://regex"),
+            vec![("https://regex".into(), Some("https://osc8".into()))]
+        );
     }
 
     #[test]

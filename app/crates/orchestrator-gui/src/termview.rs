@@ -221,25 +221,15 @@ fn link_span(
     col: usize,
     run_end: usize,
     cx: &mut Context<Orchestrator>,
-) -> impl IntoElement {
+) -> AnyElement {
     let u = url.to_string();
     let chars: Vec<char> = run.text.chars().collect();
-    let mut wrap = div()
-        .flex()
-        .flex_row()
-        .id(SharedString::from(format!("lnk-{row_idx}-{run_idx}")))
-        .text_color(rgb(run.fg))
-        .cursor_pointer()
-        .hover(|h| h.text_color(rgb(ACCENT)))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |_this, e: &MouseDownEvent, _w, cx| {
-                if e.modifiers.secondary() {
-                    cx.open_url(&u);
-                    cx.stop_propagation(); // don't also start a row drag-select
-                }
-            }),
-        );
+    let id = SharedString::from(format!("lnk-{row_idx}-{run_idx}"));
+
+    // One piece per selection/search mark intersecting the link, so a selected
+    // sub-range TINTS like any other run — the link used to bypass the mark
+    // splitter entirely, so dragging over a URL showed no highlight.
+    let mut pieces: Vec<Div> = Vec::new();
     for (ps, pe, bg) in grid_view::run_marks(marks, col, run_end) {
         let txt: String = chars
             .get(ps..pe)
@@ -262,9 +252,63 @@ fn link_span(
         if run.italic {
             piece = piece.italic();
         }
+        pieces.push(piece);
+    }
+
+    // ⌘-click opens via this element; a plain click opens via the window mouse-up
+    // handler (which resolves the cell → `grid_view::link_at`), so opening never
+    // depends on this element's hitbox winning over the canvas overlay.
+    // THE COMMON CASE IS ONE PIECE, and it is rendered as a PLAIN text div —
+    // exactly like `span()` — rather than wrapped in a nested flex row.
+    //
+    // The wrapper was unconditional, and a `flex` box among the row's plain text
+    // children does not size to the same line box, so any line containing a link
+    // sat at a different height from its neighbours. Now the wrapper appears only
+    // when a selection has genuinely split the link into several pieces, which is
+    // the only case that needs a container to hold them side by side.
+    if pieces.len() == 1 {
+        let piece = pieces.pop().unwrap_or_else(div);
+        let u1 = u.clone();
+        return piece
+            .id(id)
+            .text_color(rgb(run.fg))
+            .cursor_pointer()
+            .hover(|h| h.text_color(rgb(ACCENT)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_this, e: &MouseDownEvent, _w, cx| {
+                    if e.modifiers.secondary() {
+                        cx.open_url(&u1);
+                        cx.stop_propagation(); // don't also start a row drag-select
+                    }
+                }),
+            )
+            .into_any_element();
+    }
+
+    // Split by a selection: the pieces need a row to sit in. They omit their own
+    // fg so they INHERIT the wrapper's colour — that is what makes hover recolour
+    // the WHOLE link rather than the piece under the pointer.
+    let mut wrap = div()
+        .flex()
+        .flex_row()
+        .id(id)
+        .text_color(rgb(run.fg))
+        .cursor_pointer()
+        .hover(|h| h.text_color(rgb(ACCENT)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |_this, e: &MouseDownEvent, _w, cx| {
+                if e.modifiers.secondary() {
+                    cx.open_url(&u);
+                    cx.stop_propagation();
+                }
+            }),
+        );
+    for piece in pieces {
         wrap = wrap.child(piece);
     }
-    wrap
+    wrap.into_any_element()
 }
 
 /// The grid render — fixed-width font, one div per row. `rows_visible` clamps how
@@ -305,7 +349,9 @@ pub fn render_grid(
     let q: Vec<char> = query.chars().collect();
     for (i, runs) in snap.rows.iter().enumerate().skip(start) {
         let plain = plains.get(i).map(|s| s.as_str()).unwrap_or("");
-        let links = grid_view::row_links(runs, plain);
+        // runs SPLIT at link boundaries, so a URL in a plain-text line no longer
+        // underlines the whole line — see `row_runs_and_links`.
+        let (runs, links) = grid_view::row_runs_and_links(runs, plain);
         let hl = grid_view::row_highlight(sel, i, plain.chars().count());
         // verify-before-paint: only ranges whose text STILL matches the query
         // (ascii-ci) are painted — stale anchors self-heal instead of smearing.
@@ -329,7 +375,7 @@ pub fn render_grid(
         }
         let marks = grid_view::row_marks(hl, SELECT_BG, &ranges, SEARCH_BG, current, SEARCH_CUR_BG);
         col = col.child(render_row(
-            runs,
+            &runs,
             i,
             snap.cursor,
             snap.cursor_visible,
