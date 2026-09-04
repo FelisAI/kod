@@ -165,6 +165,96 @@ impl Orchestrator {
     }
 
 
+
+    /// One ⏎ row: a session that finished a turn while you were elsewhere, what
+    /// it said, and how long it has been waiting.
+    /// One ⏎ row: a session that finished a turn while you were elsewhere, what
+    /// it said, and how long it has been waiting.
+    fn ready_row(
+        &self,
+        name: String,
+        info: &SessionInfo,
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // The wait is the POINT of this row, so it is the thing on the right
+        // rather than a phase word every row would share.
+        let waited = self
+            .session_ready_since(info.id)
+            .map(|t| crate::timefmt::ago_label(now_ms.saturating_sub(t)))
+            .unwrap_or_default();
+        let (jslug, jid) = (info.project_slug.clone(), info.id);
+            div()
+                .id(SharedString::from(format!("ready-{}", info.id.0)))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(7.))
+                .rounded(px(9.))
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(HAIR))
+                .cursor_pointer()
+                .hover(|h| h.border_color(rgb(0x346B54)))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(14.))
+                        .text_size(px(11.))
+                        .text_color(rgb(ACCENT))
+                        .child("⏎"),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(150.))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_STRONG))
+                        .child(SharedString::from(termview::session_label(&info))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(px(110.))
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(rgb(MUTED2))
+                        .child(SharedString::from(name)),
+                )
+                // WHAT IT SAID. Without this the row named a session and
+                // a wait and left you to open it to find out whether it
+                // mattered — while the same sentence sat one tier below
+                // under ▲ WHAT HAPPENED. Now it is here, on the row that
+                // can act on it.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(rgb(TEXT))
+                        .child(SharedString::from(termview::trim(
+                            info.last_message.trim(),
+                            150,
+                        ))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED2))
+                        .child(SharedString::from(format!("ready {waited}"))),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.focus_session(&jslug, jid, window, cx)
+                }))
+            .into_any_element()
+    }
+
     /// A pill telling the user whether sessions survive a restart — green when
     /// the daemon is attached, a LOUD amber warning on a silent in-process
     /// fallback (dogfooding: invisible daemon = the feature "doesn't exist").
@@ -414,129 +504,13 @@ impl Orchestrator {
             }
             feed = feed.child(tier);
         }
-        // ── ⏎ READY — finished a turn while you were elsewhere, waiting on your
-        // next instruction.
-        //
-        // The state for this always existed (`sess_unreviewed`, set on TurnEnd and
-        // deliberately not on the Busy→Idle edge, which fires between every tool
-        // call). Its ENTIRE surfacing was one step on a rail brightness ladder, so
-        // the only way to find out a session was waiting was to remember to go and
-        // look — which is the overhead this screen exists to remove.
-        //
-        // Below ⚠ NEEDS YOU on purpose: a session sitting on a permission prompt
-        // is blocked and cannot proceed without you, while a finished turn is
-        // merely your move. Both are "you", in that order.
-        // The cli-session ids in READY. ▲ WHAT HAPPENED drops their summaries
-        // below: a finished turn is now reported ONCE, on the row that can act on
-        // it, instead of twice — as a ready session here and as project news one
-        // tier down, a beat apart and phrased differently.
+        // The cli-session ids waiting on you. ▲ WHAT HAPPENED drops their
+        // summaries below, so a finished turn is reported ONCE — on the row that
+        // can act on it.
         let ready_sess: std::collections::HashSet<String> = ready
             .iter()
             .filter_map(|(_, i)| i.cli_session_id.clone())
             .collect();
-        if ready_n > 0 {
-            let now_ms = crate::render_sidebar::wall_now_ms();
-            let mut tier = div()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(7.))
-                        .text_size(px(11.5))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(ACCENT))
-                        .child("⏎ READY")
-                        .child(
-                            div()
-                                .text_color(rgb(MUTED2))
-                                .child(SharedString::from(ready_n.to_string())),
-                        ),
-                );
-            for (name, info) in ready {
-                // The wait is the POINT of this row, so it is the thing on the
-                // right rather than a phase word every row would share.
-                let waited = self
-                    .session_ready_since(info.id)
-                    .map(|t| crate::timefmt::ago_label(now_ms.saturating_sub(t)))
-                    .unwrap_or_default();
-                let (jslug, jid) = (info.project_slug.clone(), info.id);
-                tier = tier.child(
-                    div()
-                        .id(SharedString::from(format!("ready-{}", info.id.0)))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(10.))
-                        .px(px(12.))
-                        .py(px(7.))
-                        .rounded(px(9.))
-                        .bg(rgb(PANEL))
-                        .border_1()
-                        .border_color(rgb(HAIR))
-                        .cursor_pointer()
-                        .hover(|h| h.border_color(rgb(0x346B54)))
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(14.))
-                                .text_size(px(11.))
-                                .text_color(rgb(ACCENT))
-                                .child("⏎"),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(150.))
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(12.5))
-                                .text_color(rgb(TEXT_STRONG))
-                                .child(SharedString::from(termview::session_label(&info))),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .max_w(px(110.))
-                                .truncate()
-                                .text_size(px(11.5))
-                                .text_color(rgb(MUTED2))
-                                .child(SharedString::from(name)),
-                        )
-                        // WHAT IT SAID. Without this the row named a session and
-                        // a wait and left you to open it to find out whether it
-                        // mattered — while the same sentence sat one tier below
-                        // under ▲ WHAT HAPPENED. Now it is here, on the row that
-                        // can act on it.
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(12.))
-                                .text_color(rgb(TEXT))
-                                .child(SharedString::from(termview::trim(
-                                    info.last_message.trim(),
-                                    150,
-                                ))),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(11.))
-                                .text_color(rgb(MUTED2))
-                                .child(SharedString::from(format!("ready {waited}"))),
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.focus_session(&jslug, jid, window, cx)
-                        })),
-                );
-            }
-            feed = feed.child(tier);
-        }
         // ── ▲ WHAT HAPPENED — the standup proper.
         //
         // This was TWO tiers (▲ UPDATED + ▦ PORTFOLIO), both keyed on rollup
@@ -607,7 +581,7 @@ impl Orchestrator {
             // the tier silently vanishing — which is indistinguishable from the
             // standup being broken. Before a first check there is nothing
             // truthful to say, so it stays away.
-            if !plan.is_empty() || self.standup_divider_ms > 0 {
+            if ready_n > 0 || !plan.is_empty() || self.standup_divider_ms > 0 {
                 let mut tier = div()
                     .flex()
                     .flex_col()
@@ -633,19 +607,54 @@ impl Orchestrator {
                                     crate::timefmt::age_ms_since(self.standup_divider_ms, now_ms),
                                 );
                                 let n = plan.projects.len();
+                                // Ready leads, because it is the half you can do
+                                // something about.
+                                let mut bits: Vec<String> = Vec::new();
+                                if ready_n > 0 {
+                                    bits.push(format!("{ready_n} ready for you"));
+                                }
+                                if self.standup_divider_ms == 0 {
+                                    bits.push("first look".to_string());
+                                } else if n > 0 {
+                                    bits.push(format!("{n} new since you last looked, {seen}"));
+                                } else if ready_n == 0 {
+                                    bits.push(format!("nothing new since you last looked, {seen}"));
+                                }
                                 div()
                                     .font_weight(FontWeight::NORMAL)
                                     .text_size(px(10.5))
-                                    .text_color(rgb(if n > 0 { ACCENT } else { MUTED2 }))
-                                    .child(SharedString::from(if self.standup_divider_ms == 0 {
-                                        "· first look".to_string()
-                                    } else if n > 0 {
-                                        format!("· {n} new since you last looked, {seen}")
+                                    .text_color(rgb(if ready_n > 0 || n > 0 {
+                                        ACCENT
                                     } else {
-                                        format!("· nothing new since you last looked, {seen}")
+                                        MUTED2
                                     }))
+                                    .child(SharedString::from(format!("· {}", bits.join(" · "))))
                             }),
                     );
+                // ONE GROUP, TWO SECTIONS.
+                //
+                // ⏎ READY used to be its own tier above this one, which read as a
+                // separate feature rather than as what it is: the part of "what
+                // happened" you can act on. Same group, split once — the sessions
+                // waiting on you, then everything else that changed and wants
+                // nothing.
+                //
+                // The sub-headings appear ONLY when both halves have content. A
+                // heading over the only thing on screen names nothing, and this
+                // screen has enough chrome.
+                let split = ready_n > 0 && !plan.is_empty();
+                if ready_n > 0 {
+                    if split {
+                        tier = tier.child(sub_heading("READY FOR YOU", ACCENT));
+                    }
+                    let ready_now = crate::render_sidebar::wall_now_ms();
+                    for (name, info) in ready {
+                        tier = tier.child(self.ready_row(name, &info, ready_now, cx));
+                    }
+                    if split {
+                        tier = tier.child(sub_heading("NOTHING TO ACT ON", MUTED2));
+                    }
+                }
                 // No NEW bar: the header already says "{n} new since you last
                 // looked", and a heading that repeats the line above it is chrome.
                 for pp in &plan.projects {
@@ -1634,6 +1643,22 @@ pub(crate) fn standup_thread_hint(summaries_on: bool, _thread_empty: bool) -> Op
 /// always yields the same line. `working` is derived-building over stored link
 /// recency (the alive-stamp is a live-view concern); `drifted` is a live-only
 /// signal, so it stays 0 here (the map view carries it). `None` = no parts yet.
+
+/// A section label INSIDE a tier — lighter than a tier heading, because it
+/// divides one group rather than announcing another.
+fn sub_heading(text: &'static str, color: u32) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .pt(px(4.))
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(color))
+        .child(text)
+        .child(div().flex_1().h(px(1.)).bg(rgb(HAIR_SOFT)))
+}
 
 /// The standup's one grey line (pure — no store, no window).
 #[cfg(test)]
