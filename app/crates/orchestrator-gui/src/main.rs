@@ -1283,6 +1283,18 @@ impl Orchestrator {
         cx.notify();
     }
 
+    /// Clear a session's ⏎ ready flag WITHOUT opening it.
+    ///
+    /// The only way to clear one used to be to open the session, which forces the
+    /// context switch this screen exists to save: you read the one line the row
+    /// carries, decide it needs nothing, and still have to go there to make it
+    /// stop asking. Dismissing is the same claim opening makes — "I have seen
+    /// this" — minus the trip.
+    pub(crate) fn dismiss_ready(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.sess_unreviewed.remove(&id);
+        cx.notify();
+    }
+
     /// Stamp a project as READ — persisted, plus the in-memory cache so the
     /// rail's unread cue and the standup's FRESH border clear in the same frame.
     ///

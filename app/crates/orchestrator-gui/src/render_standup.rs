@@ -26,7 +26,6 @@ impl Orchestrator {
         // No `fresh` any more: every project the planner hands back is one you
         // have NOT seen, so a "read" variant of this card would be unreachable.
         let (count, hidden) = (p.total, p.hidden_lines);
-        let jslug = p.key.clone();
         let lead = p
             .lines
             .first()
@@ -101,13 +100,37 @@ impl Orchestrator {
                         )
                     })),
             )
+            // EXPLICIT ACTIONS. "open ▸" was a LABEL — it looked like a button,
+            // did nothing, and the real control was the whole card, so reading a
+            // block risked being pulled into a project. And the useful one was
+            // missing: a block you have read and want gone meant opening the
+            // project just to make it stop reporting.
             .child(
-                div()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .text_size(px(10.5))
-                    .text_color(rgb(MUTED2))
-                    .child("open ▸"),
+                card_action(
+                    SharedString::from(format!("upd-open-{}", p.key)),
+                    "open ▸",
+                    ACCENT,
+                )
+                .on_click(cx.listener({
+                    let k = p.key.clone();
+                    move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                        this.select_project(&k, cx)
+                    }
+                })),
+            )
+            .child(
+                card_action(
+                    SharedString::from(format!("upd-read-{}", p.key)),
+                    "mark read",
+                    TEXT,
+                )
+                .on_click(cx.listener({
+                    let k = p.key.clone();
+                    move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                        this.mark_project_read(&k);
+                        cx.notify();
+                    }
+                })),
             );
 
         let mut card = div()
@@ -121,7 +144,6 @@ impl Orchestrator {
             .bg(rgb(PANEL))
             .border_1()
             .border_color(rgb(0x346B54))
-            .cursor_pointer()
             .hover(|h| h.border_color(rgb(0x36404A)))
             .child(head);
         for text in lines {
@@ -141,7 +163,7 @@ impl Orchestrator {
                     .child(SharedString::from(text)),
             );
         }
-        if !digest && hidden > 0 {
+        if hidden > 0 {
             // CLICKABLE. A count you cannot open is a complaint, not a control —
             // "+53 more" told you what you were missing and gave you no way to
             // see it. `stop_propagation` so opening the block does not also
@@ -164,9 +186,7 @@ impl Orchestrator {
                     })),
             );
         }
-        card.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.select_project(&jslug, cx)
-        }))
+        card
     }
 
 
@@ -201,7 +221,6 @@ impl Orchestrator {
                 .bg(rgb(PANEL))
                 .border_1()
                 .border_color(rgb(HAIR))
-                .cursor_pointer()
                 .hover(|h| h.border_color(rgb(0x346B54)))
                 .child(
                     div()
@@ -257,9 +276,34 @@ impl Orchestrator {
                         .text_color(rgb(MUTED2))
                         .child(SharedString::from(format!("ready {waited}"))),
                 )
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.focus_session(&jslug, jid, window, cx)
-                }))
+                // EXPLICIT ACTIONS, and the body no longer navigates.
+                //
+                // The whole row used to be one click target that opened the
+                // session, which makes reading the row a risk: you click to look
+                // and get pulled out of whatever you were doing. And the action
+                // most worth having was missing entirely — clearing a row you have
+                // read and decided needs nothing meant opening it anyway, which is
+                // the context switch this screen exists to save.
+                .child(
+                    card_action(
+                        SharedString::from(format!("ready-open-{}", info.id.0)),
+                        "open ▸",
+                        ACCENT,
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.focus_session(&jslug, jid, window, cx)
+                    })),
+                )
+                .child(
+                    card_action(
+                        SharedString::from(format!("ready-dismiss-{}", info.id.0)),
+                        "dismiss",
+                        TEXT,
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.dismiss_ready(jid, cx)
+                    })),
+                )
             .into_any_element()
     }
 
@@ -1651,6 +1695,28 @@ pub(crate) fn standup_thread_hint(summaries_on: bool, _thread_empty: bool) -> Op
 /// always yields the same line. `working` is derived-building over stored link
 /// recency (the alive-stamp is a live-view concern); `drifted` is a live-only
 /// signal, so it stays 0 here (the map view carries it). `None` = no parts yet.
+
+/// A small text action on a card. Plain words, not icons: these rows already
+/// carry a glyph, a name, a project, a sentence and a clock, and a row of
+/// unlabelled symbols on top of that is a puzzle rather than a control.
+fn card_action(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    tint: u32,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .whitespace_nowrap()
+        .px(px(6.))
+        .py(px(2.))
+        .rounded(px(5.))
+        .cursor_pointer()
+        .text_size(px(10.5))
+        .text_color(rgb(MUTED2))
+        .hover(|h| h.text_color(rgb(tint)).bg(rgb(CARD2)))
+        .child(label)
+}
 
 /// A section label INSIDE a tier — lighter than a tier heading, because it
 /// divides one group rather than announcing another.
