@@ -1182,7 +1182,6 @@ mod tests {
     fn limit(hit: bool, percent: Option<u8>, clock: &str) -> UsageLimit {
         UsageLimit {
             hit,
-            window: orchestrator_host::usage_limit::LimitWindow::Unknown,
             percent,
             reset_clock: clock.to_string(),
             reset_tz: String::new(),

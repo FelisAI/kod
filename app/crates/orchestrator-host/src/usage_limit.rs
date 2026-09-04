@@ -20,28 +20,6 @@ use crate::session::AC_GIVEUP_MS;
 /// and must survive an idle window, because auto-continue (slice 2) wakes on
 /// the reset. Owned strings (not `Copy`) so it can carry the reset clock +
 /// IANA zone verbatim.
-fn unknown_window() -> LimitWindow {
-    LimitWindow::Unknown
-}
-
-/// WHICH allowance a block is against.
-///
-/// Different in KIND, not degree, which is why it is worth carrying: a session
-/// window reopens in hours and — depending on plan and CLI version — can be reset
-/// on the spot, while a weekly one is days out and cannot. "You are blocked" is
-/// the same sentence for both and the right response is not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum LimitWindow {
-    /// the rolling 5-hour session allowance.
-    Session,
-    /// the weekly allowance. Its banner is the one that prints a calendar DATE.
-    Weekly,
-    /// the banner named no window — a credit cap, or a bare "you've hit your
-    /// limit". NEVER guessed into one of the above: offering a session-limit
-    /// remedy for a block that is not one is worse than offering nothing.
-    Unknown,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageLimit {
     /// true = hard block ("You've hit your session limit"); false = the benign
@@ -65,11 +43,6 @@ pub struct UsageLimit {
     /// (or codex's raw `resets_at`). `None` when the banner carried no parseable
     /// time or zone — auto-continue can only arm when this is `Some`.
     pub reset_at_unix: Option<i64>,
-    /// Which allowance this is against — see [`LimitWindow`]. Read from the word
-    /// claude prints between "hit your" and "limit", with the weekly banner's
-    /// calendar date as a second witness.
-    #[serde(default = "unknown_window")]
-    pub window: LimitWindow,
     /// wall-clock ms the banner was FIRST observed — the GUI ticks the age
     /// locally (timestamps over prose, design critique #4).
     pub since_ms: u64,
@@ -271,24 +244,6 @@ pub fn parse_usage_limit(text: &str, now_ms: u64) -> Option<UsageLimit> {
             rest.split(['·', '\n']).next().unwrap_or(rest).contains("limit")
         });
     let hit = hit_window || credit_cap;
-    // WHICH window. Read from the clause after "hit your" / "reached your" — the
-    // same narrow clause the hit itself is gated on, so a "weekly" appearing in
-    // an unrelated later sentence cannot relabel a session block. `reset_date` is
-    // a second witness: only the weekly banner prints a calendar date.
-    let window = {
-        let clause = ["hit your", "reached your"]
-            .iter()
-            .find_map(|k| lower.split_once(k).map(|(_, rest)| rest))
-            .map(|rest| rest.split(['·', '\n']).next().unwrap_or(rest))
-            .unwrap_or("");
-        if clause.contains("session") {
-            LimitWindow::Session
-        } else if clause.contains("week") {
-            LimitWindow::Weekly
-        } else {
-            LimitWindow::Unknown
-        }
-    };
     // the benign warning form: "used N%" / "approaching … limit".
     let warning = (lower.contains("used") || lower.contains("approaching")) && lower.contains("limit");
     if !hit && !warning {
@@ -301,7 +256,6 @@ pub fn parse_usage_limit(text: &str, now_ms: u64) -> Option<UsageLimit> {
     let reset_at_unix = banner_reset_instant(&reset_clock, &reset_date, &reset_tz, now_ms);
     Some(UsageLimit {
         hit,
-        window,
         percent,
         reset_clock,
         reset_date,
@@ -643,18 +597,6 @@ impl crate::transcript::CodexRateLimits {
             .unwrap_or_default();
         Some(UsageLimit {
             hit,
-            // Codex reports the window's real DURATION, so this is measured
-            // rather than inferred from which slot it arrived in — `primary` is
-            // not documented anywhere to be the short one. The split is at a day
-            // because the two windows in play are ~5 hours and a week; nothing
-            // sits near the boundary, so a wrong answer would take a genuinely
-            // new window shape rather than a borderline one.
-            window: match src.map(|w| w.window_minutes) {
-                Some(m) if m == 0 => LimitWindow::Unknown,
-                Some(m) if m <= 24 * 60 => LimitWindow::Session,
-                Some(_) => LimitWindow::Weekly,
-                None => LimitWindow::Unknown,
-            },
             percent: Some(percent),
             reset_clock,
             reset_date: String::new(),
@@ -801,46 +743,10 @@ mod tests {
 
     /// The display helpers claude parity leans on: a live countdown off
     /// `reset_at_unix` and the weekly-date label off `reset_date` — both pure.
-    /// A session block and a weekly block are the same sentence today and the
-    /// right response is not: one reopens in hours (and, on some plans and CLI
-    /// versions, can be reset on the spot), the other is days out and cannot.
-    #[test]
-    fn a_session_block_and_a_weekly_block_are_told_apart() {
-        let now = 1_788_200_000_000u64;
-        let w = |t: &str| parse_usage_limit(t, now).map(|u| u.window);
-
-        assert_eq!(
-            w("You've hit your session limit \u{b7} resets 2:20pm (America/Los_Angeles)"),
-            Some(LimitWindow::Session)
-        );
-        assert_eq!(
-            w("You've hit your weekly limit \u{b7} resets Jun 5 at 7am (America/Los_Angeles)"),
-            Some(LimitWindow::Weekly)
-        );
-        assert_eq!(w("you have reached your weekly usage limit"), Some(LimitWindow::Weekly));
-
-        // NEVER GUESSED. A bare block names no window, and a credit cap is not a
-        // window at all — offering a session-limit remedy for either would be
-        // worse than offering nothing.
-        assert_eq!(w("You've hit your limit"), Some(LimitWindow::Unknown));
-        assert_eq!(
-            w("You've reached your Opus limit. Run /usage-credits to add more."),
-            Some(LimitWindow::Unknown)
-        );
-
-        // Read from the SAME narrow clause the hit is gated on, so a "weekly"
-        // in a later sentence cannot relabel a session block.
-        assert_eq!(
-            w("You've hit your session limit \u{b7} your weekly limit is unaffected"),
-            Some(LimitWindow::Session)
-        );
-    }
-
     #[test]
     fn reset_countdown_and_label_format() {
         let mk = |reset_at: Option<i64>, date: &str, clock: &str| UsageLimit {
             hit: true,
-            window: LimitWindow::Unknown,
             percent: None,
             reset_clock: clock.into(),
             reset_tz: String::new(),
@@ -1006,7 +912,6 @@ mod tests {
     fn limit(hit: bool, since_ms: u64, reset_at_unix: Option<i64>) -> UsageLimit {
         UsageLimit {
             hit,
-            window: LimitWindow::Unknown,
             percent: None,
             reset_clock: "4:30pm".into(),
             reset_date: String::new(),

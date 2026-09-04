@@ -23,7 +23,7 @@ use crate::session::{CliKind, SessionId};
 /// Bumped by hand whenever any wire type below changes shape. The client sends
 /// it in `Hello`; the daemon rejects a mismatch so a freshly-rebuilt GUI never
 /// talks to an incompatible older daemon (docs/018 §13).
-pub const WIRE_VERSION: u32 = 26; // …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS); 26: UsageLimit.window (session vs weekly)
+pub const WIRE_VERSION: u32 = 25; // …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS)
 
 /// Reject absurd frame lengths (a corrupt/foreign peer) before allocating.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -546,7 +546,6 @@ mod tests {
         });
         i.usage_limit = Some(crate::session::UsageLimit {
             hit: true,
-            window: crate::usage_limit::LimitWindow::Unknown,
             percent: Some(92),
             reset_clock: "4:30pm".into(),
             reset_date: String::new(),
@@ -880,7 +879,7 @@ mod tests {
     /// the change must be a CONSCIOUS act paired with a WIRE_VERSION bump.
     #[test]
     fn protocol_hash_is_stable() {
-        const PROTOCOL_HASH: u64 = 0x747ce9c8dc2531ed; // WIRE_VERSION 26
+        const PROTOCOL_HASH: u64 = 0xdf8263516e4e6d5f; // WIRE_VERSION 25
         let got = fnv1a(&protocol_corpus());
         assert_eq!(
             got, PROTOCOL_HASH,
