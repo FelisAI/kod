@@ -343,11 +343,13 @@ pub(crate) const AC_GIVEUP_MS: i64 = 6 * 3600 * 1000;
 /// nothing anywhere reporting why. That is what it did in the wild, on
 /// Claude Code 2.1.258. Captured from a real blocked session:
 ///
+/// ```text
 ///     ⎿  You've hit your session limit · resets 2:20pm (America/Los_Angeles)
 ///        /login to switch to an API usage-billed account.
 ///
 ///     ✻ Crunched for 5m 40s · done 1:05 PM
 ///     <claude's input composer: a multi-row bordered box + a hint line>
+/// ```
 ///
 /// The banner is ordinary conversation output, NOT the pinned footer the older
 /// comments here assumed, so the composer alone pushes it past six rows. The

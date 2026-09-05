@@ -97,6 +97,7 @@ fn claude_args(
     settings: &Path,
     cwd: &Path,
     caller: &[String],
+    effort: &str,
     prompt: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -105,6 +106,7 @@ fn claude_args(
         "--settings".to_string(),
         settings.to_string_lossy().into_owned(),
     ];
+    args.extend(effort_cli_args(effort));
     args.extend(caller.iter().cloned());
     args.push("--add-dir".to_string());
     args.push(cwd.to_string_lossy().into_owned());
@@ -113,6 +115,29 @@ fn claude_args(
         args.push(p.to_string());
     }
     args
+}
+
+/// The effort levels the per-session settings file cannot carry.
+///
+/// `effortLevel` in settings.json is allowlisted to low/medium/high/xhigh (see
+/// `Ingress::effort_fragment`). "max" is documented only on the CLI —
+/// `--effort <level>  Effort level for the current session (low, medium, high,
+/// xhigh, max)`, read straight off 2.1.261's own `--help` — so it rides argv.
+///
+/// Deliberately NOT moving the other four onto this flag as well. The flag is
+/// documented for all five, but the settings-file path is the one currently
+/// shipping and working; swapping four working levels onto a different
+/// mechanism to gain a fifth trades a known-good for an untested one. One
+/// verified route each.
+///
+/// Placed BEFORE the caller's own args so an explicit `--effort` from a profile
+/// still wins.
+fn effort_cli_args(effort: &str) -> Vec<String> {
+    if effort == "max" {
+        vec!["--effort".to_string(), "max".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The argv for `codex resume` — caller args ride BEFORE the subcommand,
@@ -192,6 +217,7 @@ impl SessionHost {
             &settings,
             &spec.cwd,
             &caller,
+            &spec.effort,
             // Dispatch delivery (docs/011 WIRE): the prompt rides as the FINAL
             // positional argv element.
             Some(&spec.initial_prompt),
@@ -226,7 +252,15 @@ impl SessionHost {
             spec.program = "claude".into();
             let caller = std::mem::take(&mut spec.args);
             // deliberately IGNORES spec.initial_prompt — resume replays history.
-            spec.args = claude_args("--resume", session_id, &settings, &spec.cwd, &caller, None);
+            spec.args = claude_args(
+                "--resume",
+                session_id,
+                &settings,
+                &spec.cwd,
+                &caller,
+                &spec.effort,
+                None,
+            );
             // (no --permission-mode — inherit the user's global mode, see spawn_claude)
             let session = HostedSession::spawn(
                 id,
@@ -857,6 +891,37 @@ mod tests {
     // could pass while the flag never reached the process.
 
     #[test]
+    /// "max" is the one level the settings FILE cannot carry, so it has to
+    /// reach claude on argv — and it must not disturb anything else.
+    #[test]
+    fn max_effort_rides_argv_and_the_others_do_not() {
+        let build = |eff: &str| {
+            claude_args(
+                "--session-id",
+                "s",
+                Path::new("/s.json"),
+                Path::new("/repo"),
+                &[],
+                eff,
+                None,
+            )
+        };
+        let max = build("max");
+        let i = max.iter().position(|a| a == "--effort").expect("--effort missing");
+        assert_eq!(max[i + 1], "max");
+        // BEFORE --add-dir, and before any caller args, so a profile's own
+        // --effort still wins by coming later.
+        assert!(i < max.iter().position(|a| a == "--add-dir").unwrap());
+
+        for eff in ["", "high", "xhigh", "ultracode", "junk"] {
+            assert!(
+                !build(eff).contains(&"--effort".to_string()),
+                "{eff:?} must stay on the settings-file path"
+            );
+        }
+    }
+
+    #[test]
     fn claude_argv_keeps_caller_args_and_pins_add_dir_last() {
         let args = claude_args(
             "--session-id",
@@ -864,6 +929,7 @@ mod tests {
             Path::new("/s.json"),
             Path::new("/repo"),
             &["--model".to_string(), "opus".to_string(), "-v".to_string()],
+            "",
             None,
         );
         assert_eq!(
@@ -891,6 +957,7 @@ mod tests {
             Path::new("/s.json"),
             Path::new("/repo"),
             &["--model".to_string(), "opus".to_string()],
+            "",
             Some("go build it"),
         );
         assert_eq!(
@@ -905,6 +972,7 @@ mod tests {
             Path::new("/s.json"),
             Path::new("/repo"),
             &[],
+            "",
             Some(""),
         );
         assert!(!plain.iter().any(|a| a == "--"));
@@ -918,6 +986,7 @@ mod tests {
             Path::new("/s.json"),
             Path::new("/repo"),
             &["--model".to_string(), "opus".to_string()],
+            "",
             None,
         );
         assert_eq!(&args[..2], &["--resume", "abc"]);

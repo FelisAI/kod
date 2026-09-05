@@ -85,8 +85,13 @@ impl HookIngress {
 
     /// The settings fragment for a default effort. "ultracode" is a MODE flag
     /// (xhigh + workflow orchestration), the rest are effortLevel values.
-    /// Allowlisted: anything else (incl. "" and stale values like "max", which
-    /// settings.json rejects) contributes nothing.
+    /// Allowlisted: anything else contributes nothing.
+    ///
+    /// "max" is deliberately absent and NOT a stale value: it is a real level
+    /// (`claude --effort` documents low/medium/high/xhigh/max) that this file's
+    /// `effortLevel` key is not known to accept, so it reaches claude on argv
+    /// instead — see `host::effort_cli_args`. Adding it here as well would be
+    /// two mechanisms racing for one setting.
     fn effort_fragment(effort: &str) -> &'static str {
         match effort {
             "ultracode" => "\n  \"ultracode\": true,",

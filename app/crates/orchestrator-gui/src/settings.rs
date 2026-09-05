@@ -576,11 +576,14 @@ impl Orchestrator {
     /// Sessions — what every session Kod starts inherits (default claude effort)
     /// and how loudly a session asks for you (needs-you toast lifetime).
     fn render_settings_sessions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // (SpawnSpec.effort value, label, note) — "" = off. Applied host-side in
-        // the per-session --settings file; "ultracode" is the mode flag, the
-        // rest are effortLevel values (settings.json rejects "max"/"auto").
+        // (SpawnSpec.effort value, label, note) — "" = off. Applied host-side:
+        // "ultracode" is a mode flag and the middle levels are `effortLevel` in
+        // the per-session --settings file, while "max" rides `--effort` on argv
+        // (see `host::effort_cli_args`) because the settings key is allowlisted
+        // to low/medium/high/xhigh. Both routes end up in the same place.
         let cur = self.claude_effort.clone();
-        let opts: [(&str, &str, &str); 4] = [
+        let opts: [(&str, &str, &str); 5] = [
+            ("max", "Max", "the highest level claude offers"),
             (
                 "ultracode",
                 "Ultracode",
