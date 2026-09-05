@@ -217,38 +217,52 @@ pub(crate) fn plan_updates(
         .map(|key| {
             let mut evs = by_key.remove(&key).unwrap_or_default();
             evs.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
-            // ONE LINE PER THREAD, not per turn.
+            let newest_ms = evs.first().map(|e| e.ts_ms).unwrap_or(0);
+            // `total` is EVERY update since the floor — the turns, not the
+            // threads. It is what the row's count reports and what the expander
+            // subtracts from, so "12 updates" and "11 more" describe the same
+            // set the timeline below shows.
+            let total = evs.len();
+            let plan_ev = |e: &&TimelineEvent| PlannedEvent {
+                kind: e.kind.clone(),
+                text: e.text.clone(),
+                ts_ms: e.ts_ms,
+            };
+            // COLLAPSED: ONE LINE PER THREAD. EXPANDED: EVERY TURN.
             //
             // The summariser writes a fresh summary every turn: measured, a
             // single session produced 54 summaries over 34.7 hours — one every
-            // 39 minutes. Those are not 54 updates, they are one session's state
-            // restated 54 times, and treating them as events is what produced a
-            // block reading "+56 more". Keeping only the NEWEST per session
-            // turns that project into one line saying where it actually got to.
+            // 39 minutes. Those are not 54 things that happened, they are one
+            // session's state restated 54 times, and listing them by default is
+            // what produced a block reading "+56 more". So the quiet default
+            // still shows only where each session GOT TO.
+            //
+            // But the older turns used to be dropped HERE, before any capping,
+            // which meant no control could ever reach them — expanding a row
+            // could only ever reveal other SESSIONS, never a session's own
+            // history. Now the collapse is a view, not a filter: the full list
+            // survives, and the expander shows it.
             //
             // Events with no session (map batches) never collapse — they have no
             // thread to be the latest of.
-            let mut seen_thread: std::collections::HashSet<(u8, &str)> =
-                std::collections::HashSet::new();
-            evs.retain(|e| {
-                if e.sess.is_empty() {
-                    return true;
-                }
-                seen_thread.insert((kind_ord(&e.kind), e.sess.as_str()))
-            });
-            let newest_ms = evs.first().map(|e| e.ts_ms).unwrap_or(0);
+            let lines: Vec<PlannedEvent> = if is_expanded(&key) {
+                evs.iter().map(plan_ev).collect()
+            } else {
+                let mut seen_thread: std::collections::HashSet<(u8, &str)> =
+                    std::collections::HashSet::new();
+                evs.iter()
+                    .filter(|e| {
+                        e.sess.is_empty()
+                            || seen_thread.insert((kind_ord(&e.kind), e.sess.as_str()))
+                    })
+                    .map(plan_ev)
+                    .collect()
+            };
             PlannedProject {
                 key,
                 newest_ms,
-                total: evs.len(),
-                lines: evs
-                    .iter()
-                    .map(|e| PlannedEvent {
-                        kind: e.kind.clone(),
-                        text: e.text.clone(),
-                        ts_ms: e.ts_ms,
-                    })
-                    .collect(),
+                total,
+                lines,
                 hidden_lines: 0,
             }
         })
@@ -285,8 +299,11 @@ pub(crate) fn plan_updates(
             p.hidden_lines = 0;
             continue;
         }
-        p.hidden_lines = p.total.saturating_sub(keep);
         p.lines.truncate(keep);
+        // Against what is SHOWN, not against `keep`. A single session with 12
+        // turns collapses to ONE line, so `total - keep` would have promised
+        // "9 more" while 11 were actually out of sight.
+        p.hidden_lines = p.total.saturating_sub(p.lines.len());
     }
 
     UpdatePlan {
@@ -576,18 +593,32 @@ mod tests {
         e
     }
 
+    /// COLLAPSED it still says one line; EXPANDED it says all of them.
+    ///
+    /// MEASURED: one real session produced 54 summaries over 34.7h — one every
+    /// 39 minutes. That is a rolling status, not 54 things that happened, so the
+    /// quiet default must still be the single latest line. What changed is that
+    /// the other 53 are no longer DROPPED: they used to be filtered out before
+    /// any capping, so no control could reach them and the row truthfully
+    /// reported "nothing to expand" while 53 turns sat in the timeline below.
     #[test]
-    fn one_session_restating_itself_collapses_to_its_latest() {
-        // MEASURED: one real session produced 54 summaries over 34.7h — one
-        // every 39 minutes. That is a rolling status, not 54 things that
-        // happened, and rendering it as events is what produced "+56 more".
+    fn one_session_collapses_to_its_latest_but_can_still_be_opened() {
         let evs: Vec<_> = (0..54)
             .map(|i| ev_sess("ai-video", "s1", 9_000 - i, "where it got to"))
             .collect();
-        let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
-        assert_eq!(p.projects[0].total, 1, "one thread, one line");
-        assert_eq!(p.projects[0].hidden_lines, 0, "and so nothing to hide");
-        assert_eq!(p.projects[0].lines[0].ts_ms, 9_000, "the NEWEST is what it says");
+
+        let shut = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
+        let p = &shut.projects[0];
+        assert_eq!(p.lines.len(), 1, "collapsed is still ONE line");
+        assert_eq!(p.lines[0].ts_ms, 9_000, "and it is the NEWEST");
+        assert_eq!(p.total, 54, "but the row now counts the turns it is standing on");
+        assert_eq!(p.hidden_lines, 53, "…and offers every one of them");
+
+        let open = plan_updates(&evs, &|_| true, &|_| true, &|_| 0, false);
+        let q = &open.projects[0];
+        assert_eq!(q.lines.len(), 54, "expanded shows every update since the floor");
+        assert_eq!(q.hidden_lines, 0);
+        assert_eq!(q.lines[0].ts_ms, 9_000, "newest still first");
     }
 
     #[test]
@@ -598,9 +629,15 @@ mod tests {
             ev_sess("atlas", "s2", 700, "b"),
         ];
         let p = plan_updates(&evs, &|_| true, &|_| false, &|_| 0, false);
-        assert_eq!(p.projects[0].total, 2);
         assert_eq!(p.projects[0].lines[0].text, "a-new");
         assert_eq!(p.projects[0].lines[1].text, "b");
+        assert_eq!(p.projects[0].lines.len(), 2, "one line per session while collapsed");
+        assert_eq!(p.projects[0].total, 3, "three updates exist");
+        assert_eq!(p.projects[0].hidden_lines, 1, "so a-old is reachable");
+
+        let open = plan_updates(&evs, &|_| true, &|_| true, &|_| 0, false);
+        let texts: Vec<&str> = open.projects[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["a-new", "a-old", "b"], "expanded shows the session's own history");
     }
 
     #[test]

@@ -814,7 +814,11 @@ impl Orchestrator {
                             plan.density,
                             now_ms,
                             i == 0,
-                            self.standup_block_open.contains(&pp.key),
+                            // The SAME predicate the planner was given. Two
+                            // spellings of "is this expanded" can drift, and when
+                            // they do the row renders its full history with no
+                            // control to close it again.
+                            is_expanded(&pp.key),
                             cx,
                         ));
                     }
