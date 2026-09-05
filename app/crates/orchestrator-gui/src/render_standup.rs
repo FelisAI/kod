@@ -1668,10 +1668,26 @@ impl Orchestrator {
         }
 
         div()
-            .flex_1()
+            // h_full, NOT flex_1 — and that is what makes this screen scroll.
+            //
+            // gpui's default display is BLOCK (gpui::Style::default), so the
+            // pane that wraps every screen is a block container and `flex_1` on
+            // this root means nothing: its height was `auto`, i.e. exactly as
+            // tall as its content. The scroll box below then divided up an
+            // UNBOUNDED height, so it never had anything to clip and the wheel
+            // did nothing. The Standup has never scrolled — it only became
+            // visible once there was enough history to need it. (The rail scrolls
+            // because it is a direct child of the ROOT, which IS a flex row.)
+            //
+            // A definite height here — the wrapper is itself `h_full` inside that
+            // flex row — is the whole fix, and it is confined to this screen:
+            // making the shared wrapper a flex column would have changed the
+            // Workspace's layout context too, for a bug only reported here.
+            .h_full()
             .flex()
             .flex_col()
             .min_w_0()
+            .min_h_0()
             .when_some(self.render_restore_banner(cx), |c, b| c.child(b))
             .child(
                 div()

@@ -435,7 +435,20 @@ impl Orchestrator {
             return;
         };
         let is_end = trigger == "end";
-        let prev_headline = self.sess_summaries.get(&cid).map(|r| r.headline.clone());
+        // The last headline that SAID something. The in-memory cache holds the
+        // newest row, which may now be a deliberate no-change blank — handing
+        // that to the prompt as "previous status" would drop the delta anchor,
+        // and the next real summary would re-report the whole session as new.
+        // Asked of the STORE, not of the in-memory cache: the cache holds the
+        // NEWEST row, which may now be a deliberate no-change blank, and handing
+        // that to the prompt as "previous status" would drop the delta anchor —
+        // the next real summary would then re-report the whole session as new.
+        // `last_real_headline` walks back to the last one that said something.
+        let prev_headline = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| s.last_real_headline(&cid));
         self.sum_job_times.push(now_s);
         self.sum_running.store(true, Ordering::Relaxed);
         let store = self.store.clone();

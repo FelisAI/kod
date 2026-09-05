@@ -69,7 +69,9 @@ glances at. Below: the session GOAL and the most recent exchange. Output ONLY mi
 RULES: headline = ONE line (max ~80 chars) stating what was ACCOMPLISHED — outcomes (features \
 landed, bugs fixed, decisions made, results learned), with exact names/numbers; never narrate \
 activity (\"working on X\", \"exploring Y\"). {prev}If a previous status is given, report only \
-what changed SINCE it; if nothing meaningful changed, say so in five words. next_action = what \
+what changed SINCE it; if nothing meaningful changed, output EXACTLY \
+{{\"headline\":\"\",\"next_action\":\"\",\"detail\":[]}} and nothing else — do NOT write a \
+sentence about there being no change. next_action = what \
 the HUMAN should do next (max ~90 chars) ONLY if something genuinely awaits them (a question, \
 a result to review, a decision); otherwise EXACTLY the empty string \"\". detail = 2-3 short \
 factual bullets. Never invent facts not in the digest.\n\nSESSION DIGEST:\n{digest}"
@@ -86,10 +88,24 @@ fn parse_standup_json(json: &str, goal: String) -> Result<SessSummary, String> {
             .trim()
             .to_string()
     };
-    let headline = s("headline");
-    if headline.is_empty() {
+    // AN EMPTY HEADLINE IS A VALID ANSWER — it means "nothing meaningful changed
+    // since the previous status", which is the one thing this summarizer had no
+    // way to say. It used to be told to "say so in five words", so a quiet
+    // session produced a fluent sentence that was stored and rendered as a
+    // first-class update; 53 of 766 rows in a real store were exactly that.
+    //
+    // The row is still WRITTEN with an empty headline rather than skipped,
+    // because the row IS the freshness record (thru_at_ms/src_bytes): skipping it
+    // would re-queue the same transcript every tick and spend plan quota forever.
+    // `Store::timeline` drops empty headlines, so it costs nothing on screen.
+    //
+    // A MISSING key is still an error — only an explicitly empty string is the
+    // "no change" signal, so a model that answers with the wrong shape is still
+    // a parse failure rather than a silent no-op.
+    if v.get("headline").and_then(|x| x.as_str()).is_none() {
         return Err("parse: summary missing headline".into());
     }
+    let headline = s("headline");
     let detail = v
         .get("detail")
         .and_then(|d| d.as_array())

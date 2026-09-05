@@ -7,6 +7,31 @@ use rusqlite::params;
 
 use super::{now, HostedSessionRow, SessionPartRow, Store, TimelineEvent, TimelineKind};
 
+/// Does this headline say "nothing happened"?
+///
+/// THE APP ASKED FOR THESE. `standup_prompt` used to end with "if nothing
+/// meaningful changed, say so in five words" — so a session with no new work got
+/// a fluent sentence about having no new work, which was then stored and
+/// rendered as a first-class update. Measured on a real store: 53 of 766
+/// summaries (7%), in six different wordings, so nothing but a prefix match
+/// catches the ones already written.
+///
+/// The prompt now returns an EMPTY headline for this case and empty is filtered
+/// separately; this function exists for the history that predates it. It is a
+/// PREFIX test on purpose — a real achievement headline leads with the outcome,
+/// so "No meaningful change since archival." is caught while "Nothing-burger
+/// dialog fixed" is not.
+pub fn is_no_change_headline(h: &str) -> bool {
+    let t = h.trim().to_ascii_lowercase();
+    t.is_empty()
+        || t.starts_with("no meaningful")
+        || t.starts_with("nothing meaningful")
+        || t.starts_with("no meaningful change")
+        || t.starts_with("nothing changed")
+        || t.starts_with("no changes since")
+        || t.starts_with("no change since")
+}
+
 impl Store {
     // --- hosted sessions (crash recovery) ---
 
@@ -165,6 +190,27 @@ impl Store {
             params![cli_session_id],
         )?;
         Ok(())
+    }
+
+    /// The newest headline for this session that actually SAID something.
+    ///
+    /// The summarizer is given the previous status and asked for the delta, so
+    /// the anchor has to skip the no-change rows — otherwise the first quiet
+    /// summary erases the anchor and the next real one re-reports the whole
+    /// session as if it were new.
+    pub fn last_real_headline(&self, cli_session_id: &str) -> Option<String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT headline FROM session_summary WHERE sess=?1 ORDER BY at_ms DESC LIMIT 20",
+            )
+            .ok()?;
+        let heads: Vec<String> = st
+            .query_map(params![cli_session_id], |r| r.get::<_, String>(0))
+            .ok()?
+            .flatten()
+            .collect();
+        heads.into_iter().find(|h| !is_no_change_headline(h))
     }
 
     // --- session↔node linkage (docs/011: dispatch + live attribution) ---
@@ -342,7 +388,10 @@ impl Store {
                 })
             });
             if let Ok(rows) = rows {
-                out.extend(rows.flatten());
+                // A summary that reports NO change is not an event. Dropped here
+                // rather than in the Standup because every reader of `timeline`
+                // wants the same thing, and the Standup is not the only one.
+                out.extend(rows.flatten().filter(|e| !is_no_change_headline(&e.text)));
             }
         }
         // ▶/■ dispatch trail + ◆ user decisions (node-attributed part_notes).
@@ -448,5 +497,44 @@ impl Store {
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod no_change_tests {
+    use super::is_no_change_headline;
+
+    /// The six wordings actually found in a real store (53 of 766 rows). They
+    /// are all different, which is why the filter is a prefix test and not an
+    /// equality check against one string.
+    #[test]
+    fn the_wordings_the_model_actually_produced_are_all_caught() {
+        for h in [
+            "Nothing meaningful changed since status",
+            "No meaningful change since archival.",
+            "No meaningful changes since status",
+            "No meaningful status change occurred",
+            "Nothing meaningful changed since verification",
+            "No meaningful changes since Slice 0",
+            "",
+            "   ",
+        ] {
+            assert!(is_no_change_headline(h), "should be filtered: {h:?}");
+        }
+    }
+
+    /// And real achievements must survive — including ones that merely CONTAIN
+    /// the words, which a `contains` test would have eaten.
+    #[test]
+    fn real_headlines_survive() {
+        for h in [
+            "4 of 5 Spark quality re-renders landed; window 4 completed in 74 minutes",
+            "Plant spread fixed; meadow bounds fell from 139-155% to 90-107%",
+            "Nothing-burger dialog removed from the onboarding flow",
+            "Fixed a bug where no meaningful change was reported",
+            "分镜编辑器已上线ClipEditor，10组shot list可视化审阅",
+        ] {
+            assert!(!is_no_change_headline(h), "should be kept: {h:?}");
+        }
     }
 }
