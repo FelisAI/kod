@@ -17,6 +17,7 @@ impl Orchestrator {
         density: crate::standup_plan::Density,
         now_ms: u64,
         first: bool,
+        expanded: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let digest = matches!(density, crate::standup_plan::Density::Digest);
@@ -121,32 +122,6 @@ impl Orchestrator {
             );
         }
         let ekey = p.key.clone();
-        if hidden > 0 {
-            // CLICKABLE. A count you cannot open is a complaint, not a control —
-            // "+53 more" told you what you were missing and gave you no way to
-            // see it.
-            body = body.child(
-                div()
-                    .id(SharedString::from(format!("upd-more-{}", p.key)))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.))
-                    .pt(px(2.))
-                    .w_full()
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED2))
-                    .hover(|h| h.text_color(rgb(ACCENT)))
-                    .child(icon("icons/chevron-down.svg", 10., MUTED2))
-                    .child(SharedString::from(format!("{hidden} more")))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.standup_block_open.insert(ekey.clone());
-                        cx.notify();
-                    })),
-            );
-        }
-
         let (kopen, kread) = (p.key.clone(), p.key.clone());
         list_row(first)
             .id(SharedString::from(format!("upd-{}", p.key)))
@@ -168,6 +143,35 @@ impl Orchestrator {
                         .flex_row()
                         .items_center()
                         .gap(px(6.))
+                        // EXPAND IS A BUTTON, AND IT GOES BOTH WAYS.
+                        //
+                        // It was 11px muted text under the body reading "12
+                        // more" — the same "too small to read as a control"
+                        // problem the actions had before they became chips. And
+                        // it only ever INSERTED into the open set: once expanded,
+                        // the planner sets hidden_lines to 0, the text row
+                        // disappeared with it, and there was nothing left to
+                        // click. A one-way door.
+                        .when(hidden > 0 || expanded, |c| {
+                            c.child(
+                                card_action(
+                                    SharedString::from(format!("upd-more-{}", p.key)),
+                                    if expanded { "Less" } else { "More" },
+                                    Some(if expanded {
+                                        "icons/chevron-up.svg"
+                                    } else {
+                                        "icons/chevron-down.svg"
+                                    }),
+                                    false,
+                                )
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    if !this.standup_block_open.remove(&ekey) {
+                                        this.standup_block_open.insert(ekey.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                            )
+                        })
                         .child(
                             card_action(
                                 SharedString::from(format!("upd-read-{}", p.key)),
@@ -810,14 +814,35 @@ impl Orchestrator {
                             plan.density,
                             now_ms,
                             i == 0,
+                            self.standup_block_open.contains(&pp.key),
                             cx,
                         ));
                     }
-                    if plan.hidden_projects > 0 {
-                        // A FOOTER ROW of the same list, not a loose line under
-                        // it: "show the rest" belongs to the list it extends, and
-                        // as a bare line it read as an unrelated caption.
+                    // THE FOOTER APPEARS WHENEVER THE VIEW IS CAPPED — not
+                    // only when whole projects are hidden.
+                    //
+                    // That was a real hole: past BLOCK_MAX_PROJECTS the planner
+                    // drops every project to ONE line (Density::Digest), but
+                    // `hidden_projects` is only non-zero past PROJECT_CAP. So
+                    // with 7-10 unread projects the standup silently showed a
+                    // single line each and offered NO way to see the rest —
+                    // which is exactly "it only shows the last message".
+                    //
+                    // `standup_updates_all` already un-caps both (see
+                    // plan_updates: show_all forces Density::Blocks), so one
+                    // control serves both cases, and it toggles back.
+                    let capped = plan.hidden_projects > 0
+                        || matches!(plan.density, crate::standup_plan::Density::Digest);
+                    if capped || self.standup_updates_all {
                         let n = plan.hidden_projects;
+                        let on = self.standup_updates_all;
+                        let label = if on {
+                            "Show less".to_string()
+                        } else if n > 0 {
+                            format!("Show {n} more project{}", if n == 1 { "" } else { "s" })
+                        } else {
+                            "Show every update".to_string()
+                        };
                         group = group.child(
                             list_row(plan.projects.is_empty())
                                 .id("upd-show-all")
@@ -828,13 +853,18 @@ impl Orchestrator {
                                 .text_size(px(11.5))
                                 .text_color(rgb(MUTED2))
                                 .hover(|h| h.bg(rgb(CARD2)).text_color(rgb(ACCENT)))
-                                .child(icon("icons/chevron-down.svg", 11., MUTED2))
-                                .child(SharedString::from(format!(
-                                    "Show {n} more project{}",
-                                    if n == 1 { "" } else { "s" }
-                                )))
+                                .child(icon(
+                                    if on {
+                                        "icons/chevron-up.svg"
+                                    } else {
+                                        "icons/chevron-down.svg"
+                                    },
+                                    11.,
+                                    MUTED2,
+                                ))
+                                .child(SharedString::from(label))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.standup_updates_all = true;
+                                    this.standup_updates_all = !this.standup_updates_all;
                                     cx.notify();
                                 })),
                         );

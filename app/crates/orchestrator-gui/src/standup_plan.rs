@@ -732,6 +732,48 @@ mod tests {
 
 
     #[test]
+    /// THE HOLE: between BLOCK_MAX_PROJECTS and PROJECT_CAP the planner caps
+    /// every project to ONE line, but `hidden_projects` stays 0 — so the tier
+    /// footer, which only ever keyed on `hidden_projects`, never appeared and
+    /// there was no way to see the rest. That is what "it only shows the last
+    /// message" was.
+    ///
+    /// This pins the CONDITION the footer must key on: whenever anything is
+    /// held back, `show_all` must visibly change the plan.
+    #[test]
+    fn a_capped_view_always_has_something_left_to_expand() {
+        let yes = |_: &str| true;
+        let no = |_: &str| false;
+        let floor = |_: &str| 0u64;
+
+        // 7 projects: more than BLOCK_MAX_PROJECTS (6), fewer than PROJECT_CAP.
+        let mut events = Vec::new();
+        for pi in 0..7 {
+            for e in 0..4 {
+                events.push(ev(&format!("p{pi}"), 1_000 + (pi * 10 + e) as u64, "did a thing"));
+            }
+        }
+
+        let capped = plan_updates(&events, &yes, &no, &floor, false);
+        assert!(matches!(capped.density, Density::Digest), "7 projects must digest");
+        assert_eq!(capped.hidden_projects, 0, "…yet hide no whole PROJECT — the hole");
+        // So something IS held back even though hidden_projects is 0:
+        assert!(
+            capped.projects.iter().any(|p| p.hidden_lines > 0),
+            "lines are being hidden with no project-level signal that they are"
+        );
+
+        // …and the control must actually un-cap it.
+        let open = plan_updates(&events, &yes, &no, &floor, true);
+        assert!(matches!(open.density, Density::Blocks), "show_all must restore detail");
+        assert!(
+            open.projects.iter().map(|p| p.lines.len()).sum::<usize>()
+                > capped.projects.iter().map(|p| p.lines.len()).sum::<usize>(),
+            "expanding must actually show more lines"
+        );
+    }
+
+    #[test]
     fn events_older_than_the_floor_do_not_report_at_all() {
         // THE bug this fixes: timeline() is capped by COUNT, not time — 120 rows
         // is about three weeks of real history — so without a floor a project
