@@ -1249,15 +1249,26 @@ impl Orchestrator {
             // that exact Vec. Two reads would be two locks, and worse, two views
             // of one screen that could disagree about what happened.
             let events = timeline.clone();
-            let failed: Vec<(String, String)> = {
+            // The failures AND whether this exact set has already been waved
+            // off, read under ONE lock.
+            let (failed, fail_dismissed): (Vec<(String, String)>, Option<String>) = {
                 let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-                store
+                let f: Vec<(String, String)> = store
                     .dead_summary_jobs()
                     .into_iter()
                     .filter(|(_, _, _, _, died_ms)| *died_ms >= day_ago)
                     .map(|(_, cid, _, err, _)| (cid, err))
-                    .collect()
+                    .collect();
+                let d = store.get_setting(FAIL_DISMISSED_KEY);
+                (f, d)
             };
+            // A SIGNATURE, not a boolean. Dismissing has to mean "I have seen
+            // THESE failures", not "never warn me again": keyed on the set of
+            // sessions, a new failure tomorrow brings the notice back on its own,
+            // while the ones he has already read stay gone — including across a
+            // restart, which an in-memory flag would not survive.
+            let fail_sig = fail_signature(&failed);
+            let fail_seen = fail_dismissed.as_deref() == Some(fail_sig.as_str());
             let divider_ms = self.standup_divider_ms;
             let mut thread = div().flex().flex_col().gap(px(1.)).pt(px(4.));
             // ONE line, never two, and only when it tells the user something they
@@ -1293,37 +1304,59 @@ impl Orchestrator {
             // discarded the error text, so 10 permanently-blacklisted sessions
             // rendered exactly like healthy ones and the user had no way to
             // know the pipeline was dead.
-            if !failed.is_empty() {
+            if !failed.is_empty() && !fail_seen {
+                // ONE LINE, AND DISMISSIBLE. It was two permanent lines — the
+                // sentence and the raw error under it — with no way to clear
+                // them, so a summarizer that failed once sat on the Standup
+                // taking space from the sessions the screen is FOR. The reason
+                // still ships, folded into the same line after an em dash, which
+                // is all the room it ever needed.
                 let n = failed.len();
                 let (_, err) = &failed[n - 1];
-                let reason: String = err.chars().take(140).collect();
+                let reason: String = err.chars().take(90).collect();
+                let sig = fail_sig.clone();
                 thread = thread.child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap(px(2.))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
                         .px(px(8.))
-                        .py(px(6.))
+                        .py(px(4.))
+                        .child(icon("icons/warning.svg", 11., AMBER))
                         .child(
                             div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(6.))
+                                .flex_1()
+                                .min_w_0()
+                                .line_clamp(1)
                                 .text_size(px(11.5))
                                 .text_color(rgb(AMBER))
-                                .child(icon("icons/warning.svg", 11., AMBER))
                                 .child(SharedString::from(format!(
-                                    "{n} session summar{} failed in the last day — retrying on a backoff.",
+                                    "{n} session summar{} failed — retrying on a backoff · {reason}",
                                     if n == 1 { "y" } else { "ies" }
                                 ))),
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
-                                .text_color(rgb(MUTED2))
-                                .truncate()
-                                .child(SharedString::from(reason)),
+                                .id("fail-dismiss")
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(20.))
+                                .h(px(20.))
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .hover(|h| h.bg(rgb(CARD2)))
+                                .child(icon("icons/close.svg", 10., MUTED2))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    let _ = this
+                                        .store
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .set_setting(FAIL_DISMISSED_KEY, &sig);
+                                    cx.notify();
+                                })),
                         ),
                 );
             }
@@ -1805,6 +1838,24 @@ impl Orchestrator {
 /// can never be resumed automatically, however the switch is set. Reading it off
 /// the same fact is what keeps this sentence from promising something the gate
 /// will then refuse.
+/// The identity of a set of failed summary jobs, for the dismiss ledger.
+///
+/// SORTED, and that is the whole point. `dead_summary_jobs()` makes no ordering
+/// promise, so a signature built in iteration order would differ between two
+/// renders of the SAME failures — and the notice he just dismissed would come
+/// straight back, which is indistinguishable from the dismiss button not
+/// working.
+pub(crate) fn fail_signature(failed: &[(String, String)]) -> String {
+    let mut ids: Vec<&str> = failed.iter().map(|(c, _)| c.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.join(",")
+}
+
+/// Which set of failed summary jobs the user has already waved off. A SET, not
+/// a flag — see the dismiss handler.
+const FAIL_DISMISSED_KEY: &str = "standup_fail_dismissed";
+
 pub(crate) fn resume_promise(auto_on: bool, has_reset_instant: bool) -> &'static str {
     match (auto_on, has_reset_instant) {
         (false, _) => "auto-continue off",
@@ -1954,6 +2005,28 @@ mod tests {
     /// branch records the day the Dock badge, the toast, the notification and the
     /// sidebar dot each decided for themselves what "needs you" meant, and
     /// "Dock-badge 1" and "nothing needs you" were reachable in the same instant.
+    /// The dismiss has to survive a reshuffle, and must NOT survive a new
+    /// failure.
+    #[test]
+    fn dismissing_the_summary_warning_sticks_until_something_new_fails() {
+        let f = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        };
+        let a = super::fail_signature(&f(&[("s2", "boom"), ("s1", "boom")]));
+        let b = super::fail_signature(&f(&[("s1", "other text"), ("s2", "boom")]));
+        assert_eq!(a, b, "same sessions in a different order must dismiss once");
+
+        let c = super::fail_signature(&f(&[("s1", "x"), ("s2", "x"), ("s3", "x")]));
+        assert_ne!(a, c, "a NEW failing session must bring the notice back");
+
+        assert_eq!(super::fail_signature(&[]), "");
+        // A duplicate row for one session must not read as a second failure.
+        assert_eq!(
+            super::fail_signature(&f(&[("s1", "a"), ("s1", "b")])),
+            super::fail_signature(&f(&[("s1", "a")]))
+        );
+    }
+
     #[test]
     fn every_live_session_lands_in_exactly_one_tier() {
         use orchestrator_host::Phase;

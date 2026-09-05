@@ -55,6 +55,7 @@ impl AssetSource for Assets {
             "icons/idle.svg",
             "icons/feed.svg",
             "icons/restore.svg",
+            "icons/close.svg",
         ))
     }
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
