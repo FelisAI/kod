@@ -1705,8 +1705,22 @@ impl Render for Orchestrator {
         // fires in the capture phase, before the field's own, so clicking INTO the
         // field would cancel it. Bubble phase here, and only outside the rail, so
         // the field can never cancel itself.
+        // flex_1 + min_w_0, NOT size_full.
+        //
+        // THIS is the "standup has a width set" bug, and it was never in the
+        // Standup: `size_full` is width:100% + height:100%, so as a child of the
+        // root flex ROW this pane asked for the WHOLE window while the rail sat
+        // beside it — and a flex item's default `min-width: auto` meant it could
+        // not then be talked down to the space actually left over. The pane hung
+        // off the right edge by exactly the rail's width, so every row inside it
+        // was clipped mid-word instead of truncating, at every window size.
+        //
+        // No amount of `min_w_0` + `truncate` further down can fix that: those
+        // let a child give ground, and this parent was never asked to.
         let main = div()
-            .size_full()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .child(main)
             .on_mouse_down(
                 MouseButton::Left,

@@ -268,10 +268,15 @@ impl Orchestrator {
                                     c.child(
                                         div()
                                             .flex_none()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(3.))
                                             .whitespace_nowrap()
                                             .text_size(px(10.))
                                             .text_color(rgb(ACCENT))
-                                            .child("⏎ ready"),
+                                            .child(icon("icons/reply.svg", 9., ACCENT))
+                                            .child("ready"),
                                     )
                                 }),
                         )
@@ -491,9 +496,7 @@ impl Orchestrator {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED2))
-                    .child("◌")
+                    .child(icon("icons/idle.svg", 12., MUTED2))
                     .into_any_element()
             } else {
                 project_badge(&name, &slug, 20.).into_any_element()
@@ -604,26 +607,36 @@ impl Orchestrator {
             .child({
                 let sc = self.standup_counts();
                 // most urgent first — the glyph reports the loudest thing there is.
-                let sc_glyph: (&'static str, u32) = if sc.blocked > 0 {
-                    ("⛔", 0xE68A8A)
+                // THE SAME ICONS THE STANDUP ITSELF USES. They were the
+                // typographic stand-ins ⛔ ⚠ ⏎ ● ◌ — which do not exist in the
+                // app's type at the same weight or baseline, so the one control
+                // you look at to decide whether to look was rendering in a
+                // different vocabulary from the screen behind it.
+                let sc_icon: (&'static str, u32) = if sc.blocked > 0 {
+                    ("icons/blocked.svg", 0xE68A8A)
                 } else if sc.needs > 0 {
-                    ("⚠", AMBER)
+                    ("icons/warning.svg", AMBER)
                 } else if sc.ready > 0 {
-                    ("⏎", ACCENT)
+                    ("icons/reply.svg", ACCENT)
                 } else if sc.working > 0 {
-                    ("●", ORANGE)
+                    ("icons/working.svg", ORANGE)
                 } else {
-                    ("◌", if on_standup { ACCENT } else { MUTED2 })
+                    ("icons/idle.svg", if on_standup { ACCENT } else { MUTED2 })
                 };
-                let mut sc_pills: Vec<(String, u32, u32)> = Vec::new();
+                let mut sc_pills: Vec<(&'static str, String, u32, u32)> = Vec::new();
                 if sc.blocked > 0 {
-                    sc_pills.push((format!("⛔ {}", sc.blocked), 0x2A1616, 0xE68A8A));
+                    sc_pills.push((
+                        "icons/blocked.svg",
+                        sc.blocked.to_string(),
+                        0x2A1616,
+                        0xE68A8A,
+                    ));
                 }
                 if sc.needs > 0 {
-                    sc_pills.push((format!("⚠ {}", sc.needs), 0x1A1408, AMBER));
+                    sc_pills.push(("icons/warning.svg", sc.needs.to_string(), 0x1A1408, AMBER));
                 }
                 if sc.ready > 0 {
-                    sc_pills.push((format!("⏎ {}", sc.ready), 0x10231C, ACCENT));
+                    sc_pills.push(("icons/reply.svg", sc.ready.to_string(), 0x10231C, ACCENT));
                 }
                 div()
                     .id("standup")
@@ -648,13 +661,7 @@ impl Orchestrator {
                     // whether to look was carrying a shape with no meaning. It is
                     // now whatever is most urgent behind the button, so the button
                     // answers its own question before you press it.
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(13.))
-                            .text_color(rgb(sc_glyph.1))
-                            .child(sc_glyph.0),
-                    )
+                    .child(icon(sc_icon.0, 14., sc_icon.1))
                     .child(
                         div()
                             .flex_1()
@@ -669,18 +676,23 @@ impl Orchestrator {
                     // idle are reassurance and stay off: this button is for
                     // deciding whether something wants you, and a count that is
                     // never zero would answer that with noise.
-                    .children(sc_pills.into_iter().map(|(txt, fg, bg)| {
+                    .children(sc_pills.into_iter().map(|(ic, n, bg, fg)| {
                         div()
                             .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(3.))
                             .whitespace_nowrap()
                             .bg(rgb(bg))
                             .text_color(rgb(fg))
                             .rounded(px(20.))
-                            .px(px(7.))
-                            .py(px(1.))
+                            .px(px(6.))
+                            .py(px(2.))
                             .text_size(px(10.5))
                             .font_weight(FontWeight::BOLD)
-                            .child(SharedString::from(txt))
+                            .child(icon(ic, 9., fg))
+                            .child(SharedString::from(n))
                     }))
             });
         // Recover is a per-project control-bar action, not global nav. Projects:
@@ -704,7 +716,7 @@ impl Orchestrator {
             .min_h_0()
             .overflow_y_scroll();
         if !active.is_empty() {
-            list = list.child(section_header("● ACTIVE", Some(active.len()), GREEN));
+            list = list.child(section_header("ACTIVE", Some(active.len()), GREEN));
             for &i in &active {
                 list = list.child(self.rail_active_project(i, cx));
             }

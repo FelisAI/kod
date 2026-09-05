@@ -818,10 +818,21 @@ impl Orchestrator {
                     .flex_row()
                     .items_center()
                     .gap(px(10.))
-                    .child(div().w(px(6.)).h(px(6.)).rounded(px(3.)).bg(rgb(AMBER)))
+                    // The same chips every other surface uses. This banner used
+                    // to carry three different button styles in one row — a
+                    // filled accent_btn, a bordered div and a bare text div —
+                    // which is what made the first thing you see on launch look
+                    // assembled rather than designed.
+                    .child(icon("icons/warning.svg", 13., AMBER))
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            // WRAPS rather than truncates: gpui paints no
+                            // ellipsis for a flex-sized nowrap box, so this
+                            // headline was being chopped to "18 sessions were
+                            // open bef" the moment the window narrowed.
+                            .line_clamp(2)
                             .text_size(px(13.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_STRONG))
@@ -831,56 +842,50 @@ impl Orchestrator {
                                 if n == 1 { "was" } else { "were" }
                             ))),
                     )
+                    // Quietest first, default action last — the reading order
+                    // for a row of controls, and the position AppKit puts the
+                    // default button in.
                     .child(
-                        div()
-                            .id("restore-all")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.restore_all(window, cx)
-                            }))
-                            .child(accent_btn("Restore all")),
+                        card_action("restore-dismiss", "Dismiss", None, false).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.dismiss_restore(cx)),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("restore-review")
-                            .px(px(10.))
-                            .py(px(4.))
-                            .rounded(px(8.))
-                            .border_1()
-                            .border_color(rgb(HAIR))
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .hover(|h| h.text_color(rgb(ACCENT)))
-                            .child(if self.restore_expanded {
-                                "Hide"
+                        // The label and the chevron BOTH report the state. It
+                        // said "Review" whether or not the list was already open.
+                        card_action(
+                            "restore-review",
+                            if self.restore_expanded { "Hide" } else { "Review" },
+                            Some(if self.restore_expanded {
+                                "icons/chevron-up.svg"
                             } else {
-                                "Review"
-                            })
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.restore_expanded = !this.restore_expanded;
-                                cx.notify();
-                            })),
+                                "icons/chevron-down.svg"
+                            }),
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.restore_expanded = !this.restore_expanded;
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        div()
-                            .id("restore-dismiss")
-                            .px(px(10.))
-                            .py(px(4.))
-                            .rounded(px(8.))
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .hover(|h| h.text_color(rgb(0xE68A8A)))
-                            .child("Dismiss")
-                            .on_click(
-                                cx.listener(|this, _: &ClickEvent, _, cx| this.dismiss_restore(cx)),
-                            ),
+                        card_action(
+                            "restore-all",
+                            "Restore all",
+                            Some("icons/restore.svg"),
+                            true,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.restore_all(window, cx)
+                        })),
                     ),
             )
             .child(
+                // Aligned under the TITLE, not the icon — the icon is a marker,
+                // and text that starts under it reads as a second column.
                 div()
-                    .pl(px(16.))
+                    .pl(px(23.))
+                    .truncate()
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child(SharedString::from(sub)),

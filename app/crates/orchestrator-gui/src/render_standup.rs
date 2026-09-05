@@ -16,6 +16,7 @@ impl Orchestrator {
         name: String,
         density: crate::standup_plan::Density,
         now_ms: u64,
+        first: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let digest = matches!(density, crate::standup_plan::Density::Digest);
@@ -26,16 +27,15 @@ impl Orchestrator {
         // No `fresh` any more: every project the planner hands back is one you
         // have NOT seen, so a "read" variant of this card would be unreachable.
         let (count, hidden) = (p.total, p.hidden_lines);
-        let lead = p
-            .lines
-            .first()
-            .map(|l| termview::trim(&l.text, 90))
-            .unwrap_or_default();
         // No kind glyph. ☁/▶/■/◆ marked EVERY line — overwhelmingly ☁, since
         // summaries are the spine — so it was a column of noise that told you
         // nothing you would act on differently.
         let lines: Vec<String> = if digest {
-            Vec::new()
+            p.lines
+                .first()
+                .map(|l| termview::trim(&l.text, 90))
+                .into_iter()
+                .collect()
         } else {
             p.lines
                 .iter()
@@ -43,159 +43,161 @@ impl Orchestrator {
                 .collect()
         };
 
-        let head = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(9.))
-            // a RESERVED blank when read, so names stay column-aligned —
-            .child(
-                div()
-                    .w(px(6.))
-                    .h(px(6.))
-                    .rounded(px(3.))
-                    .flex_none()
-                    .bg(rgb(ACCENT)),
-            )
-            .child(
-                div()
-                    // SHRINKABLE. `flex_none` sets flex-shrink to 0, so this column held its
-                    // full width no matter how narrow the pane got and the row overflowed
-                    // instead of truncating — the Standup lost its right-hand side on a
-                    // small window. It still PREFERS this width (grow stays 0); it may now
-                    // give ground, which is what `min_w_0` + `truncate` were always for.
-                    .flex_shrink()
-                    .w(px(if digest { 104. } else { 150. }))
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.5))
-                    .text_color(rgb(TEXT_STRONG))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(SharedString::from(termview::trim(&name, 24))),
-            )
-            .when(digest, |r| {
-                r.child(
+        // THE BODY IS THE ONLY THING THAT SHRINKS. Everything else on the row is
+        // `flex_none`; this column carries `min_w_0` so `truncate` has somewhere
+        // to go when the pane narrows.
+        let mut body = div().flex_1().min_w_0().flex().flex_col().gap(px(3.)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(7.))
+                .child(
                     div()
-                        .flex_1()
+                        .flex_shrink()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(12.))
-                        .text_color(rgb(TEXT))
-                        .child(SharedString::from(lead)),
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_STRONG))
+                        .child(SharedString::from(termview::trim(&name, 30))),
                 )
-            })
-            .when(!digest, |r| r.child(div().flex_1()))
-            .child(
-                div()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .text_size(px(10.5))
-                    .text_color(rgb(MUTED2))
-                    .child(SharedString::from(if digest {
-                        format!("{count} · {age}")
-                    } else {
-                        format!(
-                            "{count} update{} · {age}",
-                            if count == 1 { "" } else { "s" }
-                        )
-                    })),
-            )
-            ;
-
-        let mut card = div()
-            .id(SharedString::from(format!("upd-{}", p.key)))
-            .flex()
-            .flex_col()
-            .gap(px(5.))
-            .px(px(12.))
-            .py(px(if digest { 5. } else { 9. }))
-            .rounded(px(if digest { 8. } else { 10. }))
-            .bg(rgb(PANEL))
-            .border_1()
-            .border_color(rgb(0x346B54))
-            .hover(|h| h.border_color(rgb(0x36404A)))
-            .child(head);
+                // The unread mark: a dot AFTER the name, the way every Mac list
+                // marks an unread row. It used to lead the line, which put a
+                // coloured pip in the position the eye reads as an icon and left
+                // the name un-anchored.
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(6.))
+                        .h(px(6.))
+                        .rounded(px(3.))
+                        .bg(rgb(ACCENT)),
+                ),
+        );
         for text in lines {
-            card = card.child(
+            body = body.child(
                 div()
-                    .pl(px(15.))
+                    // WRAPS, deliberately — it does not truncate.
+                    //
+                    // gpui's `truncate()` only paints its ellipsis when the text
+                    // is first MEASURED against a definite width, and with
+                    // `whitespace_nowrap` it then caches that measurement
+                    // (elements/text.rs: the early return keyed on wrap_width
+                    // being None). A flex-sized column is measured indefinitely
+                    // first, so the ellipsis never appears and the sentence is
+                    // instead chopped mid-word by the group's overflow_hidden —
+                    // which reads as a rendering fault, not as "there is more".
+                    //
+                    // Two wrapped lines is also simply the better row: it is what
+                    // Mail and Messages do with a preview, and it needs no
+                    // ellipsis to look finished at any width.
+                    .line_clamp(2)
+                    // w_full, and NO min_w_0().
+                    //
+                    // These two go together. min-width:0 is what lets a flex-ROW
+                    // child shrink below its content; `body` is a flex COLUMN, so
+                    // on its children min_w_0 removes the width floor entirely,
+                    // the box collapses to zero, and truncate() renders nothing
+                    // but an ellipsis — that bug has shipped here twice.
+                    //
+                    // But WITHOUT w_full the opposite happens: the line sizes to
+                    // its content, overflows the column, and gets CLIPPED
+                    // mid-word by the group's overflow_hidden — an ellipsis that
+                    // never appears because truncate() had no box to work in.
+                    // w_full pins it to the column, which is the width that
+                    // actually shrinks.
+                    .w_full()
                     // NO min_w_0() — and this is the SECOND time that mistake has
                     // shipped here. min-width:0 is what lets a flex-ROW child
-                    // shrink below its content. `card` is a flex COLUMN, so on
+                    // shrink below its content. `body` is a flex COLUMN, so on
                     // its children min_w_0 removes the width floor entirely, the
                     // box collapses to zero, and truncate() renders nothing but
                     // the ellipsis. Every line became "…". Same bug, same fix, as
                     // the settings rows.
-                    .truncate()
                     .text_size(px(12.))
                     .text_color(rgb(TEXT))
                     .child(SharedString::from(text)),
             );
         }
-        // ONE FOOTER for every control on this card.
-        //
-        // The two buttons used to sit in the HEADER, competing with the project
-        // name, the count and the age — all of which are `flex_none` or already
-        // shrunk, so on a narrow window the row simply overflowed. A footer costs
-        // one line and takes the whole width, so nothing on this card has to
-        // fight for room any more.
         let ekey = p.key.clone();
-        let (kopen, kread) = (p.key.clone(), p.key.clone());
-        card.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(9.))
-                .pt(px(2.))
-                .child(
-                    // CLICKABLE. A count you cannot open is a complaint, not a
-                    // control — "+53 more" told you what you were missing and
-                    // gave you no way to see it.
-                    div()
-                        .id(SharedString::from(format!("upd-more-{}", p.key)))
-                        .flex_shrink()
-                        .min_w_0()
-                        .truncate()
-                        .pl(px(15.))
-                        .py(px(2.))
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED2))
-                        .hover(|h| h.text_color(rgb(ACCENT)))
-                        .when(hidden == 0, |d| d.invisible())
-                        .child(SharedString::from(format!("+{hidden} more — show ▸")))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.standup_block_open.insert(ekey.clone());
-                            cx.notify();
-                        })),
-                )
-                .child(div().flex_1().min_w_0())
-                .child(
-                    card_action(
-                        SharedString::from(format!("upd-open-{}", p.key)),
-                        "open ▸",
-                        true,
-                    )
-                    .on_click(cx.listener(move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
-                        this.select_project(&kopen, cx)
-                    })),
-                )
-                .child(
-                    card_action(
-                        SharedString::from(format!("upd-read-{}", p.key)),
-                        "mark read",
-                        false,
-                    )
-                    .on_click(cx.listener(move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
-                        this.mark_project_read(&kread);
+        if hidden > 0 {
+            // CLICKABLE. A count you cannot open is a complaint, not a control —
+            // "+53 more" told you what you were missing and gave you no way to
+            // see it.
+            body = body.child(
+                div()
+                    .id(SharedString::from(format!("upd-more-{}", p.key)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .pt(px(2.))
+                    .w_full()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED2))
+                    .hover(|h| h.text_color(rgb(ACCENT)))
+                    .child(icon("icons/chevron-down.svg", 10., MUTED2))
+                    .child(SharedString::from(format!("{hidden} more")))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.standup_block_open.insert(ekey.clone());
                         cx.notify();
                     })),
+            );
+        }
+
+        let (kopen, kread) = (p.key.clone(), p.key.clone());
+        list_row(first)
+            .id(SharedString::from(format!("upd-{}", p.key)))
+            .hover(|h| h.bg(rgb(CARD2)))
+            // The project's own badge — the same colour and initials the rail
+            // uses. The Standup had no visual tie to the sidebar at all, so the
+            // two halves of one window looked like two applications.
+            .child(project_badge(&name, &p.key, 20.))
+            .child(body)
+            .child(
+                row_trailing(if digest {
+                    format!("{count} · {age}")
+                } else {
+                    format!("{count} update{} · {age}", if count == 1 { "" } else { "s" })
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            card_action(
+                                SharedString::from(format!("upd-read-{}", p.key)),
+                                "Mark read",
+                                Some("icons/check.svg"),
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                                    this.mark_project_read(&kread);
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            card_action(
+                                SharedString::from(format!("upd-open-{}", p.key)),
+                                "Open",
+                                Some("icons/chevron-right.svg"),
+                                true,
+                            )
+                            .on_click(cx.listener(
+                                move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
+                                    this.select_project(&kopen, cx)
+                                },
+                            )),
+                        ),
                 ),
-        )
+            )
     }
-
-
 
     /// The shape of the Standup without building it — what the rail's Standup
     /// button reports. Same `standup_bucket` the tiers use, so the two cannot
@@ -244,108 +246,95 @@ impl Orchestrator {
         name: String,
         info: &SessionInfo,
         now_ms: u64,
+        first: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The wait is the POINT of this card, so it holds the end of the top line
+        // The wait is the POINT of this card, so it holds the trailing column
         // rather than being a phase word every row would share.
         let waited = self
             .session_ready_since(info.id)
             .map(|t| crate::timefmt::ago_label(now_ms.saturating_sub(t)))
             .unwrap_or_default();
         let (jslug, jid) = (info.project_slug.clone(), info.id);
-        div()
+        let slug = info.project_slug.clone();
+        list_row(first)
             .id(SharedString::from(format!("ready-{}", info.id.0)))
-            .flex()
-            .flex_col()
-            .gap(px(5.))
-            .px(px(12.))
-            .py(px(8.))
-            .rounded(px(9.))
-            .bg(rgb(PANEL))
-            .border_1()
-            .border_color(rgb(HAIR))
-            .hover(|h| h.border_color(rgb(0x346B54)))
+            .hover(|h| h.bg(rgb(CARD2)))
+            .child(project_badge(&name, &slug, 20.))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(9.))
+                    .flex_col()
+                    .gap(px(3.))
                     .child(
                         div()
-                            .flex_none()
-                            .w(px(14.))
-                            .text_size(px(11.))
-                            .text_color(rgb(ACCENT))
-                            .child("⏎"),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(7.))
+                            .child(
+                                div()
+                                    .flex_shrink()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_STRONG))
+                                    .child(SharedString::from(termview::session_label(info))),
+                            )
+                            // The state icon rides WITH the title, not in a
+                            // column of its own: one glyph per row in a fixed
+                            // gutter was a stripe of repeated symbols down the
+                            // left edge, which is exactly the noise the badge is
+                            // better at carrying.
+                            .child(icon("icons/reply.svg", 12., ACCENT)),
                     )
                     .child(
                         div()
-                            .flex_shrink()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.5))
-                            .text_color(rgb(TEXT_STRONG))
-                            .child(SharedString::from(termview::session_label(info))),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.5))
-                            .text_color(rgb(MUTED2))
-                            .child(SharedString::from(name)),
-                    )
-                    .child(div().flex_1().min_w_0())
-                    .child(
-                        div()
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED2))
-                            .child(SharedString::from(format!("ready {waited}"))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(9.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .pl(px(23.))
+                            .w_full()
+                            // wraps to two lines rather than clipping — see the
+                            // note in `update_block`.
+                            .line_clamp(2)
                             .text_size(px(12.))
                             .text_color(rgb(TEXT))
                             .child(SharedString::from(termview::trim(
                                 info.last_message.trim(),
                                 200,
                             ))),
-                    )
-                    .child(
-                        card_action(
-                            SharedString::from(format!("ready-open-{}", info.id.0)),
-                            "open ▸",
-                            true,
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.focus_session(&jslug, jid, window, cx)
-                        })),
-                    )
-                    .child(
-                        card_action(
-                            SharedString::from(format!("ready-dismiss-{}", info.id.0)),
-                            "dismiss",
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.dismiss_ready(jid, cx)
-                        })),
                     ),
+            )
+            .child(
+                row_trailing(format!("ready {waited}")).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            card_action(
+                                SharedString::from(format!("ready-dismiss-{}", info.id.0)),
+                                "Dismiss",
+                                Some("icons/check.svg"),
+                                false,
+                            )
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.dismiss_ready(jid, cx)
+                            })),
+                        )
+                        .child(
+                            card_action(
+                                SharedString::from(format!("ready-open-{}", info.id.0)),
+                                "Open",
+                                Some("icons/chevron-right.svg"),
+                                true,
+                            )
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.focus_session(&jslug, jid, window, cx)
+                            })),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -468,18 +457,21 @@ impl Orchestrator {
         let subline = if !self.scanned {
             "Reading your Claude + Codex sessions…".to_string()
         } else {
+            // NO GLYPHS. "⚠ 2 need you · ⏎ 4 ready · ● 3 working" put four
+            // different dingbats in one sentence, where each one either repeats
+            // the word beside it or has to be learned. The words already say it.
             let mut parts = Vec::new();
             if need_n > 0 {
-                parts.push(format!("⚠ {need_n} need you"));
+                parts.push(format!("{need_n} need you"));
             }
             if ready_n > 0 {
-                parts.push(format!("⏎ {ready_n} ready for you"));
+                parts.push(format!("{ready_n} ready for you"));
             }
             if work_n > 0 {
-                parts.push(format!("● {work_n} working"));
+                parts.push(format!("{work_n} working"));
             }
             if idle_n > 0 {
-                parts.push(format!("◌ {idle_n} idle"));
+                parts.push(format!("{idle_n} idle"));
             }
             if parts.is_empty() {
                 "nothing needs you right now".to_string()
@@ -508,10 +500,12 @@ impl Orchestrator {
                 .child(
                     div().flex().flex_row().items_center().gap(px(7.))
                         .text_size(px(11.5)).font_weight(FontWeight::BOLD).text_color(rgb(0xE68A8A))
-                        .child("⛔ BLOCKED")
+                        .child(icon("icons/blocked.svg", 12., 0xE68A8A))
+                        .child("BLOCKED")
                         .child(div().text_color(rgb(MUTED2)).child(SharedString::from(blocked.len().to_string()))),
                 );
-            for (name, info) in blocked {
+            let mut group = list_group();
+            for (bi, (name, info)) in blocked.into_iter().enumerate() {
                 // the tier is built from `is_some_and(|u| u.hit)`, so this is Some —
                 // but a render path must not carry a panic that a later refactor of
                 // that gate could arm.
@@ -544,30 +538,80 @@ impl Orchestrator {
                 // so a feature that exists to handle exactly this moment is invisible
                 // at exactly this moment — which is how its owner concluded it was
                 // never built.
-                let detail = format!(
-                    "{detail} · {}",
-                    resume_promise(self.auto_continue, u.reset_at_unix.is_some())
-                );
+                let promise = resume_promise(self.auto_continue, u.reset_at_unix.is_some());
                 let (jslug, jid) = (info.project_slug.clone(), info.id);
-                tier = tier.child(
-                    div()
+                let slug = info.project_slug.clone();
+                group = group.child(
+                    list_row(bi == 0)
                         .id(SharedString::from(format!("blocked-{}", info.id.0)))
-                        .flex().flex_row().items_center().gap(px(10.))
-                        .px(px(12.)).py(px(7.)).rounded(px(9.))
-                        .bg(rgb(0x201414)).border_1().border_color(rgb(0x5a2c2c))
-                        .cursor_pointer().hover(|h| h.border_color(rgb(0x7a3c3c)))
-                        .child(div().flex_none().whitespace_nowrap().w(px(14.)).text_size(px(11.)).text_color(rgb(0xE68A8A)).child("⛔"))
-                        .child(div().flex_shrink().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
-                            .child(SharedString::from(termview::session_label(&info))))
-                        .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(rgb(MUTED2)).bg(rgb(CARD)).rounded(px(5.)).px(px(6.)).py(px(1.))
-                            .child(SharedString::from(termview::trim(&name, 20))))
-                        .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(rgb(0xE0A0A0)).child(SharedString::from(detail)))
-                        .child(div().flex_none().whitespace_nowrap().text_size(px(10.5)).text_color(rgb(MUTED2)).child("open ▸"))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.focus_session(&jslug, jid, window, cx)
-                        })),
+                        .hover(|h| h.bg(rgb(0x241A1A)))
+                        .child(project_badge(&name, &slug, 20.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(7.))
+                                        .child(
+                                            div()
+                                                .flex_shrink()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(TEXT_STRONG))
+                                                .child(SharedString::from(termview::session_label(
+                                                    &info,
+                                                ))),
+                                        )
+                                        .child(icon("icons/blocked.svg", 12., 0xE68A8A)),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(0xE0A0A0))
+                                        .child(SharedString::from(detail)),
+                                )
+                                // The PROMISE on its own line. It used to be
+                                // glued to the reset time with a "·", which made
+                                // the one sentence that says whether Kod will act
+                                // look like more timestamp.
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(MUTED2))
+                                        .child(SharedString::from(promise.to_string())),
+                                ),
+                        )
+                        .child(
+                            row_trailing(String::new()).child(
+                                card_action(
+                                    SharedString::from(format!("blocked-open-{}", info.id.0)),
+                                    "Open",
+                                    Some("icons/chevron-right.svg"),
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.focus_session(&jslug, jid, window, cx)
+                                    },
+                                )),
+                            ),
+                        ),
                 );
             }
+            tier = tier.child(group);
             feed = feed.child(tier);
         }
         // ── ⚠ NEEDS YOU — pinned top, loud, ONE CTA: open it in the terminal ──
@@ -581,7 +625,8 @@ impl Orchestrator {
                     .text_size(px(11.5))
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(AMBER))
-                    .child("⚠ NEEDS YOU")
+                    .child(icon("icons/warning.svg", 12., AMBER))
+                    .child("NEEDS YOU")
                     .child(
                         div()
                             .text_color(rgb(MUTED2))
@@ -685,7 +730,8 @@ impl Orchestrator {
                             .text_size(px(11.5))
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(ACCENT))
-                            .child("▲ WHAT HAPPENED")
+                            .child(icon("icons/feed.svg", 12., ACCENT))
+                            .child("WHAT HAPPENED")
                             // Lead with the COUNT, not the window. "what
                             // happened" means "since I last looked" to the
                             // reader; the window is only how far back the planner
@@ -731,44 +777,69 @@ impl Orchestrator {
                 // The sub-headings appear ONLY when both halves have content. A
                 // heading over the only thing on screen names nothing, and this
                 // screen has enough chrome.
+                //
+                // TWO GROUPED LISTS, not two runs of free-floating cards. Each
+                // half is one rounded surface with hairlines BETWEEN its rows,
+                // which is what makes a set of rows read as a list rather than as
+                // a pile of boxes — and it is the whole reason the sub-headings
+                // can be quiet now: the grouping itself does the dividing that
+                // two loud labels were being asked to do.
                 let split = ready_n > 0 && !plan.is_empty();
                 if ready_n > 0 {
                     if split {
                         tier = tier.child(sub_heading("READY FOR YOU", ACCENT));
                     }
                     let ready_now = crate::render_sidebar::wall_now_ms();
-                    for (name, info) in ready {
-                        tier = tier.child(self.ready_row(name, &info, ready_now, cx));
+                    let mut group = list_group();
+                    for (i, (name, info)) in ready.into_iter().enumerate() {
+                        group = group.child(self.ready_row(name, &info, ready_now, i == 0, cx));
                     }
+                    tier = tier.child(group);
                     if split {
                         tier = tier.child(sub_heading("NOTHING TO ACT ON", MUTED2));
                     }
                 }
                 // No NEW bar: the header already says "{n} new since you last
                 // looked", and a heading that repeats the line above it is chrome.
-                for pp in &plan.projects {
-                    tier = tier.child(self.update_block(pp, pname(&pp.key), plan.density, now_ms, cx));
-                }
-                if plan.hidden_projects > 0 {
-                    let n = plan.hidden_projects;
-                    tier = tier.child(
-                        div()
-                            .id("upd-show-all")
-                            .px(px(12.))
-                            .py(px(3.))
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED2))
-                            .hover(|h| h.text_color(rgb(ACCENT)))
-                            .child(SharedString::from(format!(
-                                "{n} more project{} — show all ▸",
-                                if n == 1 { "" } else { "s" }
-                            )))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.standup_updates_all = true;
-                                cx.notify();
-                            })),
-                    );
+                if !plan.is_empty() || plan.hidden_projects > 0 {
+                    let mut group = list_group();
+                    for (i, pp) in plan.projects.iter().enumerate() {
+                        group = group.child(self.update_block(
+                            pp,
+                            pname(&pp.key),
+                            plan.density,
+                            now_ms,
+                            i == 0,
+                            cx,
+                        ));
+                    }
+                    if plan.hidden_projects > 0 {
+                        // A FOOTER ROW of the same list, not a loose line under
+                        // it: "show the rest" belongs to the list it extends, and
+                        // as a bare line it read as an unrelated caption.
+                        let n = plan.hidden_projects;
+                        group = group.child(
+                            list_row(plan.projects.is_empty())
+                                .id("upd-show-all")
+                                .py(px(8.))
+                                .items_center()
+                                .gap(px(6.))
+                                .cursor_pointer()
+                                .text_size(px(11.5))
+                                .text_color(rgb(MUTED2))
+                                .hover(|h| h.bg(rgb(CARD2)).text_color(rgb(ACCENT)))
+                                .child(icon("icons/chevron-down.svg", 11., MUTED2))
+                                .child(SharedString::from(format!(
+                                    "Show {n} more project{}",
+                                    if n == 1 { "" } else { "s" }
+                                )))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.standup_updates_all = true;
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    tier = tier.child(group);
                 }
                 feed = feed.child(tier);
             }
@@ -817,7 +888,8 @@ impl Orchestrator {
                         .text_size(px(11.5))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(MUTED2))
-                        .child("● LIVE")
+                        .child(icon("icons/working.svg", 12., MUTED))
+                        .child("LIVE")
                         .child(
                             div()
                                 .text_color(rgb(MUTED2))
@@ -861,26 +933,33 @@ impl Orchestrator {
                                 .text_color(rgb(MUTED))
                                 .child(SharedString::from(summary.line())),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .text_size(px(10.5))
-                                .text_color(rgb(MUTED2))
-                                .child(if open { "hide ▾" } else { "show ▸" }),
-                        )
+                        .child(icon(
+                            if open {
+                                "icons/chevron-down.svg"
+                            } else {
+                                "icons/chevron-right.svg"
+                            },
+                            11.,
+                            MUTED2,
+                        ))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.standup_live_open = !this.standup_live_open;
                             cx.notify();
                         })),
                 );
             if open {
-                for (busy, (name, info)) in working
+                // COMPACT ON PURPOSE. These rows are the ambient half — nothing
+                // here wants anything — so they get one line each inside a single
+                // group, rather than the two-line treatment the actionable tiers
+                // earn. Same grammar, less of it.
+                let mut group = list_group();
+                for (li, (busy, (name, info))) in working
                     .into_iter()
                     .map(|r| (true, r))
                     .chain(idle.into_iter().map(|r| (false, r)))
+                    .enumerate()
                 {
-                    let (glyph, gcol): (&str, u32) = if busy { ("●", GREEN) } else { ("◌", MUTED2) };
+                    let gcol = if busy { GREEN } else { MUTED2 };
                     let doing = {
                         let m = info.last_message.trim();
                         if m.is_empty() {
@@ -890,26 +969,45 @@ impl Orchestrator {
                         }
                     };
                     let (jslug, jid) = (info.project_slug.clone(), info.id);
-                    tier = tier.child(
-                        div()
+                    let slug = info.project_slug.clone();
+                    group = group.child(
+                        list_row(li == 0)
                             .id(SharedString::from(format!("live-{}", jid.0)))
-                            .flex().flex_row().items_center().gap(px(10.))
-                            .px(px(12.)).py(px(7.)).rounded(px(9.))
-                            .bg(rgb(PANEL)).border_1().border_color(rgb(HAIR))
-                            .cursor_pointer().hover(|h| h.border_color(rgb(0x36404A)))
-                            .child(div().flex_none().whitespace_nowrap().w(px(14.)).text_size(px(11.)).text_color(rgb(gcol)).child(glyph))
-                            .child(div().flex_shrink().w(px(150.)).min_w_0().truncate().text_size(px(12.5)).text_color(rgb(TEXT_STRONG))
-                                .child(SharedString::from(termview::session_label(&info))))
-                            .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(rgb(MUTED2)).bg(rgb(CARD)).rounded(px(5.)).px(px(6.)).py(px(1.))
-                                .child(SharedString::from(termview::trim(&name, 20))))
-                            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(rgb(MUTED)).child(SharedString::from(doing)))
-                            .when_some(info.usage_limit.clone(), |c, u| c.child(crate::render_sidebar::usage_chip(&u)))
-                            .child(div().flex_none().whitespace_nowrap().text_size(px(10.5)).text_color(rgb(MUTED2)).child("open ▸"))
+                            .items_center()
+                            .py(px(7.))
+                            .gap(px(8.))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(CARD2)))
+                            .child(project_badge(&name, &slug, 16.))
+                            .child(dot(gcol))
+                            .child(
+                                div()
+                                    .flex_shrink()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(TEXT_STRONG))
+                                    .child(SharedString::from(termview::session_label(&info))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(MUTED))
+                                    .child(SharedString::from(doing)),
+                            )
+                            .when_some(info.usage_limit.clone(), |c, u| {
+                                c.child(crate::render_sidebar::usage_chip(&u))
+                            })
+                            .child(icon("icons/chevron-right.svg", 11., MUTED2))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 this.focus_session(&jslug, jid, window, cx)
                             })),
                     );
                 }
+                tier = tier.child(group);
             }
             feed = feed.child(tier);
         }
@@ -1208,10 +1306,15 @@ impl Orchestrator {
                         .py(px(6.))
                         .child(
                             div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
                                 .text_size(px(11.5))
                                 .text_color(rgb(AMBER))
+                                .child(icon("icons/warning.svg", 11., AMBER))
                                 .child(SharedString::from(format!(
-                                    "⚠ {n} session summar{} failed in the last day — retrying on a backoff.",
+                                    "{n} session summar{} failed in the last day — retrying on a backoff.",
                                     if n == 1 { "y" } else { "ies" }
                                 ))),
                         )
@@ -1607,67 +1710,53 @@ impl Orchestrator {
         } else {
             format!("waiting {}", orchestrator_core::recap::rel_time(age_secs))
         };
-        let actions = div().flex().flex_row().items_center().gap(px(8.)).child(
-            div()
-                .id(SharedString::from(format!("term-{eid}")))
-                .px(px(15.))
-                .py(px(6.))
-                .rounded(px(9.))
-                .cursor_pointer()
-                .bg(rgb(0x23413a))
-                .border_1()
-                .border_color(rgb(0x346b54))
-                .text_size(px(12.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(ACCENT))
-                .child("Open in terminal ▸")
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.focus_session(&slug, id, window, cx)
-                })),
-        );
+        let bslug = slug.clone();
+        // DELIBERATELY NOT a list_row. Every other tier is a grouped list
+        // because its rows are peers you scan; this one is the interruption, and
+        // it earns a card of its own — amber ground, a full-size question, and
+        // one button. Flattening it into the same list would have made "an agent
+        // is stopped, waiting on you" look exactly like "a project has news".
         div()
             .id(SharedString::from(format!("need-{eid}")))
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .p(px(14.))
-            .rounded(px(12.))
-            .bg(rgb(0x201a10))
+            .gap(px(9.))
+            .p(px(13.))
+            .rounded(px(10.))
+            .bg(rgb(AMBER_INK))
             .border_1()
-            .border_color(rgb(0x5a4a2c))
+            .border_color(rgb(AMBER_HAIR))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(9.))
+                    .child(project_badge(&name, &bslug, 20.))
                     .child(
                         div()
-                            .text_size(px(14.5))
+                            .flex_shrink()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_STRONG))
                             .child(SharedString::from(termview::session_label(&info))),
                     )
+                    .child(icon("icons/warning.svg", 13., AMBER))
+                    .child(div().flex_1().min_w_0())
                     .child(
                         div()
+                            .flex_none()
+                            .whitespace_nowrap()
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED2))
-                            .bg(rgb(PANEL))
-                            .border_1()
-                            .border_color(rgb(HAIR))
-                            .rounded(px(6.))
-                            .px(px(7.))
-                            .py(px(1.))
-                            .child(SharedString::from(name)),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(11.5))
                             .text_color(rgb(AMBER))
                             .child(SharedString::from(waiting)),
                     ),
             )
+            // THE ASK, at reading size. This is the only text on the Standup the
+            // user has to actually answer, so it is the only text allowed to be
+            // bigger than the row titles around it.
             .child(
                 div()
                     .text_size(px(13.5))
@@ -1676,7 +1765,22 @@ impl Orchestrator {
                         ask.chars().take(170).collect::<String>(),
                     )),
             )
-            .child(actions)
+            .child(
+                div().flex().flex_row().items_center().gap(px(8.)).child(
+                    card_action(
+                        SharedString::from(format!("term-{eid}")),
+                        "Open in terminal",
+                        Some("icons/chevron-right.svg"),
+                        true,
+                    )
+                    .h(px(30.))
+                    .px(px(13.))
+                    .text_size(px(12.5))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.focus_session(&slug, id, window, cx)
+                    })),
+                ),
+            )
             .into_any_element()
     }
 
@@ -1795,29 +1899,34 @@ pub(crate) fn standup_thread_hint(summaries_on: bool, _thread_empty: bool) -> Op
 /// without turning a dense row into a toolbar. `primary` tints the one that
 /// carries the row's main verb; the other stays quiet so the pair reads as an
 /// action and its alternative rather than as two equal choices.
-fn card_action(id: impl Into<ElementId>, label: &'static str, primary: bool) -> Stateful<Div> {
-    let (fg, edge) = if primary {
-        (ACCENT, 0x346B54)
-    } else {
-        (MUTED, HAIR)
-    };
+/// The right-hand column of a list row: the timestamp, and the controls under
+/// it.
+///
+/// Stacked rather than strung out along the title line, and that is the fix for
+/// a bug that shipped twice: a row whose name, project, count, age and two
+/// buttons were all `flex_none` on ONE line has no give, so a narrow window
+/// pushed the right-hand side off the card instead of truncating anything. Here
+/// exactly one thing (the body text) is allowed to shrink, and this column is
+/// the only fixed-width element on the row.
+fn row_trailing(meta: String) -> Div {
     div()
-        .id(id)
         .flex_none()
         .flex()
-        .items_center()
-        .whitespace_nowrap()
-        .h(px(26.))
-        .px(px(12.))
-        .rounded(px(7.))
-        .bg(rgb(CARD2))
-        .border_1()
-        .border_color(rgb(edge))
-        .cursor_pointer()
-        .text_size(px(11.5))
-        .text_color(rgb(fg))
-        .hover(|h| h.bg(rgb(CARD)).border_color(rgb(fg)).text_color(rgb(fg)))
-        .child(label)
+        .flex_col()
+        .items_end()
+        .gap(px(6.))
+        // An empty meta must not reserve its line: a blank text node still
+        // occupies a row in the column and pushed the controls down by half a
+        // line on exactly the rows that have no timestamp to show.
+        .when(!meta.is_empty(), |d| {
+            d.child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(10.5))
+                    .text_color(rgb(MUTED2))
+                    .child(SharedString::from(meta)),
+            )
+        })
 }
 
 /// A section label INSIDE a tier — lighter than a tier heading, because it

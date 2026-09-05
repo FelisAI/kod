@@ -18,16 +18,44 @@ use crate::winchrome::{
 };
 use crate::*;
 
-/// Embedded assets (the Kod mark) — gpui resolves `svg().path(...)` here.
+/// Embedded assets (the Kod mark and the icon set) — gpui resolves
+/// `svg().path(...)` here.
+///
+/// Every icon is a SINGLE-COLOUR outline: gpui rasterises the file and uses it
+/// as a MASK, painting it in the element's `text_color`. So the `stroke` value
+/// in the file is arbitrary and the call site owns the colour — which is what
+/// lets one `warning.svg` be amber in the Standup and red on the rail without a
+/// second file.
 pub(crate) struct Assets;
+
+macro_rules! embedded {
+    ($path:expr, $($name:literal),+ $(,)?) => {
+        match $path {
+            $($name => Some(std::borrow::Cow::Borrowed(
+                include_bytes!(concat!("../assets/", $name)) as &'static [u8],
+            )),)+
+            _ => None,
+        }
+    };
+}
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        Ok(match path {
-            "logo/kod.svg" => Some(std::borrow::Cow::Borrowed(include_bytes!(
-                "../assets/logo/kod.svg"
-            ))),
-            _ => None,
-        })
+        Ok(embedded!(
+            path,
+            "logo/kod.svg",
+            "icons/chevron-right.svg",
+            "icons/chevron-down.svg",
+            "icons/chevron-up.svg",
+            "icons/check.svg",
+            "icons/reply.svg",
+            "icons/warning.svg",
+            "icons/blocked.svg",
+            "icons/working.svg",
+            "icons/idle.svg",
+            "icons/feed.svg",
+            "icons/restore.svg",
+        ))
     }
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
         Ok(Vec::new())
@@ -162,10 +190,19 @@ pub(crate) fn run() {
         // ORCH_DEMO pins the window at a known origin so a region screenshot can
         // crop to it without accessibility access (verification only) — it
         // deliberately outranks any restored geometry.
-        let bounds = if std::env::var("ORCH_DEMO").is_ok() {
+        let bounds = if let Ok(v) = std::env::var("ORCH_DEMO") {
+            // `ORCH_DEMO=1` pins the default size; `ORCH_DEMO=420x820` pins that
+            // one. The narrow form is the point: the Standup has now twice
+            // shipped a row that overflows instead of truncating below roughly
+            // 450px, and without accessibility access there is no other way to
+            // put the window at a chosen width and photograph the result.
+            let (w, h) = v
+                .split_once('x')
+                .and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?)))
+                .unwrap_or((1240., 820.));
             Bounds {
                 origin: point(px(60.), px(60.)),
-                size: gpui::size(px(1240.), px(820.)),
+                size: gpui::size(px(w), px(h)),
             }
         } else if let Some(b) = saved_bounds {
             b

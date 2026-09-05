@@ -32,6 +32,112 @@ pub(crate) const GREEN: u32 = 0x5BB99B;
 /// agent needs nothing from him; GREEN means "idle, come drive me".
 pub(crate) const ORANGE: u32 = 0xE08A4E;
 
+/// The fill behind a PRIMARY action — a teal so far down toward the ground that
+/// it reads as a raised surface rather than a coloured button. Full-strength
+/// ACCENT as a fill would make every card shout the same volume as ⚠ NEEDS YOU.
+pub(crate) const ACCENT_INK: u32 = 0x1A2F28;
+pub(crate) const ACCENT_HAIR: u32 = 0x2E5145;
+
+/// One icon from the embedded set (`icons/*.svg`), painted in `color`.
+///
+/// gpui uses the file as a MASK, so the stroke colour inside the SVG is
+/// irrelevant and every call site picks its own — one `warning.svg` serves the
+/// amber standup row and a red rail badge.
+///
+/// `flex_none` because an icon that shrinks is a smudge: these sit in flex rows
+/// beside text that is *supposed* to give ground first.
+pub(crate) fn icon(path: &'static str, size: f32, color: u32) -> Svg {
+    svg()
+        .path(path)
+        .w(px(size))
+        .h(px(size))
+        .flex_none()
+        .text_color(rgb(color))
+}
+
+/// A row action: a FILLED low-contrast chip, not an outlined pill.
+///
+/// Three things here are deliberate.
+///
+/// **The fill carries the weight, the border only defines the edge.** The old
+/// chip was an outline on the card colour, which is the web's button and reads
+/// as a form control; a Mac control is a raised surface. Primary gets
+/// `ACCENT_INK` — teal pulled almost to the ground — so it is unmistakably the
+/// default action without shouting at the volume ⚠ NEEDS YOU is allowed to use.
+///
+/// **26px stays.** That is the height that finally made these hittable, and no
+/// amount of restyling is worth giving it back.
+///
+/// **Hover moves the FILL, never the text colour.** The icon is masked in `fg`
+/// at build time and cannot follow a hover, so a hover that recoloured the label
+/// would leave the glyph beside it behind — a two-tone chip. Lifting the surface
+/// is also just what AppKit does.
+pub(crate) fn card_action(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    glyph: Option<&'static str>,
+    primary: bool,
+) -> Stateful<Div> {
+    let (fg, bg, edge, lift) = if primary {
+        (ACCENT, ACCENT_INK, ACCENT_HAIR, 0x224037)
+    } else {
+        (MUTED, CARD2, HAIR, 0x2C333F)
+    };
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .whitespace_nowrap()
+        .h(px(26.))
+        .px(px(10.))
+        .rounded(px(6.))
+        .bg(rgb(bg))
+        .border_1()
+        .border_color(rgb(edge))
+        .cursor_pointer()
+        .text_size(px(11.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(fg))
+        .hover(|h| h.bg(rgb(lift)).border_color(rgb(fg)))
+        .when_some(glyph, |d, g| d.child(icon(g, 11., fg)))
+        .child(label)
+}
+
+/// A macOS grouped list: ONE rounded surface, rows full-bleed inside it,
+/// hairlines only BETWEEN them (see `list_row`).
+///
+/// This replaces a stack of individually-bordered cards. A border per card
+/// draws N rectangles competing for the eye and makes the gaps between them
+/// read as structure they do not carry; a group draws one, and the rows inside
+/// it become a list — which is what they always were.
+pub(crate) fn list_group() -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(10.))
+        .bg(rgb(CARD))
+        .border_1()
+        .border_color(rgb(HAIR))
+        .overflow_hidden()
+}
+
+/// A row inside `list_group`. `first` suppresses the separator, so callers can
+/// enumerate without special-casing the head of the list.
+pub(crate) fn list_row(first: bool) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(10.))
+        .px(px(12.))
+        .py(px(10.))
+        .when(!first, |d| {
+            d.border_t_1().border_color(rgb(HAIR_SOFT))
+        })
+}
+
 pub(crate) fn dot(color: u32) -> impl IntoElement {
     div().w(px(7.)).h(px(7.)).rounded(px(4.)).bg(rgb(color))
 }
@@ -107,17 +213,6 @@ pub(crate) fn section_header(label: &str, count: Option<usize>, color: u32) -> i
             )
         })
         .child(div().flex_1().h(px(1.)).bg(rgb(HAIR_SOFT)))
-}
-
-pub(crate) fn accent_btn(label: &str) -> impl IntoElement {
-    div()
-        .px(px(10.))
-        .py(px(4.))
-        .rounded(px(8.))
-        .bg(rgb(ACCENT))
-        .text_size(px(12.))
-        .text_color(rgb(0x0C140F))
-        .child(SharedString::from(label.to_string()))
 }
 
 /// A centered notice for a stage's empty / loading / error states.
