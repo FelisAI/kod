@@ -65,11 +65,25 @@ pub enum PhoneMsg {
     Input { sid: u64, text: String, #[serde(default)] rid: u64 },
     /// One control key, for answering a prompt an agent is already showing.
     Key { sid: u64, key: PhoneKeyName, #[serde(default)] rid: u64 },
+    /// Start or stop receiving this session's terminal.
+    ///
+    /// EXPLICIT, and per session, because the daemon repaints a grid per tick
+    /// per session: streaming every session to every phone would spend a radio
+    /// on screens nobody is looking at. One watch at a time — a second `watch`
+    /// replaces the first, so the phone cannot leak subscriptions by forgetting
+    /// to turn one off.
+    Watch { sid: u64, #[serde(default = "yes")] on: bool },
     /// Any `t` this build does not know. This variant is what makes rule 2
     /// above *structural*: an unrecognized type is a value we can answer, not a
     /// parse failure that would tempt the loop into dropping the socket.
     #[serde(other)]
     Unknown,
+}
+
+/// `watch` with no `on` means "start" — the common case, and the one a
+/// hand-written client is likeliest to send.
+fn yes() -> bool {
+    true
 }
 
 /// The keys a phone may press, as the phone spells them.
@@ -176,12 +190,17 @@ pub struct Caps {
     /// that any particular session will accept one. That is per-session
     /// ([`WireSession::can_input`]) and, for real, the daemon's call.
     pub input: bool,
+    /// This bridge understands `watch` and will send `grid` frames. An older
+    /// bridge omits it, so `#[serde(default)]` reads as false and a newer phone
+    /// simply does not offer the terminal.
+    #[serde(default)]
+    pub grid: bool,
 }
 
 impl Caps {
     /// The only caps this bridge ever sends.
     pub fn v0() -> Self {
-        Self { input: true }
+        Self { input: true, grid: true }
     }
 }
 
@@ -215,6 +234,26 @@ pub enum BridgeMsg {
     Gone {
         epoch: String,
         sid: u64,
+    },
+    /// One session's terminal, as PLAIN TEXT lines.
+    ///
+    /// Plain text, not style runs, and that is a size decision before it is a
+    /// design one: a styled grid is several times the bytes and `MAX_FRAME` is
+    /// 64KB, so colour would buy a payload that can fail to fit for information
+    /// the phone can already read — claude's selection marker is the character
+    /// `❯`, and a diff still says `+` and `-`. Runs can be added later without
+    /// breaking this frame.
+    ///
+    /// Sent ONLY to a connection that asked for this `sid` with `watch`.
+    Grid {
+        epoch: String,
+        sid: u64,
+        cols: u16,
+        rows: u16,
+        /// One string per visible row, trailing blanks trimmed.
+        lines: Vec<String>,
+        /// (row, col) of the cursor, or null when it is hidden.
+        cursor: Option<(u16, u16)>,
     },
     Pong,
     /// The answer to exactly one `input` or `key`, ok or not.
@@ -452,7 +491,7 @@ mod tests {
         };
         assert_eq!(
             v(&m),
-            json!({"t":"hello_ok","proto":2,"epoch":"e1","server_time":1234,"caps":{"input":true}})
+            json!({"t":"hello_ok","proto":2,"epoch":"e1","server_time":1234,"caps":{"input":true,"grid":true}})
         );
     }
 
@@ -565,6 +604,7 @@ mod tests {
                 BridgeMsg::Gone { .. } => "gone",
                 BridgeMsg::Pong => "pong",
                 BridgeMsg::InputResult { .. } => "input_result",
+                BridgeMsg::Grid { .. } => "grid",
                 BridgeMsg::Err { .. } => "err",
             }
         }
@@ -585,6 +625,14 @@ mod tests {
             BridgeMsg::Gone { epoch: "e".into(), sid: 1 },
             BridgeMsg::Pong,
             BridgeMsg::input_ok(1, 1),
+            BridgeMsg::Grid {
+                epoch: "e".into(),
+                sid: 1,
+                cols: 80,
+                rows: 24,
+                lines: vec!["$ ls".into()],
+                cursor: Some((0, 4)),
+            },
             BridgeMsg::err("c", "m"),
         ];
         let mut seen: Vec<&str> = Vec::new();
@@ -598,6 +646,7 @@ mod tests {
             [
                 "err",
                 "gone",
+                "grid",
                 "hello_err",
                 "hello_ok",
                 "input_result",
@@ -607,6 +656,7 @@ mod tests {
             ]
         );
         assert!(Caps::v0().input, "the composer flag the iOS app reads went dark");
+        assert!(Caps::v0().grid, "the terminal flag the iOS app reads went dark");
     }
 
     #[test]
@@ -618,6 +668,7 @@ mod tests {
                 PhoneMsg::Ping => "ping",
                 PhoneMsg::Input { .. } => "input",
                 PhoneMsg::Key { .. } => "key",
+                PhoneMsg::Watch { .. } => "watch",
                 PhoneMsg::Unknown => "<unknown>",
             }
         }
@@ -625,6 +676,21 @@ mod tests {
         assert_eq!(tag(&decode_frame(br#"{"t":"ping"}"#).unwrap()), "ping");
         assert_eq!(tag(&decode_frame(br#"{"t":"input","sid":1,"text":"hi"}"#).unwrap()), "input");
         assert_eq!(tag(&decode_frame(br#"{"t":"key","sid":1,"key":"enter"}"#).unwrap()), "key");
+        assert_eq!(
+            tag(&decode_frame(br#"{"t":"watch","sid":1,"on":true}"#).unwrap()),
+            "watch"
+        );
+        // `on` defaults to TRUE: a bare watch means start, which is what a
+        // hand-written client will send and the only reading that is not a
+        // silent no-op.
+        assert_eq!(
+            decode_frame(br#"{"t":"watch","sid":4}"#).unwrap(),
+            PhoneMsg::Watch { sid: 4, on: true }
+        );
+        assert_eq!(
+            decode_frame(br#"{"t":"watch","sid":4,"on":false}"#).unwrap(),
+            PhoneMsg::Watch { sid: 4, on: false }
+        );
         // Anything a future phone invents still lands in `Unknown`, which the
         // server answers with `err` rather than a disconnect.
         assert_eq!(tag(&decode_frame(br#"{"t":"approve","sid":1}"#).unwrap()), "<unknown>");

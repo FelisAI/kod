@@ -556,6 +556,11 @@ pub enum Step {
     /// this file — the daemon resolves the session's kind from its own state and
     /// refuses shells, dead sessions and unknown ids.
     Ask { rid: u64, sid: u64, ask: PhoneAsk },
+    /// Point this connection's terminal stream at `sid`, or turn it off.
+    ///
+    /// Like [`Step::Accept`], the protocol decides only that the ask is
+    /// well-formed: it holds no [`Hub`] and cannot register anything itself.
+    Watch { sid: u64, on: bool },
 }
 
 /// The two things a phone may ask for, after the wire layer has vetted the shape.
@@ -647,6 +652,10 @@ impl Protocol {
                     "this bridge does not know that key",
                 )]),
             },
+            // No `rid`, and no result frame: a watch is not an ask the daemon
+            // answers, and the phone learns it worked because grids start
+            // arriving. Turning one off is fire-and-forget by the same logic.
+            (true, PhoneMsg::Watch { sid, on }) => Step::Watch { sid, on },
             // The no-lockstep rule: answer, do NOT hang up. A phone one version
             // ahead sending a message this build has never heard of is a normal
             // event, not a protocol violation.
@@ -680,6 +689,12 @@ struct Sub {
     tx: Sender<BridgeMsg>,
     /// How many messages are queued and unread. See [`MAX_BACKLOG`].
     backlog: Arc<AtomicUsize>,
+    /// The ONE session whose terminal this connection asked for, if any.
+    ///
+    /// One, not a set: a phone shows one session at a time, and a set would let
+    /// a client accumulate subscriptions it never turns off — each one a grid
+    /// per daemon tick down a radio.
+    watching: Option<u64>,
 }
 
 struct HubState {
@@ -766,7 +781,7 @@ impl Hub {
         let id = st.next_sub;
         st.next_sub += 1;
         let snapshot = st.sessions.values().cloned().collect();
-        st.subs.push(Sub { id, tx, backlog: Arc::clone(&backlog) });
+        st.subs.push(Sub { id, tx, backlog: Arc::clone(&backlog), watching: None });
         ClientHandle { id, snapshot, rx, backlog }
     }
 
@@ -811,6 +826,48 @@ impl Hub {
         let msg = BridgeMsg::Session { epoch: self.epoch.clone(), rev, session };
         broadcast(&mut st, msg);
         Some(rev)
+    }
+
+    /// Point one connection's terminal stream at a session, or turn it off.
+    pub fn watch(&self, sub_id: u64, sid: Option<u64>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sub) = st.subs.iter_mut().find(|s| s.id == sub_id) {
+            sub.watching = sid;
+        }
+    }
+
+    /// Is anyone watching this session? The pump asks before doing the work of
+    /// projecting a grid nobody wants.
+    pub fn is_watched(&self, sid: u64) -> bool {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.subs.iter().any(|s| s.watching == Some(sid))
+    }
+
+    /// Send one terminal frame to the connections watching that session, and to
+    /// no one else.
+    pub fn grid(&self, msg: BridgeMsg) {
+        let sid = match &msg {
+            BridgeMsg::Grid { sid, .. } => *sid,
+            _ => return,
+        };
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.subs.retain(|sub| {
+            if sub.watching != Some(sid) {
+                return true;
+            }
+            // A watcher that has fallen behind loses the SUBSCRIPTION, exactly
+            // like `broadcast` — a grid stream is the easiest way to build a
+            // backlog, so it must obey the same bound rather than get an
+            // exemption for being "just a repaint".
+            if sub.backlog.load(Ordering::Relaxed) >= MAX_BACKLOG {
+                return false;
+            }
+            if sub.tx.send(msg.clone()).is_err() {
+                return false;
+            }
+            sub.backlog.fetch_add(1, Ordering::Relaxed);
+            true
+        });
     }
 
     /// Drop a session and broadcast `gone`.
@@ -1621,8 +1678,49 @@ pub fn pump(
                 }
             }
             Some(Change::Closed(id)) => hub.gone(id.0),
+            // A grid nobody asked for is dropped here, before it is projected:
+            // the daemon sends one per session per tick, and this is the line
+            // that keeps a phone's radio out of every session it is not looking
+            // at.
+            Some(Change::Grid(id)) => {
+                if hub.is_watched(id.0) {
+                    if let Some(g) = mirror.grids.get(&id) {
+                        hub.grid(grid_msg(hub.epoch().to_string(), id.0, g));
+                    }
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// One [`GridSnapshot`] as the phone's `grid` frame.
+///
+/// Trailing BLANK ROWS are dropped as well as trailing spaces: a claude session
+/// in an 80x40 terminal is mostly empty below the prompt, and sending twenty
+/// empty strings per tick is the same waste as sending the padding inside them.
+/// The row count still reports the real viewport, so the phone can tell a short
+/// screen from a truncated one.
+fn grid_msg(epoch: String, sid: u64, g: &orchestrator_host::emulator::GridSnapshot) -> BridgeMsg {
+    let mut lines = g.plain_lines();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let cols: usize = g
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|run| run.text.chars().count()).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    BridgeMsg::Grid {
+        epoch,
+        sid,
+        cols: cols as u16,
+        rows: g.rows.len() as u16,
+        lines,
+        cursor: g
+            .cursor_visible
+            .then(|| (g.cursor.0 as u16, g.cursor.1 as u16)),
     }
 }
 
@@ -1847,6 +1945,12 @@ fn conn(
                     if !send_all(&mut ws, &[frame]) {
                         break;
                     }
+                }
+                // No daemon round trip and no reply frame: a watch only re-points
+                // this connection's own stream, and the phone learns it took
+                // because grids start (or stop) arriving.
+                Step::Watch { sid, on } => {
+                    hub.watch(handle.id, if on { Some(sid) } else { None });
                 }
                 _ => {}
             },
@@ -2551,6 +2655,58 @@ mod tests {
         let h = hub.attach_client();
         assert_eq!(h.snapshot[0].sid, 1);
         assert!(h.drain().unwrap().is_empty());
+    }
+
+    /// A terminal goes to the phone that ASKED and to nobody else. Two phones
+    /// share one hub, and a grid is the largest thing on this wire — leaking it
+    /// to a connection that never watched would spend a stranger's radio on a
+    /// screen they did not open, and put a session's contents on a device that
+    /// never requested it.
+    #[test]
+    fn a_grid_reaches_only_the_connection_watching_that_session() {
+        let hub = Hub::new("e1");
+        let watcher = hub.attach_client();
+        let bystander = hub.attach_client();
+        hub.watch(watcher.id, Some(7));
+
+        assert!(hub.is_watched(7), "the pump must know to project this one");
+        assert!(!hub.is_watched(8), "nothing is watching 8");
+
+        hub.grid(BridgeMsg::Grid {
+            epoch: "e1".into(),
+            sid: 7,
+            cols: 80,
+            rows: 24,
+            lines: vec!["$ whoami".into()],
+            cursor: None,
+        });
+        let got = watcher.drain().unwrap();
+        assert_eq!(got.len(), 1, "the watcher gets exactly one frame");
+        assert!(matches!(&got[0], BridgeMsg::Grid { sid: 7, .. }));
+        assert!(bystander.drain().unwrap().is_empty(), "a grid must never broadcast");
+
+        // A grid for a session nobody watches goes nowhere at all.
+        hub.grid(BridgeMsg::Grid {
+            epoch: "e1".into(),
+            sid: 8,
+            cols: 80,
+            rows: 24,
+            lines: vec!["secret".into()],
+            cursor: None,
+        });
+        assert!(watcher.drain().unwrap().is_empty());
+
+        // Turning it off stops the stream, and one watch replaces another.
+        hub.watch(watcher.id, None);
+        hub.grid(BridgeMsg::Grid {
+            epoch: "e1".into(),
+            sid: 7,
+            cols: 80,
+            rows: 24,
+            lines: vec!["$ still here".into()],
+            cursor: None,
+        });
+        assert!(watcher.drain().unwrap().is_empty(), "unwatch must actually stop it");
     }
 
     #[test]
