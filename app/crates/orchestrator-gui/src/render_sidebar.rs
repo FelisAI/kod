@@ -675,6 +675,16 @@ impl Orchestrator {
                         this.screen = Screen::Standup;
                         cx.notify();
                     }))
+                    // THE LEGEND, ON HOVER. The button can only ever show its
+                    // single most urgent mark, so four of the five states are
+                    // invisible at any moment and the one on screen has to be
+                    // recognised from memory. Hovering names it — and names the
+                    // ones it is outranking, which the pills cannot do for the
+                    // quiet tiers without adding a count that is never zero.
+                    .tooltip(move |_, cx| {
+                        let rows = crate::render_standup::tip_rows(&sc);
+                        cx.new(|_| StandupTip { rows }).into()
+                    })
                     // THE GLYPH IS THE STATE, not decoration. It used to be "◳",
                     // which names nothing — the one place you look to decide
                     // whether to look was carrying a shape with no meaning. It is
@@ -1587,5 +1597,48 @@ mod row_tone_tests {
         u.sort_unstable();
         u.dedup();
         assert_eq!(u.len(), all.len(), "two tones render identically");
+    }
+}
+
+/// The Standup button's hover legend: one line per non-empty tier.
+///
+/// A view of its own because gpui's `tooltip` takes an `AnyView` — it renders in
+/// its own layer above the window, which is also why it may overflow the rail's
+/// width without being clipped by it.
+pub(crate) struct StandupTip {
+    rows: Vec<(&'static str, u32, String)>,
+}
+
+impl Render for StandupTip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(5.))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(8.))
+            .bg(rgb(CARD2))
+            .border_1()
+            .border_color(rgb(HAIR))
+            .shadow_lg();
+        for (ic, col, text) in &self.rows {
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.))
+                    .whitespace_nowrap()
+                    .child(icon(ic, 11., *col))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(TEXT))
+                            .child(SharedString::from(text.clone())),
+                    ),
+            );
+        }
+        card
     }
 }

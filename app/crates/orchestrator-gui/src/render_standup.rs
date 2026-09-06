@@ -1964,6 +1964,60 @@ pub(crate) struct StandupCounts {
     pub idle: usize,
 }
 
+/// One line per non-empty tier, for the Standup button's tooltip: the icon, its
+/// colour, and what that condition MEANS in words.
+///
+/// The button can only ever show its single most urgent mark, so four of the
+/// five states are invisible at any moment and the one on screen has to be
+/// decoded from memory. This is the legend, produced on hover — and it is what
+/// makes a quiet mark honest: "3 working" is a different silence from "nothing
+/// running", and the button draws those almost identically on purpose.
+///
+/// The wording is the tiers' own, so reading it once teaches the icon.
+pub(crate) fn tip_rows(sc: &StandupCounts) -> Vec<(&'static str, u32, String)> {
+    let mut out: Vec<(&'static str, u32, String)> = Vec::new();
+    let plural = |n: usize| if n == 1 { "session" } else { "sessions" };
+    if sc.blocked > 0 {
+        out.push((
+            "icons/blocked.svg",
+            0xE68A8A,
+            format!("{} {} blocked on a limit", sc.blocked, plural(sc.blocked)),
+        ));
+    }
+    if sc.needs > 0 {
+        out.push((
+            "icons/warning.svg",
+            AMBER,
+            format!("{} waiting on your answer", sc.needs),
+        ));
+    }
+    if sc.ready > 0 {
+        out.push((
+            "icons/reply.svg",
+            ACCENT,
+            format!("{} finished a turn — your move", sc.ready),
+        ));
+    }
+    if sc.working > 0 {
+        out.push((
+            "icons/dot.svg",
+            ORANGE,
+            format!("{} working — wants nothing", sc.working),
+        ));
+    }
+    if sc.idle > 0 {
+        out.push((
+            "icons/idle.svg",
+            MUTED2,
+            format!("{} idle", sc.idle),
+        ));
+    }
+    if out.is_empty() {
+        out.push(("icons/idle.svg", MUTED2, "No sessions running".to_string()));
+    }
+    out
+}
+
 pub(crate) fn blocked_tier_claims(limit_hit: bool, awaiting_decision: bool) -> bool {
     limit_hit && !awaiting_decision
 }
@@ -2075,6 +2129,34 @@ mod tests {
             super::fail_signature(&f(&[("s1", "a"), ("s1", "b")])),
             super::fail_signature(&f(&[("s1", "a")]))
         );
+    }
+
+    /// The tooltip must account for EVERY live session — that is the only
+    /// reason it exists. A tier silently missing from the legend would make the
+    /// numbers not add up, which is worse than no tooltip.
+    #[test]
+    fn the_hover_legend_accounts_for_every_session() {
+        use super::{tip_rows, StandupCounts};
+        let sc = StandupCounts { blocked: 2, needs: 1, working: 7, ready: 3, idle: 4 };
+        let rows = super::tip_rows(&sc);
+        assert_eq!(rows.len(), 5, "one line per non-empty tier");
+        let joined = rows.iter().map(|r| r.2.as_str()).collect::<Vec<_>>().join(" | ");
+        for n in ["2", "1", "7", "3", "4"] {
+            assert!(joined.contains(n), "{n} missing from {joined:?}");
+        }
+        // urgency order, same as the button's own glyph precedence
+        assert!(joined.find('2').unwrap() < joined.find('7').unwrap());
+
+        // Empty tiers are omitted rather than shown as zeroes.
+        let quiet = StandupCounts { working: 3, ..Default::default() };
+        let rows = tip_rows(&quiet);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].2.contains("3 working"));
+
+        // …and nothing at all still says something.
+        let rows = tip_rows(&StandupCounts::default());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].2.contains("No sessions"));
     }
 
     #[test]
