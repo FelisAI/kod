@@ -432,7 +432,15 @@ impl From<&SessionInfo> for WireSession {
             phase: i.phase.into(),
             phase_since: i.phase_since_ms,
             alive: i.alive,
-            can_input: i.kind != CliKind::Shell,
+            // Every LIVE session, shells included.
+            //
+            // This flag only greys the composer early; the daemon decides for
+            // real. It used to exclude shells to match a refusal that has since
+            // been removed (see `dispatch_checked`) — and a flag that says
+            // "read-only" about a session the daemon will happily accept input
+            // for is worse than no flag, because the phone hides a box that
+            // would have worked.
+            can_input: i.alive,
             last_message: i.last_message.clone(),
             pending_headline: i.pending.as_ref().map(|p| p.view.summary()),
             trouble: i.trouble.map(|t| trouble_slug(t.kind).to_string()),
@@ -852,19 +860,23 @@ mod tests {
     }
 
     #[test]
-    fn can_input_is_false_for_a_shell_and_true_for_the_agents() {
-        // The courtesy flag, pinned against the rule the DAEMON enforces: a shell
-        // is arbitrary command execution, so typing into one from a phone is
-        // remote code execution as the user. This value only greys the composer
-        // out early — but if it ever said `true` for a shell, every phone would
-        // offer a box for exactly the input that is about to be refused.
-        for (kind, expect) in
-            [(CliKind::Claude, true), (CliKind::Codex, true), (CliKind::Shell, false)]
-        {
+    fn can_input_tracks_what_the_daemon_will_actually_accept() {
+        // The courtesy flag, pinned against the rule the DAEMON enforces. It once
+        // excluded shells, to match a refusal in `dispatch_checked` that has
+        // since been removed — the session KIND was never the boundary, the
+        // token is. The two must agree in this direction especially: a flag
+        // saying "read-only" about a session the daemon would accept input for
+        // hides a box that would have worked.
+        for kind in [CliKind::Claude, CliKind::Codex, CliKind::Shell] {
             let mut i = bare_info();
             i.kind = kind;
-            assert_eq!(WireSession::from(&i).can_input, expect, "wrong can_input for {kind:?}");
+            i.alive = true;
+            assert!(WireSession::from(&i).can_input, "{kind:?} should be typeable");
         }
+        // A dead session is the one thing the daemon still refuses.
+        let mut dead = bare_info();
+        dead.alive = false;
+        assert!(!WireSession::from(&dead).can_input);
     }
 
     #[test]

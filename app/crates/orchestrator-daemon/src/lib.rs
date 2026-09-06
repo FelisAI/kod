@@ -19,7 +19,7 @@ use orchestrator_host::protocol::{ClientRole, PhoneKey as WirePhoneKey,
     WIRE_VERSION,
 };
 use orchestrator_host::input::KeyInput;
-use orchestrator_host::session::{CliKind, SessionId};
+use orchestrator_host::session::SessionId;
 use orchestrator_host::{SessionBackend, SessionHost};
 
 pub mod bridge;
@@ -596,9 +596,26 @@ fn send_event(
 ///    daemon's own `infos()`. That is the point — a phone cannot claim a shell is
 ///    a claude session, because it never gets to say what the session is.
 ///
-/// Shells are refused because a shell IS arbitrary command execution: typing into
-/// one is remote code execution as the user. claude and codex ask before they run
-/// anything dangerous, so typing into them is bounded by their own gate.
+/// SHELLS ARE NO LONGER REFUSED, and the reasoning that refused them did not
+/// survive being checked.
+///
+/// It was: "a shell IS arbitrary command execution; claude and codex ask before
+/// they run anything dangerous, so typing into them is bounded by their own
+/// gate." The second half is false in practice. Kod deliberately passes no
+/// `--permission-mode` (see `host::spawn_claude`), so sessions inherit the
+/// user's global default — measured on this developer's machine that is
+/// `"defaultMode": "auto"`, where the agent decides for itself on most actions.
+/// And even under ask-mode the phone is handed Up/Down/Enter for the explicit
+/// purpose of ANSWERING permission prompts. So a phone could already reach
+/// arbitrary execution in two steps while the one-step path was blocked.
+///
+/// The session kind was never the boundary; the TOKEN is. Anyone holding it can
+/// make this machine run code either way, so the honest posture is to say so at
+/// pairing rather than to imply a limit that is not there.
+///
+/// What remains here is real and stays: the session must EXIST and be ALIVE,
+/// resolved from the daemon's own `infos()` — a phone still never gets to say
+/// what it is typing into.
 fn dispatch_checked(host: &SessionHost, role: ClientRole, cmd: Command) -> CommandReply {
     if !role.may(&cmd) {
         return CommandReply::Error("this connection is not permitted that command".into());
@@ -608,16 +625,6 @@ fn dispatch_checked(host: &SessionHost, role: ClientRole, cmd: Command) -> Comma
             None => return CommandReply::Error("that session is gone".into()),
             Some(i) if !i.alive => {
                 return CommandReply::Error("that session has ended".into())
-            }
-            // ALLOWLIST, matching the role gate above. `!= Shell` would mean a
-            // CliKind added later is typeable from a phone by default, which is
-            // exactly the wrong direction for the one rule this feature promises.
-            Some(i) if !matches!(i.kind, CliKind::Claude | CliKind::Codex) => {
-                return CommandReply::Error(
-                    "Kod only lets a phone type into claude and codex sessions, never into \
-                     a shell."
-                        .into(),
-                )
             }
             Some(_) => {}
         }
@@ -1048,34 +1055,61 @@ mod phone_capability_tests {
         }
     }
 
-    /// THE security property of the whole mobile feature.
+    /// A phone MAY type into a shell, and the guard that used to stop it is
+    /// gone deliberately.
     ///
-    /// A shell is arbitrary command execution; typing into one from a phone is
-    /// remote code execution as the user. The refusal is made HERE, against the
-    /// daemon's own view of the session, precisely because the phone supplies only
-    /// an id — it never gets to say what kind of session it is typing into, so it
-    /// cannot lie its way past this.
+    /// It read: "a shell is arbitrary command execution; claude and codex ask
+    /// before they run anything dangerous, so typing into them is bounded by
+    /// their own gate." Checked, the second half does not hold. Kod passes no
+    /// `--permission-mode`, so a session inherits the user's global default —
+    /// measured on the developer's own machine, `"defaultMode": "auto"`, where
+    /// the agent decides for itself on most actions. And under ask-mode the
+    /// phone is handed Up/Down/Enter for the stated purpose of ANSWERING
+    /// permission prompts. So arbitrary execution was already two keystrokes
+    /// away while the one-step path carried a refusal, which is a boundary that
+    /// only looks like one.
+    ///
+    /// The token is the boundary. This test now pins what that leaves standing.
     #[test]
-    fn a_phone_cannot_type_into_a_shell() {
+    fn a_phone_may_type_into_a_shell_now_that_the_token_is_the_boundary() {
         let host = SessionHost::new();
         let id = host.spawn_shell("t", std::env::temp_dir()).expect("spawn");
 
-        let reply = dispatch_checked(
-            &host,
-            ClientRole::Phone,
-            Command::PhoneInput { id, text: "rm -rf /".into() },
+        assert!(
+            !matches!(
+                dispatch_checked(
+                    &host,
+                    ClientRole::Phone,
+                    Command::PhoneInput { id, text: "echo hello".into() },
+                ),
+                CommandReply::Error(_)
+            ),
+            "a phone with the token may drive a shell"
         );
-        let e = err_text(&reply);
-        assert!(e.contains("shell"), "the refusal must say why: {e}");
+        assert!(!matches!(
+            dispatch_checked(
+                &host,
+                ClientRole::Phone,
+                Command::PhoneKey { id, key: WirePhoneKey::Enter },
+            ),
+            CommandReply::Error(_)
+        ));
+    }
 
-        // …and neither can a key press, which is the same hole with a smaller
-        // payload (Enter alone submits whatever is already on the command line).
-        let reply = dispatch_checked(
+    /// What the id check still buys, with the kind check gone: the session must
+    /// EXIST and be ALIVE, resolved from the daemon's own `infos()`. A phone
+    /// supplies only an id and still never gets to say what it is typing into,
+    /// so it cannot address something that is not there.
+    #[test]
+    fn a_phone_still_cannot_type_at_a_session_that_is_not_there() {
+        let host = SessionHost::new();
+        let ghost = SessionId(9_999);
+        let e = err_text(&dispatch_checked(
             &host,
             ClientRole::Phone,
-            Command::PhoneKey { id, key: WirePhoneKey::Enter },
-        );
-        assert!(err_text(&reply).contains("shell"));
+            Command::PhoneInput { id: ghost, text: "hi".into() },
+        ));
+        assert!(e.contains("gone"), "must say the session is not there: {e}");
     }
 
     /// The role gate is the OUTER wall: even a bridge that constructed the
