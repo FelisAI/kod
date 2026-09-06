@@ -922,7 +922,7 @@ impl Orchestrator {
                         .text_size(px(11.5))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(MUTED2))
-                        .child(icon("icons/working.svg", 12., MUTED))
+                        .child(icon("icons/dot.svg", 9., MUTED))
                         .child("LIVE")
                         .child(
                             div()

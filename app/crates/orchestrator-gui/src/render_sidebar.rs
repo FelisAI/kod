@@ -619,7 +619,26 @@ impl Orchestrator {
                 } else if sc.ready > 0 {
                     ("icons/reply.svg", ACCENT)
                 } else if sc.working > 0 {
-                    ("icons/working.svg", ORANGE)
+                    // A FILLED DOT, not a broken ring.
+                    //
+                    // The ring was meant to read as "motion without an
+                    // animation" — a spinner shape. Frozen, it reads as a broken
+                    // circle and nothing else; its owner asked what "that half
+                    // circle thing" meant, which is the whole answer.
+                    //
+                    // Animating it would be unambiguous but wrong here: with a
+                    // dozen sessions usually running it would spin nearly always,
+                    // and permanent motion in the rail is exactly the ambient
+                    // noise this button exists to avoid.
+                    //
+                    // So: the vocabulary already on every session row. ORANGE is
+                    // documented in theme.rs as working/busy and each rail row
+                    // marks a busy session with `dot(ORANGE)`. Filled = something
+                    // is running; the dashed outline below = nothing is. One pair
+                    // of shapes, no third symbol to learn — and for THIS button
+                    // both mean the same thing anyway ("nothing wants you"), so
+                    // the distinction is allowed to be quiet.
+                    ("icons/dot.svg", ORANGE)
                 } else {
                     ("icons/idle.svg", if on_standup { ACCENT } else { MUTED2 })
                 };

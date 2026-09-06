@@ -51,7 +51,7 @@ impl AssetSource for Assets {
             "icons/reply.svg",
             "icons/warning.svg",
             "icons/blocked.svg",
-            "icons/working.svg",
+            "icons/dot.svg",
             "icons/idle.svg",
             "icons/feed.svg",
             "icons/restore.svg",
