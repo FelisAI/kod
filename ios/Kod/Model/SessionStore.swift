@@ -16,6 +16,12 @@ struct SessionStore: Equatable {
     /// True once the one full snapshot has landed — before that, "no sessions" is
     /// ignorance, not emptiness, and the views say so.
     private(set) var hasSnapshot = false
+    /// The newest terminal for the ONE session this phone is watching.
+    ///
+    /// One, not a map: the bridge only streams what was asked for, and keeping
+    /// old grids would hand a later view a screen that stopped updating when the
+    /// watch moved — a still frame that looks live.
+    private(set) var grid: TerminalGrid?
 
     /// Every session the bridge currently knows, in a stable order (sid, which is
     /// monotonic at the daemon). NEVER recency: rows that reorder under the thumb
@@ -26,7 +32,7 @@ struct SessionStore: Equatable {
 
     mutating func apply(_ msg: ServerMessage) {
         switch msg {
-        case .helloOk(_, let epoch, _, _):
+        case .helloOk(_, let epoch, _, _, _):
             adopt(epoch)
         case .sessions(let epoch, let list):
             adopt(epoch)
@@ -46,6 +52,13 @@ struct SessionStore: Equatable {
             adopt(epoch)
             sessions.removeValue(forKey: sid)
             revs.removeValue(forKey: sid)
+            if grid?.sid == sid { grid = nil }
+        case .grid(let epoch, let g):
+            adopt(epoch)
+            // LATEST WINS, and no rev guard: a grid is a whole viewport, not a
+            // delta, so an out-of-order one is simply an older screen. The
+            // bridge already sends only the newest.
+            grid = g
         case .helloErr, .pong, .err, .ignored:
             break
         }
@@ -58,6 +71,9 @@ struct SessionStore: Equatable {
         epoch = incoming
         sessions.removeAll()
         revs.removeAll()
+        // A new attach means the watch is gone too: the terminal we hold is from
+        // a bridge that is no longer there.
+        grid = nil
         hasSnapshot = false
     }
 

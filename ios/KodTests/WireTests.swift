@@ -22,7 +22,7 @@ final class WireTests: XCTestCase {
 
     func testHelloOkParses() throws {
         let msg = try Wire.parse(frame: #"{"t":"hello_ok","proto":1,"epoch":"e1","server_time":1700000000000,"caps":{"input":false}}"#)
-        guard case .helloOk(let proto, let epoch, let time, let input) = msg else {
+        guard case .helloOk(let proto, let epoch, let time, let input, _) = msg else {
             return XCTFail("expected hello_ok, got \(msg)")
         }
         XCTAssertEqual(proto, 1)
@@ -55,7 +55,11 @@ final class WireTests: XCTestCase {
     }
 
     func testUnknownTypeIsIgnoredNotFatal() throws {
-        XCTAssertEqual(try Wire.parse(frame: #"{"t":"grid","sid":1}"#), .ignored(t: "grid"))
+        // Deliberately a type no build will ever mint. This used to say "grid",
+        // which stopped being unknown the day the terminal landed — an example
+        // chosen from the near future is an example with an expiry date.
+        XCTAssertEqual(try Wire.parse(frame: #"{"t":"holodeck","sid":1}"#),
+                       .ignored(t: "holodeck"))
     }
 
     func testFrameLimitRejectedBeforeParsing() {
@@ -411,4 +415,74 @@ final class ComposerTests: XCTestCase {
         _ = c.settle(rid: c.inFlightRid, sid: 7, ok: true, message: "")
         XCTAssertFalse(c.busy)
     }
+
+    // MARK: - the terminal
+
+    func testGridFrameParses() throws {
+        let frame = #"{"t":"grid","epoch":"e1","sid":7,"cols":80,"rows":24,"lines":["$ ls","a  b"],"cursor":[1,4]}"#
+        guard case .grid(let epoch, let g) = try Wire.parse(frame: frame) else {
+            return XCTFail("expected grid")
+        }
+        XCTAssertEqual(epoch, "e1")
+        XCTAssertEqual(g.sid, 7)
+        XCTAssertEqual(g.cols, 80)
+        XCTAssertEqual(g.rows, 24)
+        XCTAssertEqual(g.lines, ["$ ls", "a  b"])
+        XCTAssertEqual(g.cursorRow, 1)
+        XCTAssertEqual(g.cursorCol, 4)
+    }
+
+    /// A hidden cursor is null, and must cost the cursor rather than the frame —
+    /// the terminal is still worth showing without one.
+    func testGridWithoutACursorStillParses() throws {
+        let frame = #"{"t":"grid","epoch":"e1","sid":7,"cols":80,"rows":24,"lines":[],"cursor":null}"#
+        guard case .grid(_, let g) = try Wire.parse(frame: frame) else {
+            return XCTFail("expected grid")
+        }
+        XCTAssertNil(g.cursorRow)
+        XCTAssertNil(g.cursorCol)
+    }
+
+    /// An older Mac announces no `grid` cap, and the phone must read that as
+    /// false — offering a terminal it will never be sent is a screen that stays
+    /// blank forever.
+    func testAnOlderBridgeAnnouncesNoTerminal() throws {
+        let msg = try Wire.parse(frame: #"{"t":"hello_ok","epoch":"e1","caps":{"input":true}}"#)
+        guard case .helloOk(_, _, _, let input, let grid) = msg else {
+            return XCTFail("expected hello_ok")
+        }
+        XCTAssertTrue(input)
+        XCTAssertFalse(grid, "absent grid cap must not read as available")
+    }
+
+    func testWatchEncodes() {
+        XCTAssertEqual(ClientMessage.watch(sid: 7, on: true).json,
+                       #"{"t":"watch","sid":7,"on":true}"#)
+        XCTAssertEqual(ClientMessage.watch(sid: 7, on: false).json,
+                       #"{"t":"watch","sid":7,"on":false}"#)
+    }
+
+    /// The cache keeps ONE terminal, and drops it whenever the thing it belongs
+    /// to goes away — a still frame that looks live is worse than none.
+    func testTheStoreHoldsOneGridAndDropsItWhenItStops() throws {
+        var store = SessionStore()
+        let g = TerminalGrid(sid: 7, cols: 80, rows: 24, lines: ["hi"], cursorRow: nil, cursorCol: nil)
+        store.apply(.grid(epoch: "e1", grid: g))
+        XCTAssertEqual(store.grid, g)
+
+        // a newer frame replaces it outright
+        let g2 = TerminalGrid(sid: 7, cols: 80, rows: 24, lines: ["hi", "there"], cursorRow: 1, cursorCol: 0)
+        store.apply(.grid(epoch: "e1", grid: g2))
+        XCTAssertEqual(store.grid, g2)
+
+        // the session ending takes its terminal with it
+        store.apply(.gone(epoch: "e1", sid: 7))
+        XCTAssertNil(store.grid)
+
+        // and so does a new bridge attach
+        store.apply(.grid(epoch: "e1", grid: g))
+        store.apply(.sessions(epoch: "e2", sessions: []))
+        XCTAssertNil(store.grid, "a new epoch means the watch is gone too")
+    }
+
 }

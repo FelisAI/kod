@@ -134,6 +134,14 @@ final class AppModel {
     /// coarse answer; `Session.canInput` is the per-session one, and the composer
     /// needs both — a Mac that answers false here has nothing to type into.
     private(set) var inputAllowed = false
+    /// Whether this bridge sends terminals at all, as announced at hello. False
+    /// against an older Mac, which is exactly right: it cannot send them, so the
+    /// phone must not offer a screen that would stay blank.
+    private(set) var gridAllowed = false
+    /// The session this phone has asked the bridge to stream, so a repeated
+    /// `onAppear` does not re-send the same watch and a switch always turns the
+    /// old one off.
+    private var watching: UInt64?
 
     var tab: RootTab = .standup
     var selectedSid: UInt64? {
@@ -298,6 +306,34 @@ final class AppModel {
         transmit(msg)
     }
 
+    /// Point the bridge's terminal stream at one session, or turn it off.
+    ///
+    /// Idempotent, because SwiftUI calls `onAppear` more than once for the same
+    /// screen and a watch per call would be a watch per re-layout. Turning the
+    /// old one off is implicit at the bridge (one watch per connection replaces
+    /// the previous), so this sends only the new one — but it DOES send an
+    /// explicit off when there is no new session, which is what stops a
+    /// backgrounded phone being streamed a terminal nobody is looking at.
+    func watch(_ sid: UInt64?) {
+        guard gridAllowed, watching != sid else { return }
+        let previous = watching
+        watching = sid
+        if let sid {
+            send(.watch(sid: sid, on: true))
+        } else if let previous {
+            send(.watch(sid: previous, on: false))
+        }
+    }
+
+    /// Fire-and-forget, unlike `transmit`: a watch has no `rid`, gets no answer,
+    /// and must never touch the composer's in-flight state.
+    private func send(_ msg: ClientMessage) {
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.client.send(msg)
+        }
+    }
+
     func apply(settings new: BridgeSettings) {
         // NORMALISED before it is kept, not only before it is stored. Holding the
         // raw value meant `model.settings` and the store could differ by a
@@ -395,8 +431,9 @@ final class AppModel {
     }
 
     private func ingest(_ msg: ServerMessage) {
-        if case .helloOk(_, _, let serverTime, let input) = msg {
+        if case .helloOk(_, _, let serverTime, let input, let grid) = msg {
             inputAllowed = input
+            gridAllowed = grid
             clockOffsetMs = serverTime == 0 ? 0 : Int64(serverTime) - Int64(Self.localNowMs())
             now = serverNowMs()
         }

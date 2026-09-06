@@ -138,12 +138,31 @@ extension Session: Decodable {
 
 // MARK: - Messages
 
+/// One session's terminal as the phone receives it: PLAIN TEXT rows.
+///
+/// No style runs. The bridge sends text because a styled grid is several times
+/// the bytes against a 64KB frame cap, for information that is already legible —
+/// claude's selection marker is the character "❯", and a diff still says + and -.
+struct TerminalGrid: Equatable {
+    let sid: UInt64
+    /// The real viewport, so a short screen can be told from a truncated one:
+    /// trailing BLANK rows are dropped on the wire, so `lines.count <= rows`.
+    let cols: Int
+    let rows: Int
+    let lines: [String]
+    /// Nil when the cursor is hidden.
+    let cursorRow: Int?
+    let cursorCol: Int?
+}
+
 enum ServerMessage: Equatable {
-    case helloOk(proto: Int, epoch: String, serverTime: UInt64, inputAllowed: Bool)
+    case helloOk(proto: Int, epoch: String, serverTime: UInt64, inputAllowed: Bool, gridAllowed: Bool)
     case helloErr(code: String, message: String)
     case sessions(epoch: String, sessions: [Session])
     case session(epoch: String, rev: UInt64, session: Session)
     case gone(epoch: String, sid: UInt64)
+    /// A terminal frame for a session this phone asked to `watch`.
+    case grid(epoch: String, grid: TerminalGrid)
     case pong
     case err(code: String, message: String)
     /// An unknown "t". Carried rather than thrown so the caller can log it; the
@@ -184,6 +203,10 @@ enum ClientMessage {
     /// that on ordinary use, so this is not a theoretical race.
     case input(sid: UInt64, text: String, rid: UInt64)
     case key(sid: UInt64, key: PhoneKey, rid: UInt64)
+    /// Start or stop receiving one session's terminal. No `rid`: the bridge does
+    /// not answer a watch, and the phone learns it took because grids arrive.
+    /// Exactly one session at a time — a second watch replaces the first.
+    case watch(sid: UInt64, on: Bool)
 
     var json: String {
         switch self {
@@ -192,6 +215,8 @@ enum ClientMessage {
             return "{\"t\":\"hello\",\"proto\":\(kProtoVersion),\"token\":\"\(escaped)\"}"
         case .ping:
             return "{\"t\":\"ping\"}"
+        case .watch(let sid, let on):
+            return "{\"t\":\"watch\",\"sid\":\(sid),\"on\":\(on)}"
         case .input(let sid, let text, let rid):
             return "{\"t\":\"input\",\"sid\":\(sid),\"text\":\"\(ClientMessage.escape(text))\",\"rid\":\(rid)}"
         case .key(let sid, let key, let rid):
@@ -250,7 +275,11 @@ enum Wire {
                 return .helloOk(proto: m.proto ?? kProtoVersion,
                                 epoch: m.epoch,
                                 serverTime: m.server_time ?? 0,
-                                inputAllowed: m.caps?.input ?? false)
+                                inputAllowed: m.caps?.input ?? false,
+                                // Absent on an older bridge, which is exactly
+                                // right: it cannot send grids, so the phone
+                                // must not offer a terminal.
+                                gridAllowed: m.caps?.grid ?? false)
             case "hello_err":
                 let m = try d.decode(CodeFrame.self, from: data)
                 return .helloErr(code: m.code ?? "", message: m.message ?? "")
@@ -263,6 +292,15 @@ enum Wire {
             case "gone":
                 let m = try d.decode(GoneFrame.self, from: data)
                 return .gone(epoch: m.epoch, sid: m.sid)
+            case "grid":
+                let m = try d.decode(GridFrame.self, from: data)
+                return .grid(epoch: m.epoch,
+                             grid: TerminalGrid(sid: m.sid,
+                                                cols: m.cols ?? 0,
+                                                rows: m.rows ?? 0,
+                                                lines: m.lines ?? [],
+                                                cursorRow: m.cursor?.first,
+                                                cursorCol: m.cursor?.last))
             case "pong":
                 return .pong
             case "err":
@@ -300,7 +338,7 @@ enum Wire {
     // Private mirrors of the wire shapes. Unknown fields fall on the floor for
     // free — that is Codable's default and exactly what the contract wants.
     private struct TypeOnly: Decodable { let t: String }
-    private struct Caps: Decodable { let input: Bool? }
+    private struct Caps: Decodable { let input: Bool?; let grid: Bool? }
     private struct HelloOkFrame: Decodable {
         let proto: Int?
         let epoch: String
@@ -311,6 +349,16 @@ enum Wire {
     private struct SessionsFrame: Decodable { let epoch: String; let sessions: [Session]? }
     private struct SessionFrame: Decodable { let epoch: String; let rev: UInt64?; let session: Session }
     private struct GoneFrame: Decodable { let epoch: String; let sid: UInt64 }
+    /// `cursor` is a two-element array or null. Decoded as [Int]? so a malformed
+    /// one costs the cursor, not the whole frame.
+    private struct GridFrame: Decodable {
+        let epoch: String
+        let sid: UInt64
+        let cols: Int?
+        let rows: Int?
+        let lines: [String]?
+        let cursor: [Int]?
+    }
     /// `sid` is required for the same reason it is on `Session`: an answer that
     /// cannot be matched to a session is an answer that could clear the wrong
     /// composer.

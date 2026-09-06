@@ -332,8 +332,9 @@ final class BridgeClient {
                                    on: ws, timeout: Self.helloTimeout)
 
         switch try Wire.parse(frame: try await receive(ws, timeout: Self.helloTimeout)) {
-        case .helloOk(let proto, let epoch, let serverTime, let input):
-            onMessage(.helloOk(proto: proto, epoch: epoch, serverTime: serverTime, inputAllowed: input))
+        case .helloOk(let proto, let epoch, let serverTime, let input, let grid):
+            onMessage(.helloOk(proto: proto, epoch: epoch, serverTime: serverTime,
+                               inputAllowed: input, gridAllowed: grid))
             ready = true
             established = true
             onState(.connected(endpoint))

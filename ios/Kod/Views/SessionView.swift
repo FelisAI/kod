@@ -1,9 +1,16 @@
 //  SessionView.swift — one session: what it said, and what you say back.
 //
-//  There is still no terminal grid, and that stays a product decision rather than
-//  a missing feature: on a phone the useful thing is the sentence the agent just
-//  said and the question it is waiting on, as native wrapping text you can select
-//  and scroll. An 80x24 character grid squeezed onto a 390pt screen is unreadable.
+//  THERE IS A TERMINAL NOW, and the old note here argued there should not be:
+//  "an 80x24 character grid squeezed onto a 390pt screen is unreadable". That is
+//  true of a grid REFLOWED to the phone's width, which is why this one is not.
+//  It renders at its real column count in a monospaced font and scrolls
+//  sideways, so the columns stay where the agent drew them — a box-drawn
+//  permission dialog or a diff survives, and you pan to it rather than reading a
+//  scrambled version of it.
+//
+//  It also answers the complaint the old note could not: you cannot approve what
+//  you cannot see. The phone had arrow keys and an Enter for a prompt whose text
+//  it never showed.
 //
 //  What has changed is the bottom of the screen. The daemon now accepts typing
 //  from a phone into an AGENT session — never a shell, never a dead one — and
@@ -31,6 +38,13 @@ struct SessionView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(KodColor.bg)
+        // WATCH WHILE THIS SCREEN IS UP, AND ONLY THEN. The bridge streams a
+        // terminal per daemon tick, so a watch left on behind a backgrounded app
+        // is a radio spent on a screen nobody is looking at. `watch` is
+        // idempotent, so SwiftUI re-invoking these costs nothing.
+        .onAppear { model.watch(model.selectedSid) }
+        .onDisappear { model.watch(nil) }
+        .onChange(of: model.selectedSid) { _, sid in model.watch(sid) }
         .kodChrome(title: "Session")
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { picker }
@@ -91,6 +105,10 @@ struct SessionView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
+                }
+
+                if let g = model.store.grid, g.sid == s.sid, !g.lines.isEmpty {
+                    terminal(g)
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -202,6 +220,46 @@ struct SessionView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The live terminal, at its REAL width.
+    ///
+    /// Horizontal scrolling rather than wrapping, because a wrapped terminal is
+    /// not a smaller terminal — it is a broken one. The character grid is the
+    /// only reason a permission dialog has a box around it and a diff lines up,
+    /// and reflowing to 390pt destroys exactly the structure you are reading it
+    /// for.
+    ///
+    /// `.textSelection(.enabled)` on the whole block: copying a path or an error
+    /// out of a session was the other half of "I can't select things".
+    @ViewBuilder
+    private func terminal(_ g: TerminalGrid) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                TierHeading(text: "TERMINAL", color: KodColor.muted)
+                Spacer(minLength: 4)
+                // The real viewport, so a screen that is merely SHORT can be told
+                // from one that was cut: the bridge drops trailing blank rows.
+                MetaTag(text: "\(g.cols)×\(g.rows)")
+            }
+            KodCard {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(Array(g.lines.enumerated()), id: \.offset) { _, line in
+                            // A blank row must still take a row: an empty Text
+                            // collapses, and the gaps the agent drew are part of
+                            // the layout.
+                            Text(line.isEmpty ? " " : line)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(KodColor.text)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .textSelection(.enabled)
+            }
+        }
     }
 
     /// "answer" only when the session is genuinely waiting on you; otherwise you
