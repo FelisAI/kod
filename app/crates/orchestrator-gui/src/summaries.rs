@@ -66,6 +66,40 @@ impl Orchestrator {
             crate::macnotify::set_dock_badge(n);
         }
         let current: std::collections::HashSet<SessionId> = awaiting.iter().map(|s| s.id).collect();
+        // TRACE (ORCH_TRACE_NEEDS=1): every entry to and exit from
+        // AwaitingDecision, with a timestamp. A repeated toast can only come
+        // from the set FLAPPING — a session leaving the awaiting set and coming
+        // back re-arms `seen_needs` and raises a fresh one — and this is the
+        // only way to see that happen without instrumenting the daemon, which
+        // cannot be restarted. Writes only on a transition, so an idle app
+        // writes nothing.
+        if std::env::var("ORCH_TRACE_NEEDS").is_ok() {
+            let gone: Vec<SessionId> = self
+                .seen_needs
+                .iter()
+                .filter(|id| !current.contains(id))
+                .copied()
+                .collect();
+            let fresh: Vec<SessionId> =
+                current.iter().filter(|id| !self.seen_needs.contains(id)).copied().collect();
+            if !gone.is_empty() || !fresh.is_empty() {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/kod-needs.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "{now} screen={} active={:?} left={:?} entered={:?}",
+                        if self.screen == Screen::Workspace { "workspace" } else { "standup" },
+                        self.active_session_id(),
+                        gone,
+                        fresh
+                    );
+                }
+            }
+        }
         self.seen_needs.retain(|id| current.contains(id));
         // #6: a toast whose session has LEFT AwaitingDecision (answered
         // in-terminal, or otherwise resolved) must clear. With #2's permanent
@@ -87,9 +121,22 @@ impl Orchestrator {
         } else {
             now + self.toast_secs
         };
+        // A toast about the session you are ALREADY WATCHING is noise: the
+        // decision banner sits above its terminal and the dialog itself is on
+        // screen, so the overlay repeats what you are looking at — and lands
+        // exactly when you switched to deal with it. Still marked seen, so
+        // navigating away does not then pop it at you.
+        let watching = if self.screen == Screen::Workspace {
+            self.active_session_id()
+        } else {
+            None
+        };
         let mut newest: Option<ToastData> = None;
         for info in &awaiting {
             if self.seen_needs.insert(info.id) {
+                if watching == Some(info.id) {
+                    continue;
+                }
                 let proj_idx = self
                     .projects
                     .iter()
