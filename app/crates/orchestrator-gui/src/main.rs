@@ -615,6 +615,11 @@ struct Orchestrator {
     /// restore-on-launch offer, read ONCE at construction (then cleared).
     restore_offer: Vec<orchestrator_store::HostedSessionRow>,
     restore_dismissed: bool,
+    /// Dismiss is ARMED before it fires — see `render_restore_banner`. It is
+    /// irreversible from the UI (every offered row is marked dismissed at once,
+    /// so none is ever offered again) and it sits beside the default action, so
+    /// one stray tap would discard a whole crash's worth of sessions.
+    restore_dismiss_armed: bool,
     restore_expanded: bool,
     /// the control-bar "+" new-session dropdown (claude/codex/shell) open state.
     spawn_menu_open: bool,

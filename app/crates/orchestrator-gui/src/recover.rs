@@ -845,10 +845,33 @@ impl Orchestrator {
                     // Quietest first, default action last — the reading order
                     // for a row of controls, and the position AppKit puts the
                     // default button in.
+                    // DISMISS ARMS FIRST, and this is not ceremony.
+                    //
+                    // It marks every offered row `alive=0` AND `dismissed`, all
+                    // of them, in one tap — so none is ever offered again and
+                    // there is no way back from the UI. It also sits next to the
+                    // default action: the button order here was changed (quietest
+                    // first, default last) while this was still a one-tap
+                    // irreversible, which put "discard the whole crash" exactly
+                    // where "Restore all" used to be.
+                    //
+                    // Same armed two-step the rail uses to forget a project.
                     .child(
-                        card_action("restore-dismiss", "Dismiss", None, false).on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.dismiss_restore(cx)),
-                        ),
+                        card_action(
+                            "restore-dismiss",
+                            if self.restore_dismiss_armed { "Discard them?" } else { "Dismiss" },
+                            None,
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if this.restore_dismiss_armed {
+                                this.restore_dismiss_armed = false;
+                                this.dismiss_restore(cx);
+                            } else {
+                                this.restore_dismiss_armed = true;
+                                cx.notify();
+                            }
+                        })),
                     )
                     .child(
                         // The label and the chevron BOTH report the state. It
@@ -864,6 +887,7 @@ impl Orchestrator {
                             false,
                         )
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.restore_dismiss_armed = false;
                             this.restore_expanded = !this.restore_expanded;
                             cx.notify();
                         })),
@@ -876,6 +900,7 @@ impl Orchestrator {
                             true,
                         )
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.restore_dismiss_armed = false;
                             this.restore_all(window, cx)
                         })),
                     ),

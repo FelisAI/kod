@@ -590,6 +590,7 @@ pub(crate) fn run() {
                         prompt_provider,
                         restore_offer: Vec::new(),
                         restore_dismissed: false,
+                        restore_dismiss_armed: false,
                         restore_expanded: false,
                         spawn_menu_open: false,
                         summaries: std::collections::HashMap::new(),
