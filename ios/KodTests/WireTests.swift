@@ -142,9 +142,20 @@ final class WireTests: XCTestCase {
         XCTAssertEqual(ClientMessage.key(sid: 3, key: .up, rid: 9).json, #"{"t":"key","sid":3,"key":"up","rid":9}"#)
         XCTAssertEqual(ClientMessage.key(sid: 3, key: .down, rid: 9).json, #"{"t":"key","sid":3,"key":"down","rid":9}"#)
         XCTAssertEqual(ClientMessage.key(sid: 3, key: .tab, rid: 9).json, #"{"t":"key","sid":3,"key":"tab","rid":9}"#)
+        // The keys that drive a session rather than answer a prompt. ctrl_c is
+        // the one that matters: a phone that can start a command must be able to
+        // stop it.
+        XCTAssertEqual(ClientMessage.key(sid: 3, key: .ctrl_c, rid: 9).json, #"{"t":"key","sid":3,"key":"ctrl_c","rid":9}"#)
+        XCTAssertEqual(ClientMessage.key(sid: 3, key: .backtab, rid: 9).json, #"{"t":"key","sid":3,"key":"backtab","rid":9}"#)
+        XCTAssertEqual(ClientMessage.key(sid: 3, key: .pageup, rid: 9).json, #"{"t":"key","sid":3,"key":"pageup","rid":9}"#)
         // Every key the daemon accepts is spelled above; a new one must be spelled
-        // here before it can ship.
-        XCTAssertEqual(PhoneKey.allCases.map(\.rawValue), ["enter", "escape", "up", "down", "tab"])
+        // here before it can ship. The Mac parses these exact strings
+        // (`PhoneKeyName::deserialize`), so a rename here is a protocol change.
+        XCTAssertEqual(PhoneKey.allCases.map(\.rawValue),
+                       ["enter", "escape", "up", "down", "tab", "backtab",
+                        "left", "right", "home", "end", "backspace", "delete",
+                        "pageup", "pagedown",
+                        "ctrl_c", "ctrl_d", "ctrl_z", "ctrl_r", "ctrl_l", "ctrl_u"])
     }
 
     func testInputTextIsEscaped() throws {
@@ -483,6 +494,14 @@ final class ComposerTests: XCTestCase {
         store.apply(.grid(epoch: "e1", grid: g))
         store.apply(.sessions(epoch: "e2", sessions: []))
         XCTAssertNil(store.grid, "a new epoch means the watch is gone too")
+    }
+
+    /// Every key needs a caption, or its button renders blank — and with twenty
+    /// of them, the one that is missing is the one nobody scrolled to.
+    func testEveryPhoneKeyHasALabel() {
+        for k in PhoneKey.allCases {
+            XCTAssertFalse(k.label.isEmpty, "\(k) has no label")
+        }
     }
 
 }

@@ -99,6 +99,21 @@ pub enum PhoneKeyName {
     Up,
     Down,
     Tab,
+    BackTab,
+    Left,
+    Right,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    PageUp,
+    PageDown,
+    CtrlC,
+    CtrlD,
+    CtrlZ,
+    CtrlR,
+    CtrlL,
+    CtrlU,
     /// A key name this build has never heard of — rule 2, one level down. A
     /// newer phone's key must be a VALUE the loop can answer, not a deserialize
     /// error that costs the whole frame (and, before the handshake, the socket).
@@ -117,6 +132,21 @@ impl<'de> Deserialize<'de> for PhoneKeyName {
             "up" => Self::Up,
             "down" => Self::Down,
             "tab" => Self::Tab,
+            "backtab" => Self::BackTab,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "home" => Self::Home,
+            "end" => Self::End,
+            "backspace" => Self::Backspace,
+            "delete" => Self::Delete,
+            "pageup" => Self::PageUp,
+            "pagedown" => Self::PageDown,
+            "ctrl_c" => Self::CtrlC,
+            "ctrl_d" => Self::CtrlD,
+            "ctrl_z" => Self::CtrlZ,
+            "ctrl_r" => Self::CtrlR,
+            "ctrl_l" => Self::CtrlL,
+            "ctrl_u" => Self::CtrlU,
             _ => Self::Unknown,
         })
     }
@@ -135,6 +165,21 @@ impl PhoneKeyName {
             Self::Up => PhoneKey::Up,
             Self::Down => PhoneKey::Down,
             Self::Tab => PhoneKey::Tab,
+            Self::BackTab => PhoneKey::BackTab,
+            Self::Left => PhoneKey::Left,
+            Self::Right => PhoneKey::Right,
+            Self::Home => PhoneKey::Home,
+            Self::End => PhoneKey::End,
+            Self::Backspace => PhoneKey::Backspace,
+            Self::Delete => PhoneKey::Delete,
+            Self::PageUp => PhoneKey::PageUp,
+            Self::PageDown => PhoneKey::PageDown,
+            Self::CtrlC => PhoneKey::CtrlC,
+            Self::CtrlD => PhoneKey::CtrlD,
+            Self::CtrlZ => PhoneKey::CtrlZ,
+            Self::CtrlR => PhoneKey::CtrlR,
+            Self::CtrlL => PhoneKey::CtrlL,
+            Self::CtrlU => PhoneKey::CtrlU,
             Self::Unknown => return None,
         })
     }
@@ -740,13 +785,44 @@ mod tests {
 
     #[test]
     fn every_key_name_parses_to_the_daemons_word_for_it() {
-        for (name, daemon) in [
+        // EVERY name, and the exhaustive match below is what keeps it every
+        // name: the list used to stop at "tab", so widening the key set left
+        // fourteen new spellings untested and a typo in any of them would have
+        // reached a phone as a key that silently does nothing.
+        let all = [
             ("enter", PhoneKey::Enter),
             ("escape", PhoneKey::Escape),
             ("up", PhoneKey::Up),
             ("down", PhoneKey::Down),
             ("tab", PhoneKey::Tab),
-        ] {
+            ("backtab", PhoneKey::BackTab),
+            ("left", PhoneKey::Left),
+            ("right", PhoneKey::Right),
+            ("home", PhoneKey::Home),
+            ("end", PhoneKey::End),
+            ("backspace", PhoneKey::Backspace),
+            ("delete", PhoneKey::Delete),
+            ("pageup", PhoneKey::PageUp),
+            ("pagedown", PhoneKey::PageDown),
+            ("ctrl_c", PhoneKey::CtrlC),
+            ("ctrl_d", PhoneKey::CtrlD),
+            ("ctrl_z", PhoneKey::CtrlZ),
+            ("ctrl_r", PhoneKey::CtrlR),
+            ("ctrl_l", PhoneKey::CtrlL),
+            ("ctrl_u", PhoneKey::CtrlU),
+        ];
+        // Add a variant and this stops compiling until it is listed above.
+        for (_, k) in &all {
+            match k {
+                PhoneKey::Enter | PhoneKey::Escape | PhoneKey::Up | PhoneKey::Down
+                | PhoneKey::Tab | PhoneKey::BackTab | PhoneKey::Left | PhoneKey::Right
+                | PhoneKey::Home | PhoneKey::End | PhoneKey::Backspace | PhoneKey::Delete
+                | PhoneKey::PageUp | PhoneKey::PageDown | PhoneKey::CtrlC | PhoneKey::CtrlD
+                | PhoneKey::CtrlZ | PhoneKey::CtrlR | PhoneKey::CtrlL | PhoneKey::CtrlU => {}
+            }
+        }
+        assert_eq!(all.len(), 20, "a key was added to the protocol but not to this list");
+        for (name, daemon) in all {
             let frame = format!(r#"{{"t":"key","sid":3,"key":"{name}"}}"#);
             let Ok(PhoneMsg::Key { sid, key, .. }) = decode_frame(frame.as_bytes()) else {
                 panic!("{name} did not parse as a key frame");

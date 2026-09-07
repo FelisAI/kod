@@ -23,7 +23,7 @@ use crate::session::{CliKind, SessionId};
 /// Bumped by hand whenever any wire type below changes shape. The client sends
 /// it in `Hello`; the daemon rejects a mismatch so a freshly-rebuilt GUI never
 /// talks to an incompatible older daemon (docs/018 §13).
-pub const WIRE_VERSION: u32 = 25; // …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS)
+pub const WIRE_VERSION: u32 = 26; // 26: PhoneKey widened to 20 keys (^C/^D/arrows/Home/End) for phone shell work; …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS)
 
 /// Reject absurd frame lengths (a corrupt/foreign peer) before allocating.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -203,9 +203,19 @@ pub enum Command {
     PhoneClients { n: u32 },
 }
 
-/// The only keys a phone may press. An explicit, tiny set rather than the
-/// desktop's `KeyInput`: everything here is navigating a prompt an agent is
-/// already showing, and nothing here can start work.
+/// The keys a phone may press.
+///
+/// Still an explicit set rather than the desktop's whole `KeyInput` — a named
+/// list is reviewable and `Char`/`Paste` deliberately stay out, because text is
+/// the `PhoneInput` verb and keeping the two verbs from doing each other's job
+/// is what makes either reviewable (see `phone_text`).
+///
+/// It WAS five keys, on the reasoning that "everything here is navigating a
+/// prompt an agent is already showing, and nothing here can start work". That
+/// premise went when the session-kind refusal did: a phone may now drive a
+/// shell, and a shell you cannot interrupt is a worse place to be than one you
+/// cannot type into. Ctrl-C is the whole argument — without it a runaway command
+/// is unanswerable from the phone that started it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PhoneKey {
     Enter,
@@ -213,6 +223,30 @@ pub enum PhoneKey {
     Up,
     Down,
     Tab,
+    /// Shift-Tab — claude's permission-mode cycler, and back-field in a form.
+    BackTab,
+    Left,
+    Right,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    PageUp,
+    PageDown,
+    /// Interrupt. The reason this list grew.
+    CtrlC,
+    /// EOF — ends a shell's read, and closes a heredoc.
+    CtrlD,
+    /// Suspend. Listed because a phone that can send it can also `fg` afterwards.
+    CtrlZ,
+    /// Reverse history search, the one shell affordance that is unusable without
+    /// its own key.
+    CtrlR,
+    /// Clear the screen — cheap, and the fastest way to make a phone-sized
+    /// viewport readable again.
+    CtrlL,
+    /// Kill the current line. The phone has no way to hold backspace.
+    CtrlU,
 }
 
 /// The daemon-hosted mobile bridge's live state — the whole answer to "how is it
@@ -850,20 +884,47 @@ mod tests {
                 },
             },
             ClientMsg::Request {
-                request_id: 23,
-                command: Command::PhoneKey {
-                    id: SessionId(1),
-                    key: PhoneKey::Enter,
-                },
-            },
-            ClientMsg::Request {
                 request_id: 24,
                 command: Command::PhoneClients { n: 2 },
             },
         ];
         let mut bytes = bincode::serialize(&msgs).unwrap();
         bytes.extend(bincode::serialize(&cmds).unwrap());
+        // EVERY PhoneKey, and it has to be every one.
+        //
+        // The corpus above encoded only `PhoneKey::Enter`, so widening this enum
+        // from five keys to nineteen left the hash UNCHANGED and the alarm
+        // silent — the same blind spot the comment above records for PhoneInput
+        // and PhoneKey themselves, one level further down. A variant added after
+        // the last one used does not alter any encoded value, so the only guard
+        // that works is encoding all of them, and the exhaustive match in
+        // `all_phone_keys` is what makes forgetting one a compile error rather
+        // than a quiet hole.
+        for k in all_phone_keys() {
+            bytes.extend(bincode::serialize(&k).unwrap());
+        }
         bytes
+    }
+
+    /// Every [`PhoneKey`], by exhaustive match.
+    ///
+    /// The match is the point: add a variant and this stops compiling until it
+    /// is listed, which is the only reason the hash above can be trusted to
+    /// notice.
+    fn all_phone_keys() -> Vec<PhoneKey> {
+        use PhoneKey::*;
+        let all = vec![
+            Enter, Escape, Up, Down, Tab, BackTab, Left, Right, Home, End, Backspace, Delete,
+            PageUp, PageDown, CtrlC, CtrlD, CtrlZ, CtrlR, CtrlL, CtrlU,
+        ];
+        for k in &all {
+            match k {
+                Enter | Escape | Up | Down | Tab | BackTab | Left | Right | Home | End
+                | Backspace | Delete | PageUp | PageDown | CtrlC | CtrlD | CtrlZ | CtrlR
+                | CtrlL | CtrlU => {}
+            }
+        }
+        all
     }
 
     fn fnv1a(bytes: &[u8]) -> u64 {
@@ -879,7 +940,7 @@ mod tests {
     /// the change must be a CONSCIOUS act paired with a WIRE_VERSION bump.
     #[test]
     fn protocol_hash_is_stable() {
-        const PROTOCOL_HASH: u64 = 0xdf8263516e4e6d5f; // WIRE_VERSION 25
+        const PROTOCOL_HASH: u64 = 0x3a52a2a51aae7ca8; // WIRE_VERSION 26
         let got = fnv1a(&protocol_corpus());
         assert_eq!(
             got, PROTOCOL_HASH,

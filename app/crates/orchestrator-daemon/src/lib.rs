@@ -703,12 +703,30 @@ fn dispatch(host: &SessionHost, cmd: Command) -> CommandReply {
         Command::PhoneKey { id, key } => {
             host.send_key(
                 id,
+                // EXHAUSTIVE, no wildcard: a key added to the protocol must be
+                // given a meaning here, and a `_ =>` would let one arrive and do
+                // nothing while the phone showed it as a working control.
                 &match key {
                     WirePhoneKey::Enter => KeyInput::Enter,
                     WirePhoneKey::Escape => KeyInput::Escape,
                     WirePhoneKey::Up => KeyInput::Up,
                     WirePhoneKey::Down => KeyInput::Down,
                     WirePhoneKey::Tab => KeyInput::Tab,
+                    WirePhoneKey::BackTab => KeyInput::ShiftTab,
+                    WirePhoneKey::Left => KeyInput::Left,
+                    WirePhoneKey::Right => KeyInput::Right,
+                    WirePhoneKey::Home => KeyInput::Home,
+                    WirePhoneKey::End => KeyInput::End,
+                    WirePhoneKey::Backspace => KeyInput::Backspace,
+                    WirePhoneKey::Delete => KeyInput::Delete,
+                    WirePhoneKey::PageUp => KeyInput::PageUp,
+                    WirePhoneKey::PageDown => KeyInput::PageDown,
+                    WirePhoneKey::CtrlC => KeyInput::Ctrl('c'),
+                    WirePhoneKey::CtrlD => KeyInput::Ctrl('d'),
+                    WirePhoneKey::CtrlZ => KeyInput::Ctrl('z'),
+                    WirePhoneKey::CtrlR => KeyInput::Ctrl('r'),
+                    WirePhoneKey::CtrlL => KeyInput::Ctrl('l'),
+                    WirePhoneKey::CtrlU => KeyInput::Ctrl('u'),
                 },
             );
             CommandReply::Ok

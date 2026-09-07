@@ -79,7 +79,11 @@ struct SessionView: View {
                 }
                 if let headline = s.pendingHeadline {
                     banner(headline,
-                           detail: canType(s) ? nil : "Answer it in Kod on your Mac — this one cannot be answered from the phone.",
+                           // Only a DEAD session cannot be answered now — the
+                           // kind-based refusal this line used to describe is
+                           // gone, and copy that still named it would send you
+                           // to the Mac for something the phone can do.
+                           detail: canType(s) ? nil : "This session has ended.",
                            color: KodColor.amber,
                            heading: "WAITING ON YOU")
                 }
@@ -336,25 +340,54 @@ struct SessionView: View {
     /// typing is always meaningful.
     @ViewBuilder
     private var keys: some View {
-        if model.selected?.pendingHeadline != nil || model.selected?.phase == .awaiting {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Answer the prompt above")
-                    .font(KodFont.meta)
-                    .foregroundStyle(KodColor.muted2)
+        let answering = model.selected?.pendingHeadline != nil || model.selected?.phase == .awaiting
+        VStack(alignment: .leading, spacing: 6) {
+            Text(answering ? "Answer the prompt above" : "Keys")
+                .font(KodFont.meta)
+                .foregroundStyle(KodColor.muted2)
+            // TWO ROWS, and the split is by what you are doing rather than by
+            // what the wire allows: the top row answers a prompt, the bottom
+            // one drives a session that is already running. They used to appear
+            // only while something was waiting, on the reasoning that otherwise
+            // they were "a fragment of a keyboard with no visible purpose" —
+            // true when the only thing a phone could do was answer. Now that it
+            // can see the terminal and interrupt a command, the keys have a
+            // purpose whenever a session does.
+            HStack(spacing: 7) {
+                key(PhoneKey.escape)
+                key(PhoneKey.up)
+                key(PhoneKey.down)
+                key(PhoneKey.tab)
+                Spacer(minLength: 6)
+                key(PhoneKey.enter, primary: true)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 7) {
-                    key("esc", .escape)
-                    key("↑", .up)
-                    key("↓", .down)
-                    key("tab", .tab)
-                    Spacer(minLength: 6)
-                    key("enter", .enter, primary: true)
+                    // Interrupt leads, because it is the one you reach for in a
+                    // hurry and the only one that is hard to reach any other way.
+                    key(PhoneKey.ctrl_c, danger: true)
+                    key(PhoneKey.left)
+                    key(PhoneKey.right)
+                    key(PhoneKey.backspace)
+                    key(PhoneKey.ctrl_u)
+                    key(PhoneKey.ctrl_r)
+                    key(PhoneKey.ctrl_l)
+                    key(PhoneKey.ctrl_d)
+                    key(PhoneKey.backtab)
+                    key(PhoneKey.home)
+                    key(PhoneKey.end)
                 }
+                .padding(.horizontal, 1)
             }
         }
     }
 
-    private func key(_ label: String, _ which: PhoneKey, primary: Bool = false) -> some View {
-        let tint = primary ? KodColor.accent : KodColor.muted
+    /// The label comes from the KEY now, not the call site: with twenty of them,
+    /// a label typed at each button is twenty chances for the caption and the
+    /// code it sends to disagree.
+    private func key(_ which: PhoneKey, primary: Bool = false, danger: Bool = false) -> some View {
+        let tint = danger ? KodColor.red : (primary ? KodColor.accent : KodColor.muted)
+        let label = which.label
         return Button {
             // Enter WITH a draft means "send what I typed", exactly as it does on
             // a real keyboard. Routing it to a bare key press instead submitted
@@ -374,7 +407,9 @@ struct SessionView: View {
                 .padding(.horizontal, 6)
                 .background(KodColor.card, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(primary ? KodColor.accent.opacity(0.35) : KodColor.hair, lineWidth: 1))
+                    .stroke(danger ? KodColor.red.opacity(0.35)
+                                   : (primary ? KodColor.accent.opacity(0.35) : KodColor.hair),
+                            lineWidth: 1))
         }
         .buttonStyle(.plain)
         .disabled(model.composer.busy)

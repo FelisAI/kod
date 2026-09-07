@@ -37,8 +37,45 @@ enum Cli: String, CaseIterable {
 /// The only keys the daemon will take from a phone (`protocol::PhoneKey`). An
 /// enum rather than a String because a misspelled key is not a compile error on
 /// the wire — it is a refusal the user has to read and cannot act on.
+/// The keys this phone may press. The raw values ARE the wire spelling — the
+/// bridge parses these strings — so renaming a case renames a protocol value.
 enum PhoneKey: String, CaseIterable {
     case enter, escape, up, down, tab
+    case backtab
+    case left, right, home, end
+    case backspace, delete
+    case pageup, pagedown
+    /// The reason the set grew past prompt-answering: a phone that can start a
+    /// shell command must be able to interrupt one.
+    case ctrl_c, ctrl_d, ctrl_z, ctrl_r, ctrl_l, ctrl_u
+
+    /// What the key does, for the button that sends it. Deliberately words
+    /// rather than symbols for the control codes: "^C" is a glyph you have to
+    /// already know, and the phone has room for "stop".
+    var label: String {
+        switch self {
+        case .enter: return "enter"
+        case .escape: return "esc"
+        case .up: return "↑"
+        case .down: return "↓"
+        case .left: return "←"
+        case .right: return "→"
+        case .tab: return "tab"
+        case .backtab: return "⇧tab"
+        case .home: return "home"
+        case .end: return "end"
+        case .backspace: return "⌫"
+        case .delete: return "del"
+        case .pageup: return "pg↑"
+        case .pagedown: return "pg↓"
+        case .ctrl_c: return "stop"
+        case .ctrl_d: return "^D"
+        case .ctrl_z: return "^Z"
+        case .ctrl_r: return "search"
+        case .ctrl_l: return "clear"
+        case .ctrl_u: return "clear line"
+        }
+    }
 }
 
 enum Phase: String {
