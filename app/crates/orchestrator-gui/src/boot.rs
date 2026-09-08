@@ -366,12 +366,32 @@ pub(crate) fn run() {
                         .lock()
                         .ok()
                         .and_then(|s| s.get_setting("prompt_structural_model"));
+                    let prompt_profile_id = store
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.get_setting("prompt_profile_id"))
+                        .and_then(|v| v.trim().parse::<i64>().ok());
                     let prompt_config = extract::PromptConfig::from_settings(
                         prompt_provider_setting.as_deref(),
                         prompt_plumbing_model.as_deref(),
                         prompt_structural_model.as_deref(),
                     );
                     let prompt_provider = prompt_config.provider;
+                    // The account for background work, resolved the same way a
+                    // session's is — and dropped if it belongs to the other CLI,
+                    // so a stale id cannot put CLAUDE_CONFIG_DIR on a codex run.
+                    let prompt_config = {
+                        let kind = match prompt_provider {
+                            extract::PromptProvider::Claude => CliKind::Claude,
+                            extract::PromptProvider::Codex => CliKind::Codex,
+                        };
+                        let env = prompt_profile_id
+                            .and_then(|id| store.lock().ok().and_then(|s| s.profile(id)))
+                            .filter(|p| crate::settings::cli_kind_from_str(&p.cli_kind) == kind)
+                            .map(|p| crate::spawn::profile_env(kind, &p))
+                            .unwrap_or_default();
+                        prompt_config.with_env(env)
+                    };
                     extract::set_prompt_config(prompt_config);
                     // summaries are OPT-IN (default off) and demo runs force off:
                     // a plain dev launch must never spend plan quota (critique #16).
@@ -591,6 +611,7 @@ pub(crate) fn run() {
                         restore_offer: Vec::new(),
                         restore_dismissed: false,
                         restore_dismiss_armed: false,
+                        prompt_profile_id,
                         restore_expanded: false,
                         spawn_menu_open: false,
                         summaries: std::collections::HashMap::new(),

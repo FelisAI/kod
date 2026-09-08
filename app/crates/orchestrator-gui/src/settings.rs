@@ -376,6 +376,62 @@ impl Orchestrator {
     /// UI saying why. Only an id we ship as a preset for the OTHER provider is
     /// cleared: that's the one-click path the preset rows opened up, and it can't
     /// misfire on a hand-typed Custom… id, which stays the user's own business.
+    /// The environment Kod's background prompts should run with: the chosen
+    /// profile's, or none at all.
+    ///
+    /// Resolved against the provider's CLI kind, so a profile stored for codex
+    /// can never leak `CLAUDE_CONFIG_DIR` at a claude prompt — the id is
+    /// dropped rather than half-applied.
+    pub(crate) fn background_profile_env(&self) -> Vec<(String, String)> {
+        let Some(id) = self.prompt_profile_id else {
+            return Vec::new();
+        };
+        let kind = provider_cli_kind(self.prompt_provider);
+        self.store
+            .lock()
+            .ok()
+            .and_then(|s| s.profile(id))
+            .filter(|p| cli_kind_from_str(&p.cli_kind) == kind)
+            .map(|p| crate::spawn::profile_env(kind, &p))
+            .unwrap_or_default()
+    }
+
+    fn set_prompt_profile(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
+        self.prompt_profile_id = id;
+        if let Ok(store) = self.store.lock() {
+            let _ = store.set_setting(
+                "prompt_profile_id",
+                &id.map(|i| i.to_string()).unwrap_or_default(),
+            );
+        }
+        self.refresh_prompt_config();
+        cx.notify();
+    }
+
+    /// Rebuild the live background-prompt config from what is stored + the
+    /// chosen account. One place, so provider, model and profile changes cannot
+    /// each half-update it.
+    pub(crate) fn refresh_prompt_config(&mut self) {
+        let (plumbing, structural) = self
+            .store
+            .lock()
+            .ok()
+            .map(|s| {
+                (
+                    s.get_setting("prompt_plumbing_model"),
+                    s.get_setting("prompt_structural_model"),
+                )
+            })
+            .unwrap_or((None, None));
+        let config = extract::PromptConfig::from_settings(
+            Some(self.prompt_provider.key()),
+            plumbing.as_deref(),
+            structural.as_deref(),
+        )
+        .with_env(self.background_profile_env());
+        extract::set_prompt_config(config);
+    }
+
     fn set_prompt_provider(&mut self, provider: extract::PromptProvider, cx: &mut Context<Self>) {
         let mut plumbing_model = None;
         let mut structural_model = None;
@@ -398,7 +454,20 @@ impl Orchestrator {
             structural_model.as_deref(),
         );
         self.prompt_provider = config.provider;
-        extract::set_prompt_config(config);
+        // An account belongs to a CLI, so switching provider can strand the one
+        // that is selected. Cleared HERE rather than filtered at use: a row that
+        // stays lit while doing nothing is the setting lying about itself.
+        if self
+            .prompt_profile_id
+            .and_then(|id| self.store.lock().ok().and_then(|s| s.profile(id)))
+            .is_none_or(|p| cli_kind_from_str(&p.cli_kind) != provider_cli_kind(config.provider))
+        {
+            self.prompt_profile_id = None;
+            if let Ok(store) = self.store.lock() {
+                let _ = store.set_setting("prompt_profile_id", "");
+            }
+        }
+        extract::set_prompt_config(config.with_env(self.background_profile_env()));
         cx.notify();
     }
 
@@ -707,6 +776,51 @@ impl Orchestrator {
             ));
         }
 
+        // WHICH ACCOUNT KOD'S OWN PROMPTS RUN UNDER.
+        //
+        // Background work used to take whichever login was ambient, with no way
+        // to say otherwise — so someone with a work account and a personal one
+        // could not choose which of them Kod billed its summaries to, and the
+        // answer changed with the environment the app happened to launch in.
+        //
+        // Only profiles for the CLI this provider actually runs are listed: a
+        // codex profile offered under Claude would set CODEX_HOME at a claude
+        // prompt and do nothing, which reads as a broken setting rather than an
+        // inapplicable one.
+        let kind = provider_cli_kind(self.prompt_provider);
+        let profiles: Vec<orchestrator_store::ProfileRow> = self
+            .store
+            .lock()
+            .map(|s| s.profiles())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| cli_kind_from_str(&p.cli_kind) == kind)
+            .collect();
+        let mut account_picker = div().flex().flex_col().gap(px(5.)).child(setting_radio_row(
+            "prompt-profile-none",
+            self.prompt_profile_id.is_none(),
+            "Whichever login is ambient",
+            "the account the app itself was launched with",
+            cx.listener(|this, _: &ClickEvent, _, cx| this.set_prompt_profile(None, cx)),
+        ));
+        for prof in &profiles {
+            let id = prof.id;
+            account_picker = account_picker.child(setting_radio_row(
+                format!("prompt-profile-{id}"),
+                self.prompt_profile_id == Some(id),
+                prof.label.clone(),
+                prof.config_dir.clone().unwrap_or_default(),
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_prompt_profile(Some(id), cx)
+                }),
+            ));
+        }
+        let account_note = if profiles.is_empty() {
+            "No accounts for this CLI yet — add one under Profiles."
+        } else {
+            "Kod's own prompts run under this account."
+        };
+
         // (setter stays inline — it writes the same store key + mirror + notify.)
         let sum_on = self.summaries_on;
         let summaries = setting_toggle_row(
@@ -726,9 +840,14 @@ impl Orchestrator {
 
         settings_body()
             .child(settings_section(
-                "Which account runs them",
+                "Which CLI runs them",
                 "Background work goes through this CLI's existing login — no API key, no extra bill. Env overrides: ORCH_PROMPT_PROVIDER, ORCH_PROMPT_PLUMBING_MODEL, ORCH_PROMPT_STRUCTURAL_MODEL.",
                 provider_picker,
+            ))
+            .child(settings_section(
+                "Which account runs them",
+                account_note,
+                account_picker,
             ))
             .child(settings_section(
                 "Session summaries",
@@ -2071,9 +2190,20 @@ fn labeled_field(label: &'static str, control: impl IntoElement) -> impl IntoEle
         .child(control)
 }
 
+/// Which CLI a Background AI provider actually runs. The two enums are separate
+/// on purpose (one names a CLI Kod spawns, the other names who services Kod's
+/// own prompts) but a profile belongs to a CLI, so choosing an account for
+/// background work needs the bridge between them.
+fn provider_cli_kind(p: extract::PromptProvider) -> CliKind {
+    match p {
+        extract::PromptProvider::Claude => CliKind::Claude,
+        extract::PromptProvider::Codex => CliKind::Codex,
+    }
+}
+
 /// Parse a stored `cli_kind` string back into the enum (unknown ⇒ Claude — the
 /// safe default; a profile only ever stores "claude"/"codex" today).
-fn cli_kind_from_str(s: &str) -> CliKind {
+pub(crate) fn cli_kind_from_str(s: &str) -> CliKind {
     match s {
         "codex" => CliKind::Codex,
         "shell" => CliKind::Shell,
@@ -2295,6 +2425,7 @@ fn settings_group_header(label: impl Into<SharedString>) -> impl IntoElement {
 mod tests {
     use super::{
         belongs_to_other_provider, cli_kind_from_str, fmt_extra_args, fmt_profile_env,
+        provider_cli_kind,
         model_presets, parse_profile_env,
         parse_extra_args, selected_model_row, ModelRow, SettingsSection, CLAUDE_MODEL_IDS,
         CODEX_MODEL_IDS, DEFAULT_PROFILE_CLIS,
@@ -2414,6 +2545,40 @@ mod tests {
         assert_eq!(
             selected_model_row("opus", CODEX_MODEL_IDS, false),
             ModelRow::Custom
+        );
+    }
+
+    /// An account belongs to a CLI, and background work must never be handed
+    /// the wrong one: `CODEX_HOME` at a claude prompt is a setting that looks
+    /// applied and does nothing.
+    #[test]
+    fn a_background_account_only_applies_to_its_own_cli() {
+        use orchestrator_store::ProfileRow;
+        let prof = |kind: &str, dir: &str| ProfileRow {
+            id: 1,
+            label: "work".into(),
+            cli_kind: kind.into(),
+            config_dir: Some(dir.into()),
+            model: None,
+            extra_args: vec![],
+            env: Default::default(),
+            color: None,
+        };
+        assert_eq!(provider_cli_kind(crate::extract::PromptProvider::Claude), CliKind::Claude);
+        assert_eq!(provider_cli_kind(crate::extract::PromptProvider::Codex), CliKind::Codex);
+
+        // the right pairing sets the variable that CLI actually reads
+        let env = crate::spawn::profile_env(CliKind::Claude, &prof("claude", "/w/claude"));
+        assert_eq!(env, vec![("CLAUDE_CONFIG_DIR".to_string(), "/w/claude".to_string())]);
+        let env = crate::spawn::profile_env(CliKind::Codex, &prof("codex", "/w/codex"));
+        assert_eq!(env, vec![("CODEX_HOME".to_string(), "/w/codex".to_string())]);
+
+        // and the stored kind is what decides, read through the ONE parser
+        assert_eq!(cli_kind_from_str(&prof("codex", "/x").cli_kind), CliKind::Codex);
+        assert_ne!(
+            cli_kind_from_str(&prof("codex", "/x").cli_kind),
+            provider_cli_kind(crate::extract::PromptProvider::Claude),
+            "a codex account must not survive the Claude provider"
         );
     }
 

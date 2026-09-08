@@ -611,6 +611,9 @@ struct Orchestrator {
     /// provider for isolated background prompt calls (summaries, memory extraction,
     /// map proposals, seed/re-ground/expand/rework). Persisted in app_settings.
     prompt_provider: extract::PromptProvider,
+    /// Which ACCOUNT Kod's own background prompts run under, or None for
+    /// whichever login is ambient. Stored as `prompt_profile_id`.
+    prompt_profile_id: Option<i64>,
     /// sessions left alive by the prior process (crash/left-open) — the
     /// restore-on-launch offer, read ONCE at construction (then cleared).
     restore_offer: Vec<orchestrator_store::HostedSessionRow>,

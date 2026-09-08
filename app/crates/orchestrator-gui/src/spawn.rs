@@ -11,6 +11,18 @@ use crate::*;
 /// resumes under the same account it ran under. Shells (`_`) get no isolation
 /// var but still inherit the profile's plain env.
 pub(crate) fn apply_profile(spec: &mut SpawnSpec, kind: CliKind, profile: &ProfileRow) {
+    spec.env.extend(profile_env(kind, profile));
+}
+
+/// A profile as ENVIRONMENT: its config dir under the variable that CLI reads,
+/// then its own pairs.
+///
+/// Split out of `apply_profile` so Background AI can put its own prompts under a
+/// chosen account using the SAME construction a real session uses. Two spellings
+/// of "run as this profile" would be two things that drift, and the one nobody
+/// looks at would be the one billing the wrong login.
+pub(crate) fn profile_env(kind: CliKind, profile: &ProfileRow) -> Vec<(String, String)> {
+    let mut env = Vec::new();
     if let Some(dir) = profile.config_dir.as_deref().filter(|d| !d.is_empty()) {
         let var = match kind {
             CliKind::Claude => Some("CLAUDE_CONFIG_DIR"),
@@ -18,12 +30,13 @@ pub(crate) fn apply_profile(spec: &mut SpawnSpec, kind: CliKind, profile: &Profi
             _ => None,
         };
         if let Some(var) = var {
-            spec.env.push((var.to_string(), dir.to_string()));
+            env.push((var.to_string(), dir.to_string()));
         }
     }
     for (k, v) in &profile.env {
-        spec.env.push((k.clone(), v.clone()));
+        env.push((k.clone(), v.clone()));
     }
+    env
 }
 
 /// Layer a profile's MODEL + extra args onto a spawn spec's ARGV (#58). Both

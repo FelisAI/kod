@@ -191,6 +191,15 @@ pub struct PromptConfig {
     pub provider: PromptProvider,
     pub plumbing_model: String,
     pub structural_model: String,
+    /// The account this app's own prompts run under, as environment.
+    ///
+    /// Background work used to run under whatever login was ambient, with no
+    /// way to say otherwise — so a user with a work account and a personal one
+    /// could not choose which of them Kod billed its summaries to. This carries
+    /// a PROFILE's `CLAUDE_CONFIG_DIR`/`CODEX_HOME` and env pairs, built the
+    /// same way `spawn::apply_profile` builds them for a real session, so the
+    /// two cannot drift into meaning different things by "profile".
+    pub env: Vec<(String, String)>,
 }
 
 impl PromptConfig {
@@ -217,6 +226,7 @@ impl PromptConfig {
             PromptProvider::Codex => "",
         };
         Self {
+            env: Vec::new(),
             provider,
             plumbing_model: std::env::var("ORCH_PROMPT_PLUMBING_MODEL")
                 .ok()
@@ -227,6 +237,16 @@ impl PromptConfig {
                 .or_else(|| structural_model.map(str::to_string))
                 .unwrap_or_else(|| default_structural.to_string()),
         }
+    }
+}
+
+impl PromptConfig {
+    /// Layer a profile's environment on. Separate from `from_settings` so the
+    /// three call sites that build a config from stored strings do not each have
+    /// to know how a profile becomes environment.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
     }
 }
 
@@ -294,6 +314,7 @@ fn run_claude_p_impl(
     let mut child = spawn_grouped(
         Command::new("claude")
             .args(args)
+            .envs(active_prompt_config().env)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -403,6 +424,7 @@ fn run_codex_exec(
     let mut child = spawn_grouped(
         Command::new("codex")
             .args(args)
+            .envs(active_prompt_config().env)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
