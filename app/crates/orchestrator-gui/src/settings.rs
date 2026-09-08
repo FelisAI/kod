@@ -109,9 +109,16 @@ impl SettingsWindow {
                 .ok()
                 .and_then(|v| v.strip_prefix("settings:").map(str::to_string))
                 .and_then(|name| {
-                    SettingsSection::ALL
-                        .into_iter()
-                        .find(|s| s.label().eq_ignore_ascii_case(&name))
+                    // EITHER SPELLING. This matched only `label()` — so the
+                    // documented `ORCH_DEMO=settings:background-ai` silently
+                    // opened General, and the only value that worked was
+                    // "settings:Background AI", a space inside an env var that
+                    // nobody would guess. `key()` exists for exactly this and
+                    // was not being consulted.
+                    SettingsSection::ALL.into_iter().find(|s| {
+                        s.key().eq_ignore_ascii_case(&name)
+                            || s.label().eq_ignore_ascii_case(&name)
+                    })
                 })
                 .unwrap_or(SettingsSection::General),
         }
@@ -2614,6 +2621,28 @@ mod tests {
             crate::spawn::profile_env(CliKind::Codex, &codex2),
             vec![("CODEX_HOME".to_string(), "/home/dev/.codex-team".to_string())]
         );
+    }
+
+    /// Every pane is reachable by the name the comment documents.
+    ///
+    /// The parser consulted `label()` only, so `settings:background-ai` — the
+    /// spelling in the doc comment and the only one without a space in it —
+    /// opened General instead. A dev affordance that silently does the wrong
+    /// thing is worse than one that is missing: it looks like the PANE is
+    /// broken.
+    #[test]
+    fn every_settings_pane_opens_by_key_and_by_label() {
+        for section in SettingsSection::ALL {
+            for name in [section.key().to_string(), section.label().to_string()] {
+                let found = SettingsSection::ALL.into_iter().find(|s| {
+                    s.key().eq_ignore_ascii_case(&name) || s.label().eq_ignore_ascii_case(&name)
+                });
+                assert!(
+                    found.map(|f| f.key()) == Some(section.key()),
+                    "{name:?} did not select its own pane"
+                );
+            }
+        }
     }
 
     /// THE ANTI-STALENESS RULE: what Kod offers must not name a version.
