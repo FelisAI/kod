@@ -117,8 +117,34 @@ fn project_digest(root: &Path) -> String {
 /// `ORCH_PROMPT_PLUMBING_MODEL` / `ORCH_PROMPT_STRUCTURAL_MODEL`, or the stored
 /// `prompt_plumbing_model` / `prompt_structural_model` settings (a model picker in
 /// Settings lands with the settings-tab work).
-const PLUMBING_MODEL: &str = "";
-const CLAUDE_STRUCTURAL_MODEL: &str = "";
+/// ALIASES, NOT PINNED IDS. `claude --help` documents `--model` as taking "an
+/// alias for the latest model (e.g. 'fable', 'opus', or 'sonnet') or a model's
+/// full name" — so an alias keeps tracking the newest of its tier across version
+/// bumps, while a pinned id rots. Measured on this machine the day this landed:
+/// the codex list still said `gpt-5-codex` while the user's own config had moved
+/// to `gpt-6-astra`.
+///
+/// CHEAP BY DEFAULT, and that is a correction rather than a preference. Both
+/// were `""`, meaning "whatever the login uses" — and `run_claude_p_impl` does
+/// NOT pass `--ignore-user-config`, so background work inherited the user's own
+/// settings.json: measured here, `fable` at `xhigh` effort. Every session
+/// summary, Recover preview and memory extraction was being billed at the most
+/// expensive tier the account has, for work whose output is one line.
+///
+/// Plumbing gets the cheapest tier. Structural (map proposals, breakdowns) gets
+/// the middle one rather than the cheapest: it is still far below what it was
+/// costing, and a structural answer that is wrong is worse than one that costs
+/// a fraction more. Both remain overridable in Settings and by env.
+const PLUMBING_MODEL: &str = "haiku";
+const CLAUDE_STRUCTURAL_MODEL: &str = "sonnet";
+
+/// The reasoning effort background prompts ask for.
+///
+/// LOW, deliberately. These prompts summarise a transcript or fill a JSON shape;
+/// none of them is a reasoning problem. Without this they inherit whatever the
+/// user set globally — `xhigh` on this machine — so the app was paying for deep
+/// reasoning to write "fixed the build".
+const BACKGROUND_EFFORT: &str = "low";
 
 /// Which CLI should service the app's isolated background prompts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +282,10 @@ fn run_claude_p_impl(
     if !model.trim().is_empty() {
         args.extend(["--model".to_string(), model.to_string()]);
     }
+    // Effort is passed EXPLICITLY because this call inherits the user's
+    // settings.json (there is no --ignore-user-config for claude), and a global
+    // `effortLevel: xhigh` would otherwise apply to a one-line summary.
+    args.extend(["--effort".to_string(), BACKGROUND_EFFORT.to_string()]);
     args.extend([
         "--strict-mcp-config".to_string(),
         "--settings".to_string(),
@@ -448,6 +478,13 @@ fn codex_exec_args(cwd: &Path, output_path: &Path, model: &str) -> Vec<String> {
     if !model.trim().is_empty() {
         args.extend(["-m".to_string(), model.to_string()]);
     }
+    // `--ignore-user-config` above already keeps the user's config.toml out, so
+    // this is not undoing their `model_reasoning_effort` — it is naming the one
+    // this app wants instead of taking codex's built-in default on faith.
+    args.extend([
+        "-c".to_string(),
+        format!("model_reasoning_effort=\"{BACKGROUND_EFFORT}\""),
+    ]);
     args.push("-".to_string());
     args
 }
@@ -742,6 +779,38 @@ mod tests {
             Some("{\"headline\":\"ok\"}")
         );
         assert_eq!(first_json_object("no braces here"), None);
+    }
+
+    /// Background prompts must NAME their cost, not inherit it.
+    ///
+    /// The models were both `""` and no effort was passed, so every summary ran
+    /// on whatever the user had configured for real work — measured on the
+    /// developer's own machine, `fable` at `xhigh`. These are one-line
+    /// summarisation jobs.
+    #[test]
+    fn background_prompts_ask_for_a_cheap_model_and_low_effort() {
+        // The defaults themselves are cheap tiers, and ALIASES so they keep
+        // meaning "the newest of this tier" after a version bump.
+        let c = PromptConfig::from_settings(Some("claude"), None, None);
+        assert_eq!(c.plumbing_model, "haiku");
+        assert_eq!(c.structural_model, "sonnet");
+        for m in [&c.plumbing_model, &c.structural_model] {
+            assert!(
+                !m.contains(char::is_numeric),
+                "{m:?} is a pinned id — an alias is what survives a release"
+            );
+        }
+        assert_eq!(BACKGROUND_EFFORT, "low");
+
+        // codex carries the effort as a -c override, alongside the
+        // --ignore-user-config that keeps the user's config.toml out.
+        let args = codex_exec_args(Path::new("/tmp/p"), Path::new("/tmp/o.txt"), "");
+        assert!(args.iter().any(|a| a == "--ignore-user-config"));
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c"
+                && w[1] == format!("model_reasoning_effort=\"{BACKGROUND_EFFORT}\"")),
+            "codex effort override missing: {args:?}"
+        );
     }
 
     #[test]

@@ -1918,15 +1918,29 @@ fn fmt_extra_args(args: &[String]) -> String {
         .join(" ")
 }
 
-/// The model ids Kod offers for claude, newest-first. These strings are passed
-/// through verbatim as `claude --model <id>`, so they must be ids the CLI
-/// accepts — this list is a contract with the CLI, not decoration. Shared by the
-/// Background AI presets (#57) and the per-profile model picker, which drifted
-/// apart once already.
-const CLAUDE_MODEL_IDS: &[&str] = &["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+/// The models Kod offers for claude, strongest-first. Passed verbatim as
+/// `claude --model <value>`, so this list is a contract with the CLI.
+///
+/// ALIASES, NOT PINNED IDS. `claude --help`: "Provide an alias for the latest
+/// model (e.g. 'fable', 'opus', or 'sonnet') or a model's full name (e.g.
+/// 'claude-fable-5')." An alias keeps meaning "the newest of this tier" when a
+/// version lands; a pinned id becomes a name for last year's model and then, one
+/// deprecation later, for nothing at all. This list held `claude-opus-5` and
+/// friends and would have needed editing on every release.
+///
+/// A user who wants a specific build still types it into Custom… — that is what
+/// pinning is FOR, and it is their choice rather than ours going stale.
+const CLAUDE_MODEL_IDS: &[&str] = &["opus", "sonnet", "haiku"];
 
-/// The same for codex (`codex -m <id>`).
-const CODEX_MODEL_IDS: &[&str] = &["gpt-5-codex"];
+/// Codex ships NO alias — `codex --help` documents `-m, --model <MODEL>` with no
+/// mention of one, and there is no "latest" spelling to offer. So Kod ships no
+/// list rather than a guess: this held `gpt-5-codex`, and on the day that was
+/// checked the user's own config.toml had already moved to `gpt-6-astra`. A
+/// hardcoded id here is a promise about someone else's release schedule.
+///
+/// The picker still offers "" (codex's own default) and Custom…, which between
+/// them cover every real answer without Kod claiming to know the model names.
+const CODEX_MODEL_IDS: &[&str] = &[];
 
 /// The CLIs the "Default account for new sessions" card offers a row group for,
 /// each labelled with the shortcut that spawns it — exactly the kinds
@@ -1963,14 +1977,20 @@ fn belongs_to_other_provider(model: &str, provider: extract::PromptProvider) -> 
 fn model_presets(provider: extract::PromptProvider) -> &'static [(&'static str, &'static str)] {
     match provider {
         extract::PromptProvider::Claude => &[
-            ("", "whatever your claude login already uses"),
-            ("claude-opus-5", "most capable, slowest, priciest"),
-            ("claude-sonnet-5", "the balanced middle"),
-            ("claude-haiku-4-5", "cheapest and fastest"),
+            // NOT "the default" any more: Kod now names a cheap model itself,
+            // because this call inherits your settings.json and the empty value
+            // meant background summaries ran on whatever you use for real work.
+            ("", "your claude settings — including its effort level"),
+            ("opus", "most capable, slowest, priciest"),
+            ("sonnet", "the balanced middle"),
+            ("haiku", "cheapest and fastest"),
         ],
         extract::PromptProvider::Codex => &[
-            ("", "whatever your codex login already uses"),
-            ("gpt-5-codex", "codex's coding model"),
+            // Corrected: Kod passes `--ignore-user-config` to codex, so this has
+            // never meant "what your login uses" — it means codex's own built-in
+            // default. Saying otherwise sent people to a config file that was
+            // not being read.
+            ("", "codex's built-in default (your config.toml is not read here)"),
         ],
     }
 }
@@ -2392,9 +2412,44 @@ mod tests {
         // a claude id under a CODEX draft is just as unknown — the picker lists
         // per-CLI ids, so a kind flip must not leave the old id looking chosen.
         assert_eq!(
-            selected_model_row("claude-opus-5", CODEX_MODEL_IDS, false),
+            selected_model_row("opus", CODEX_MODEL_IDS, false),
             ModelRow::Custom
         );
+    }
+
+    /// THE ANTI-STALENESS RULE: what Kod offers must not name a version.
+    ///
+    /// The lists held `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5` and
+    /// `gpt-5-codex`. On the day that was checked the user's own codex config
+    /// had already moved to `gpt-6-astra`, so Kod was offering a model its owner
+    /// had stopped using — and every list like this needs an edit on somebody
+    /// else's release schedule.
+    ///
+    /// claude documents aliases that track the latest of a tier; codex documents
+    /// none, so its list is empty rather than a guess. Custom… still takes a
+    /// pinned id, which is the user CHOOSING to pin rather than us going stale
+    /// on their behalf.
+    #[test]
+    fn shipped_model_presets_name_a_tier_not_a_version() {
+        for id in CLAUDE_MODEL_IDS {
+            assert!(
+                !id.contains(char::is_numeric),
+                "{id:?} pins a version — offer the alias instead"
+            );
+            assert!(!id.contains('-'), "{id:?} looks like a full id, not an alias");
+        }
+        assert!(
+            CODEX_MODEL_IDS.is_empty(),
+            "codex publishes no 'latest' alias; shipping an id here dates the app"
+        );
+        // and the presets shown in Background AI are the same set, which is the
+        // drift this pair of lists has had before.
+        let claude: Vec<&str> = model_presets(crate::extract::PromptProvider::Claude)
+            .iter()
+            .map(|(v, _)| *v)
+            .filter(|v| !v.is_empty())
+            .collect();
+        assert_eq!(claude, CLAUDE_MODEL_IDS.to_vec());
     }
 
     /// Exactly one row of the picker is ever lit, and the ones we DO ship still
@@ -2421,10 +2476,14 @@ mod tests {
             // an OPEN editor owns the selection even while still empty, or the
             // user types into a row nothing points at.
             assert_eq!(selected_model_row("", presets, true), ModelRow::Custom);
-            assert_eq!(
-                selected_model_row(presets[0], presets, true),
-                ModelRow::Custom
-            );
+            // AN EMPTY PRESET LIST IS A VALID ANSWER, not a gap to fill. Codex
+            // publishes no alias for "the latest", so Kod ships no ids for it
+            // rather than a pinned one that goes stale — this used to index
+            // presets[0] unconditionally and panicked the moment that list
+            // became honest.
+            if let Some(first) = presets.first() {
+                assert_eq!(selected_model_row(first, presets, true), ModelRow::Custom);
+            }
         }
     }
 
