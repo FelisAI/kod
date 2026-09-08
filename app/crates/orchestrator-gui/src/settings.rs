@@ -2582,6 +2582,40 @@ mod tests {
         );
     }
 
+    /// The shape that prompted this picker, because "it doesn't show up" is the
+    /// only bug report it can produce and the kind filter is the only place a
+    /// profile could be lost: ONE codex profile, provider already codex.
+    #[test]
+    fn a_codex_profile_is_offered_when_the_provider_is_codex() {
+        use orchestrator_store::ProfileRow;
+        let codex2 = ProfileRow {
+            id: 1,
+            label: "codex2".into(),
+            cli_kind: "codex".into(),
+            config_dir: Some("/home/dev/.codex-team".into()),
+            model: None,
+            extra_args: vec![],
+            env: Default::default(),
+            color: None,
+        };
+        let listed = |provider| {
+            cli_kind_from_str(&codex2.cli_kind) == provider_cli_kind(provider)
+        };
+        assert!(
+            listed(crate::extract::PromptProvider::Codex),
+            "a codex profile must be offered under the codex provider"
+        );
+        assert!(
+            !listed(crate::extract::PromptProvider::Claude),
+            "…and hidden under claude, where CODEX_HOME would do nothing"
+        );
+        // and it carries the account the user actually configured
+        assert_eq!(
+            crate::spawn::profile_env(CliKind::Codex, &codex2),
+            vec![("CODEX_HOME".to_string(), "/home/dev/.codex-team".to_string())]
+        );
+    }
+
     /// THE ANTI-STALENESS RULE: what Kod offers must not name a version.
     ///
     /// The lists held `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5` and
