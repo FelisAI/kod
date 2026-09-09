@@ -70,6 +70,54 @@ impl Orchestrator {
                             .text_color(rgb(phase_color(info.phase)))
                             .child(phase_word(info.phase)),
                     )
+                    // WHICH ACCOUNT THIS SESSION RUNS UNDER.
+                    //
+                    // It sits in the identity cluster — dot, name, phase — because
+                    // that is the line you already read to know what you are
+                    // looking at, and the account is part of that answer: two
+                    // sessions in the same project on different logins were
+                    // indistinguishable here.
+                    //
+                    // ABSENT, not empty, when the session has no profile. Most
+                    // sessions run on the ambient login and would otherwise carry
+                    // a permanent "(default)" that says nothing — a hint you have
+                    // to look past is worse than no hint. So the row is exactly
+                    // as it was for anyone not using profiles, and the marker
+                    // appears only where it distinguishes something.
+                    //
+                    // Muted, small, and after the phase word: glanceable without
+                    // competing with the state you came here to read. The dot is
+                    // the profile's OWN colour — the one the Settings card shows
+                    // — so the rail, that card and this line agree at a glance.
+                    .when_some(
+                        info.cli_session_id
+                            .as_deref()
+                            .and_then(|cid| self.sess_profiles.get(cid)),
+                        |row, (label, color)| {
+                            row.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .when_some(*color, |d, c| {
+                                        d.child(
+                                            div()
+                                                .w(px(5.))
+                                                .h(px(5.))
+                                                .rounded(px(3.))
+                                                .bg(rgb(c)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(MUTED2))
+                                            .child(SharedString::from(label.clone())),
+                                    ),
+                            )
+                        },
+                    )
                     .child(div().flex_1())
                     // ⇄ move this session to another project (dogfooding #10:
                     // work often outgrows the project it was spawned in).

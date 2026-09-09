@@ -175,6 +175,21 @@ impl Orchestrator {
             if let Ok(rows) = store.latest_summaries() {
                 self.sess_summaries = rows.into_iter().map(|r| (r.sess.clone(), r)).collect();
             }
+            if let Ok(rows) = store.session_profiles() {
+                self.sess_profiles = rows
+                    .into_iter()
+                    .map(|(sess, label, color)| {
+                        // Same hex spelling the Settings card parses. An
+                        // unreadable colour costs the DOT, not the label — the
+                        // account is the point and the colour is decoration.
+                        let rgb = color
+                            .as_deref()
+                            .filter(|c| !c.is_empty())
+                            .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok());
+                        (sess, (label, rgb))
+                    })
+                    .collect();
+            }
             if let Ok(ev) = store.latest_event_by_sess() {
                 self.latest_turn_at = ev.into_iter().collect();
             }

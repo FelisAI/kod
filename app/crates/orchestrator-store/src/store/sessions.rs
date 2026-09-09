@@ -192,6 +192,25 @@ impl Store {
         Ok(())
     }
 
+    /// Which ACCOUNT each live-or-recent session was started under: keyed by the
+    /// CLI's own session id, carrying the profile's label and colour.
+    ///
+    /// A join rather than a per-session lookup because the caller renders every
+    /// frame: the GUI caches this on its tick beside the summaries, and a query
+    /// per repaint on the terminal's hot path is not a thing to add for a hint.
+    ///
+    /// Sessions started with no profile are simply absent — the caller shows
+    /// nothing for them, which is the right answer for the ambient login.
+    pub fn session_profiles(&self) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+        let mut st = self.conn.prepare(
+            "SELECT h.cli_session_id, p.label, p.color
+             FROM hosted_session h JOIN profile p ON p.id = h.profile_id
+             WHERE h.profile_id IS NOT NULL",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.flatten().collect())
+    }
+
     /// The newest headline for this session that actually SAID something.
     ///
     /// The summarizer is given the previous status and asked for the delta, so
@@ -497,6 +516,63 @@ impl Store {
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod session_profile_tests {
+    use crate::Store;
+    use std::collections::HashMap;
+
+    /// The join behind the session subhead's account hint. Its failure mode is
+    /// SILENT — a wrong column or a wrong key returns nothing, the hint simply
+    /// never appears, and nobody can tell that from "this session has no
+    /// profile", which is the normal case.
+    #[test]
+    fn a_session_reports_the_account_it_was_started_under() {
+        let s = Store::open_in_memory().unwrap();
+        // A DECOY FIRST, so profile_id and rowid diverge. With one profile and
+        // one session they are both 1, and a join on the wrong column still
+        // returns the right row — the first version of this test passed a
+        // mutation that replaced `h.profile_id` with `h.rowid`.
+        s.create_profile("decoy", "claude", None, None, &[], &HashMap::new(), None)
+            .unwrap();
+        let id = s
+            .create_profile(
+                "codex2",
+                "codex",
+                Some("/home/dev/.codex-team"),
+                None,
+                &[],
+                &HashMap::new(),
+                Some("#8AB4F8"),
+            )
+            .unwrap();
+        s.record_session("sess-with", "path:/p", "codex", "/p", Some(id)).unwrap();
+        // …and one started under no profile at all, which must NOT appear: the
+        // caller renders nothing for it, and a row here would put a label on the
+        // ambient login.
+        s.record_session("sess-without", "path:/p", "claude", "/p", None).unwrap();
+
+        let rows = s.session_profiles().unwrap();
+        assert_eq!(rows.len(), 1, "only the session with an account is listed");
+        assert_eq!(rows[0].0, "sess-with", "keyed by the CLI's own session id");
+        assert_eq!(rows[0].1, "codex2", "joined to the wrong profile");
+        assert_eq!(rows[0].2.as_deref(), Some("#8AB4F8"));
+    }
+
+    /// A profile with no colour still names itself — the colour is decoration,
+    /// the account is the point.
+    #[test]
+    fn an_account_without_a_colour_still_reports_its_label() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_profile("work", "claude", None, None, &[], &HashMap::new(), None)
+            .unwrap();
+        s.record_session("sess-1", "path:/p", "claude", "/p", Some(id)).unwrap();
+        let rows = s.session_profiles().unwrap();
+        assert_eq!(rows[0].1, "work");
+        assert!(rows[0].2.is_none());
     }
 }
 

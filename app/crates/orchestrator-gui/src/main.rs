@@ -614,6 +614,11 @@ struct Orchestrator {
     /// Which ACCOUNT Kod's own background prompts run under, or None for
     /// whichever login is ambient. Stored as `prompt_profile_id`.
     prompt_profile_id: Option<i64>,
+    /// Which account each session runs under, keyed by CLI session id — the
+    /// (label, colour) the session subhead hints with. Refreshed on the tick
+    /// beside the summaries; a store query per repaint on the terminal's hot
+    /// path is not a thing to add for a hint.
+    sess_profiles: std::collections::HashMap<String, (String, Option<u32>)>,
     /// sessions left alive by the prior process (crash/left-open) — the
     /// restore-on-launch offer, read ONCE at construction (then cleared).
     restore_offer: Vec<orchestrator_store::HostedSessionRow>,
