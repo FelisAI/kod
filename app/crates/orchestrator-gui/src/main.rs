@@ -619,6 +619,10 @@ struct Orchestrator {
     /// beside the summaries; a store query per repaint on the terminal's hot
     /// path is not a thing to add for a hint.
     sess_profiles: std::collections::HashMap<String, (String, Option<u32>)>,
+    /// Blocks the user has waved off, keyed session → the reset instant that was
+    /// dismissed. In memory only: a block is a live condition, and one waved off
+    /// yesterday should be offered again if it is somehow still true tomorrow.
+    blocked_dismissed: std::collections::HashMap<SessionId, i64>,
     /// sessions left alive by the prior process (crash/left-open) — the
     /// restore-on-launch offer, read ONCE at construction (then cleared).
     restore_offer: Vec<orchestrator_store::HostedSessionRow>,
@@ -1298,6 +1302,27 @@ impl Orchestrator {
     pub(crate) fn dismiss_ready(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.sess_unreviewed.remove(&id);
         cx.notify();
+    }
+
+    /// Wave off ONE block — this session, this reset instant.
+    ///
+    /// Keyed on the reset time, not just the session, so waving off today's
+    /// limit does not silence the next one: a fresh block carries a different
+    /// reset and re-arms the row. `None` (a credit cap, no parseable reset) is
+    /// stored as 0, which a later real limit will not match either.
+    pub(crate) fn dismiss_blocked(
+        &mut self,
+        id: SessionId,
+        reset_at: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.blocked_dismissed.insert(id, reset_at.unwrap_or(0));
+        cx.notify();
+    }
+
+    /// Has this exact block already been waved off?
+    pub(crate) fn blocked_is_dismissed(&self, id: SessionId, reset_at: Option<i64>) -> bool {
+        self.blocked_dismissed.get(&id) == Some(&reset_at.unwrap_or(0))
     }
 
     /// Stamp a project as READ — persisted, plus the in-memory cache so the

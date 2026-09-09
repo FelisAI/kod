@@ -613,6 +613,7 @@ pub(crate) fn run() {
                         restore_dismiss_armed: false,
                         prompt_profile_id,
                         sess_profiles: Default::default(),
+                        blocked_dismissed: Default::default(),
                         restore_expanded: false,
                         spawn_menu_open: false,
                         summaries: std::collections::HashMap::new(),

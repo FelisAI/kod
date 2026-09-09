@@ -220,6 +220,16 @@ impl Orchestrator {
                     info.usage_limit.as_ref().is_some_and(|u| u.hit),
                     info.phase,
                     self.session_unreviewed(info.id),
+                        // Expired by the clock, OR waved off by hand. Both are
+                        // "this block is no longer the answer", and the tier
+                        // needs neither to be true forever.
+                        limit_reset_passed(
+                            info.usage_limit.as_ref().and_then(|u| u.reset_at_unix),
+                            crate::render_sidebar::wall_now_ms(),
+                        ) || self.blocked_is_dismissed(
+                            info.id,
+                            info.usage_limit.as_ref().and_then(|u| u.reset_at_unix),
+                        ),
                 ) {
                     Bucket::Blocked => c.blocked += 1,
                     Bucket::Needs => c.needs += 1,
@@ -422,6 +432,16 @@ impl Orchestrator {
                         info.usage_limit.as_ref().is_some_and(|u| u.hit),
                         info.phase,
                         self.session_unreviewed(info.id),
+                        // Expired by the clock, OR waved off by hand. Both are
+                        // "this block is no longer the answer", and the tier
+                        // needs neither to be true forever.
+                        limit_reset_passed(
+                            info.usage_limit.as_ref().and_then(|u| u.reset_at_unix),
+                            crate::render_sidebar::wall_now_ms(),
+                        ) || self.blocked_is_dismissed(
+                            info.id,
+                            info.usage_limit.as_ref().and_then(|u| u.reset_at_unix),
+                        ),
                     ) {
                         Bucket::Blocked => blocked.push((p.name.clone(), info.clone())),
                         Bucket::Needs => {
@@ -544,6 +564,7 @@ impl Orchestrator {
                 // never built.
                 let promise = resume_promise(self.auto_continue, u.reset_at_unix.is_some());
                 let (jslug, jid) = (info.project_slug.clone(), info.id);
+                let reset_at = u.reset_at_unix;
                 let slug = info.project_slug.clone();
                 group = group.child(
                     list_row(bi == 0)
@@ -599,7 +620,30 @@ impl Orchestrator {
                                 ),
                         )
                         .child(
-                            row_trailing(String::new()).child(
+                            row_trailing(String::new())
+                                .child(
+                                    // EVERY OTHER TIER CAN BE CLEARED. Ready has
+                                    // Dismiss, What-happened has Mark read, and
+                                    // this row had only "Open" — so a block you
+                                    // had already dealt with sat there until the
+                                    // daemon noticed, which for a session
+                                    // producing no output can be never.
+                                    card_action(
+                                        SharedString::from(format!(
+                                            "blocked-dismiss-{}",
+                                            info.id.0
+                                        )),
+                                        "Dismiss",
+                                        Some("icons/check.svg"),
+                                        false,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _, cx| {
+                                            this.dismiss_blocked(jid, reset_at, cx)
+                                        },
+                                    )),
+                                )
+                                .child(
                                 card_action(
                                     SharedString::from(format!("blocked-open-{}", info.id.0)),
                                     "Open",
@@ -1941,8 +1985,13 @@ pub(crate) fn standup_bucket(
     limit_hit: bool,
     phase: orchestrator_host::Phase,
     unreviewed: bool,
+    reset_passed: bool,
 ) -> Bucket {
-    if blocked_tier_claims(limit_hit, phase == orchestrator_host::Phase::AwaitingDecision) {
+    if blocked_tier_claims(
+        limit_hit,
+        phase == orchestrator_host::Phase::AwaitingDecision,
+        reset_passed,
+    ) {
         return Bucket::Blocked;
     }
     match phase {
@@ -2018,8 +2067,27 @@ pub(crate) fn tip_rows(sc: &StandupCounts) -> Vec<(&'static str, u32, String)> {
     out
 }
 
-pub(crate) fn blocked_tier_claims(limit_hit: bool, awaiting_decision: bool) -> bool {
-    limit_hit && !awaiting_decision
+pub(crate) fn blocked_tier_claims(
+    limit_hit: bool,
+    awaiting_decision: bool,
+    reset_passed: bool,
+) -> bool {
+    limit_hit && !awaiting_decision && !reset_passed
+}
+
+/// Has this limit's own reset time already gone by?
+///
+/// THE TIER CONSULTS THE CLOCK, because the flag it used to trust cannot clear
+/// itself. `Session::scan_limit` re-reads the banner only when the PTY produced
+/// new bytes — and a blocked session produces none, by definition — so `hit`
+/// stays true after the window reopens, until something makes that session
+/// redraw. The reset instant is right there on the limit; a block whose reset
+/// is in the past is over whatever the flag still says.
+///
+/// A limit with no parseable reset (a credit cap) never expires this way, which
+/// is correct: nothing is coming to unblock it.
+pub(crate) fn limit_reset_passed(reset_at_unix: Option<i64>, now_ms: u64) -> bool {
+    matches!(reset_at_unix, Some(r) if r <= (now_ms / 1000) as i64)
 }
 
 /// The ONE grey line under the standup thread, or none at all.
@@ -2103,7 +2171,7 @@ fn sub_heading(text: &'static str, color: u32) -> impl IntoElement {
 /// The standup's one grey line (pure — no store, no window).
 #[cfg(test)]
 mod tests {
-    use super::{resume_promise, standup_bucket, Bucket};
+    use super::{limit_reset_passed, resume_promise, standup_bucket, Bucket};
 
     /// ONE definition, two surfaces. This file already carries the scar: the ⛔
     /// branch records the day the Dock badge, the toast, the notification and the
@@ -2162,7 +2230,9 @@ mod tests {
     #[test]
     fn every_live_session_lands_in_exactly_one_tier() {
         use orchestrator_host::Phase;
-        let b = standup_bucket;
+        // The 3-arg spelling the existing cases were written against: a block
+        // that has NOT expired and has not been waved off.
+        let b = |hit, phase, unreviewed| standup_bucket(hit, phase, unreviewed, false);
 
         // A hard limit hit waits it out — UNLESS there is a real ask on top of
         // it, which you can clear in seconds and which therefore wins.
@@ -2187,6 +2257,37 @@ mod tests {
     /// A blocked row that does not say what will happen is why its owner believed
     /// auto-continue had never been built: the feature's whole job is this moment,
     /// and this moment said nothing about it.
+    /// A BLOCK ENDS. It used to be true until the daemon noticed, and for a
+    /// session producing no output that could be never: `scan_limit` re-reads
+    /// the banner only when the PTY went dirty, and a blocked session is exactly
+    /// the one that has stopped writing. So the tier reads the clock instead.
+    #[test]
+    fn a_block_stops_claiming_the_session_once_its_reset_has_passed() {
+        use orchestrator_host::Phase;
+        let now_ms = 1_700_000_000_000u64;
+        let now_s = (now_ms / 1000) as i64;
+
+        assert!(!limit_reset_passed(Some(now_s + 600), now_ms), "still blocked");
+        assert!(limit_reset_passed(Some(now_s - 1), now_ms), "the window reopened");
+        assert!(limit_reset_passed(Some(now_s), now_ms), "exactly at the reset");
+        // A credit cap has no reset — nothing is coming to unblock it, so it must
+        // NOT expire on its own.
+        assert!(!limit_reset_passed(None, now_ms), "a capless limit never expires");
+
+        // and the tier follows
+        assert_eq!(standup_bucket(true, Phase::Idle, false, false), Bucket::Blocked);
+        assert_eq!(
+            standup_bucket(true, Phase::Idle, false, true),
+            Bucket::Idle,
+            "an expired block must hand the session back to its phase"
+        );
+        assert_eq!(
+            standup_bucket(true, Phase::Idle, true, true),
+            Bucket::Ready,
+            "…including back to READY when a turn finished while it was blocked"
+        );
+    }
+
     #[test]
     fn a_blocked_row_says_which_of_the_three_things_will_happen() {
         // Off: the switch is the news, because it is the only one the user acts on.
@@ -2257,7 +2358,7 @@ mod blocked_tier_tests {
     fn quota_alone_is_blocked() {
         // out of quota with nothing to answer: nothing the user can do but wait,
         // which is exactly what the BLOCKED tier is for.
-        assert!(blocked_tier_claims(true, false));
+        assert!(blocked_tier_claims(true, false, false));
     }
 
     #[test]
@@ -2266,13 +2367,13 @@ mod blocked_tier_tests {
         // falls through to ⚠ NEEDS YOU. Being out of quota does not make the ask
         // unanswerable — approving it now lets the work resume when the limit
         // resets, so burying it under "wait it out" hid a two-second action.
-        assert!(!blocked_tier_claims(true, true));
+        assert!(!blocked_tier_claims(true, true, false));
     }
 
     #[test]
     fn a_healthy_session_is_never_blocked() {
-        assert!(!blocked_tier_claims(false, false));
-        assert!(!blocked_tier_claims(false, true));
+        assert!(!blocked_tier_claims(false, false, false));
+        assert!(!blocked_tier_claims(false, true, false));
     }
 
     #[test]
@@ -2284,7 +2385,7 @@ mod blocked_tier_tests {
         // decline it — whatever its quota state.
         for limit_hit in [true, false] {
             assert!(
-                !blocked_tier_claims(limit_hit, true),
+                !blocked_tier_claims(limit_hit, true, false),
                 "an awaiting session must reach NEEDS YOU (limit_hit={limit_hit})"
             );
         }
