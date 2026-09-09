@@ -355,11 +355,17 @@ impl Orchestrator {
     /// Resolve a session's transcript by DISCOVERY (docs/019 slice 3 worker):
     /// claude first, else codex. Returns (path, is_codex). None = not yet
     /// discovered — the worker re-queues rather than inventing a summary.
-    fn resolve_transcript(cid: &str) -> Option<(std::path::PathBuf, bool)> {
+    fn resolve_transcript(
+        cid: &str,
+        codex_roots: &[std::path::PathBuf],
+    ) -> Option<(std::path::PathBuf, bool)> {
         if let Some(p) = orchestrator_core::scan::claude_transcript_path(cid) {
             return Some((p, false));
         }
-        orchestrator_core::scan::codex_rollout_path(cid).map(|p| (p, true))
+        // Profiled roots too: a codex session started under a profile writes its
+        // rollout to that profile's CODEX_HOME, and without this the summariser
+        // defers it forever as "not yet discovered".
+        orchestrator_core::scan::codex_rollout_path_in(cid, codex_roots).map(|p| (p, true))
     }
 
     /// docs/019 slice 3 (C5/T12): enqueue summarize jobs on the DURABLE queue
@@ -487,7 +493,8 @@ impl Orchestrator {
         // session's missing file; the per-job backoff is the targeted version of
         // it, and it is what makes an unresolvable session unable to starve
         // anyone.
-        let Some((path, is_codex)) = Self::resolve_transcript(&cid) else {
+        let Some((path, is_codex)) = Self::resolve_transcript(&cid, &self.codex_profile_roots())
+        else {
             let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             let _ = store.defer_summary_job(
                 job_id,
@@ -1043,10 +1050,14 @@ impl Orchestrator {
         if !self.backfilled.insert(id) {
             return; // already done this session
         }
+        // captured on THIS thread — the worker has no store handle.
+        let codex_roots = self.codex_profile_roots();
         let host = self.host.clone();
         std::thread::spawn(move || {
             let path = match kind {
-                CliKind::Codex => orchestrator_core::scan::codex_rollout_path(&cli_id),
+                CliKind::Codex => {
+                    orchestrator_core::scan::codex_rollout_path_in(&cli_id, &codex_roots)
+                }
                 CliKind::Claude => orchestrator_core::scan::claude_transcript_path(&cli_id),
                 CliKind::Shell => None,
             };

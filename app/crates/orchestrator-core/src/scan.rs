@@ -264,11 +264,21 @@ fn probe_git(dir: &Path) -> Option<GitFacts> {
 /// stores them date-foldered under `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`,
 /// so we search by the id embedded in the filename.
 pub fn codex_rollout_path(rollout_id: &str) -> Option<PathBuf> {
+    codex_rollout_path_in(rollout_id, &[])
+}
+
+/// As [`codex_rollout_path`], searching PROFILED codex roots as well as the
+/// ambient one. Same blind spot, same reason: a profiled session's rollout is
+/// under its own `CODEX_HOME` and this lookup decides whether a row is even
+/// treated as a codex session.
+pub fn codex_rollout_path_in(rollout_id: &str, extra_codex_roots: &[PathBuf]) -> Option<PathBuf> {
     if rollout_id.is_empty() {
         return None;
     }
-    let root = PathBuf::from(std::env::var("HOME").ok()?).join(".codex/sessions");
-    find_transcript(&root, rollout_id, 5)
+    let ambient = PathBuf::from(std::env::var("HOME").ok()?).join(".codex/sessions");
+    std::iter::once(&ambient)
+        .chain(extra_codex_roots.iter())
+        .find_map(|root| find_transcript(root, rollout_id, 5))
 }
 
 /// Find a claude session's transcript by its session id (#9 §4). Claude stores
@@ -417,6 +427,24 @@ fn is_internal_p_call(text: &str) -> bool {
 /// the read cost is ~`limit` no matter how far back we look. cwd is filtered to
 /// under `~/local` (skip tmp/home noise); the GUI groups them by project.
 pub fn recoverable_sessions(within_days: u64, limit: usize) -> Vec<RecoverableSession> {
+    recoverable_sessions_in(within_days, limit, &[])
+}
+
+/// As [`recoverable_sessions`], plus the codex roots of PROFILED accounts.
+///
+/// A codex session started under a profile writes its rollouts to that
+/// profile's `CODEX_HOME`, not to `~/.codex` — so a scan of the ambient root
+/// alone cannot see it, and Recover offered a row it could never restore.
+/// Measured on a real machine: three sessions under one profile, all three
+/// rollouts present under `<CODEX_HOME>/sessions`, none under `~/.codex`.
+///
+/// The roots are passed IN rather than discovered here: they live in the
+/// profile table, and this crate has no store.
+pub fn recoverable_sessions_in(
+    within_days: u64,
+    limit: usize,
+    extra_codex_roots: &[PathBuf],
+) -> Vec<RecoverableSession> {
     let home = home();
     // EVERY project root, not just the configured one (crate::project_roots):
     // retargeting the projects folder must not empty Recover of every session
@@ -452,10 +480,16 @@ pub fn recoverable_sessions(within_days: u64, limit: usize) -> Vec<RecoverableSe
             }
         }
     }
-    for rollout in walk_jsonl(&home.join(".codex/sessions")) {
-        let mt = mtime_secs(&rollout);
-        if mt >= cutoff {
-            cands.push((rollout, mt, true));
+    let mut codex_roots = vec![home.join(".codex/sessions")];
+    codex_roots.extend(extra_codex_roots.iter().cloned());
+    codex_roots.sort();
+    codex_roots.dedup();
+    for root in &codex_roots {
+        for rollout in walk_jsonl(root) {
+            let mt = mtime_secs(&rollout);
+            if mt >= cutoff {
+                cands.push((rollout, mt, true));
+            }
         }
     }
 
@@ -813,6 +847,38 @@ fn canonicalize_tmp(p: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// A PROFILED codex account's rollouts live under its own CODEX_HOME, and
+    /// the ambient-only lookup cannot see them.
+    ///
+    /// Measured on a real machine before this existed: three sessions started
+    /// under one profile, all three rollouts present under
+    /// `<CODEX_HOME>/sessions`, none under `~/.codex` — so Recover listed rows
+    /// from the store that it could never restore, and the summariser deferred
+    /// them forever as "not yet discovered".
+    #[test]
+    fn a_profiled_codex_rollout_is_found_only_when_its_root_is_searched() {
+        let tmp = std::env::temp_dir().join(format!("kod-scan-{}", std::process::id()));
+        let day = tmp.join("sessions/2026/09/09");
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "01a08236-9215-7bb0-a89d-3df96a22f93d";
+        let roll = day.join(format!("rollout-2026-09-09T10-00-00-{id}.jsonl"));
+        std::fs::write(&roll, "{}\n").unwrap();
+
+        let root = codex_sessions_root(Some(&tmp));
+        assert_eq!(root, tmp.join("sessions"), "CODEX_HOME/sessions is the root");
+
+        // the ambient-only search must NOT find it (that is the bug)
+        assert!(
+            codex_rollout_path(id).is_none(),
+            "a temp-dir rollout cannot be under ~/.codex — if this fails the fixture leaked"
+        );
+        // …and naming the root finds it
+        assert_eq!(codex_rollout_path_in(id, &[root]).as_deref(), Some(roll.as_path()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     use super::*;
 
     #[test]

@@ -57,16 +57,39 @@ impl Orchestrator {
         slug
     }
 
+    /// Every PROFILED codex account's rollout root.
+    ///
+    /// A codex session started under a profile writes its rollouts to that
+    /// profile's `CODEX_HOME`, so a scan of `~/.codex` alone cannot see it —
+    /// Recover listed the row (the store has it) and then could not restore it,
+    /// because the transcript it needs was somewhere nobody looked.
+    pub(crate) fn codex_profile_roots(&self) -> Vec<std::path::PathBuf> {
+        self.store
+            .lock()
+            .map(|s| s.profiles())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.cli_kind == "codex")
+            .filter_map(|p| p.config_dir)
+            .filter(|d| !d.is_empty())
+            .map(|d| orchestrator_core::scan::codex_sessions_root(Some(std::path::Path::new(&d))))
+            .collect()
+    }
+
     /// Load recoverable sessions from disk on a background thread (the import
     /// feature). The scan stats all candidates but reads only the newest ~120, so
     /// a session that crashed weeks ago is still recoverable (was capped at 7
     /// days); refreshed at launch + on each registry adopt.
     pub(crate) fn load_recoverable(&self, cx: &mut Context<Self>) {
         let slot = self.recoverable.clone();
+        // Read on THIS thread: the scan runs on a worker that has no store handle,
+        // and the roots are a handful of strings.
+        let codex_roots = self.codex_profile_roots();
         std::thread::spawn(move || {
             // ~10y window = effectively all on-disk sessions; the newest 120 valid
             // are read (cost is ~limit, not the whole disk).
-            let sessions = orchestrator_core::scan::recoverable_sessions(3650, 120);
+            let sessions =
+                orchestrator_core::scan::recoverable_sessions_in(3650, 120, &codex_roots);
             if let Ok(mut g) = slot.lock() {
                 *g = sessions;
             }
@@ -331,9 +354,13 @@ impl Orchestrator {
             .ok()
             .and_then(|g| g.iter().find(|s| s.id == cli_session_id).cloned())
             .or_else(|| {
-                orchestrator_core::scan::recoverable_sessions(3650, 120)
-                    .into_iter()
-                    .find(|s| s.id == cli_session_id)
+                orchestrator_core::scan::recoverable_sessions_in(
+                    3650,
+                    120,
+                    &self.codex_profile_roots(),
+                )
+                .into_iter()
+                .find(|s| s.id == cli_session_id)
             })
     }
 
@@ -495,7 +522,11 @@ impl Orchestrator {
         }
         let restored_kind = restore_row_kind(
             &row.kind,
-            orchestrator_core::scan::codex_rollout_path(&row.cli_session_id).is_some(),
+            orchestrator_core::scan::codex_rollout_path_in(
+                &row.cli_session_id,
+                &self.codex_profile_roots(),
+            )
+            .is_some(),
         );
         if restored_kind == CliKind::Codex {
             if let Some(rec) = self.recoverable_by_id(&row.cli_session_id) {
