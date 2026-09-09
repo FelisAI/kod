@@ -623,6 +623,10 @@ struct Orchestrator {
     /// dismissed. In memory only: a block is a live condition, and one waved off
     /// yesterday should be offered again if it is somehow still true tomorrow.
     blocked_dismissed: std::collections::HashMap<SessionId, i64>,
+    /// The CLI handle each live session was last seen under. A resumed claude
+    /// ROTATES its session id, so this is what lets the change be noticed and
+    /// the store row re-recorded against the id that can actually be resumed.
+    sess_cli_ids: std::collections::HashMap<SessionId, String>,
     /// sessions left alive by the prior process (crash/left-open) — the
     /// restore-on-launch offer, read ONCE at construction (then cleared).
     restore_offer: Vec<orchestrator_store::HostedSessionRow>,

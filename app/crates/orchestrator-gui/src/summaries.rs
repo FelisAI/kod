@@ -29,6 +29,7 @@ impl Orchestrator {
         // clean-exit observation rides the tick, which fires even when the
         // window is occluded and render() isn't running (review #12).
         self.observe_clean_exits(&all_infos);
+        self.rebind_rotated_session_ids(&all_infos);
         let awaiting: Vec<SessionInfo> = all_infos
             .iter()
             .filter(|s| s.alive && s.phase == orchestrator_host::Phase::AwaitingDecision)
@@ -350,6 +351,47 @@ impl Orchestrator {
         // SessionHost polls in its 1s sweep) and the REAL poll in local/in-process
         // mode. Either way codex limits surface with no GUI-side driver.
         self.host.poll_codex_limits();
+    }
+
+    /// Follow a session whose CLI handle ROTATED, so the store keeps naming the
+    /// conversation that can actually be resumed.
+    ///
+    /// `claude --resume <id>` does not continue writing `<id>.jsonl`; it opens a
+    /// NEW transcript. The row recorded at spawn therefore names the state as it
+    /// was BEFORE the resume, and every later recovery restores that — losing
+    /// everything done since, and compounding on each cycle. The daemon learns
+    /// the new id from the hook payload; this is the half that writes it down.
+    ///
+    /// The OLD row is CLOSED, not dismissed: that id really did end, so it
+    /// belongs in the ended strip rather than being offered as recoverable — but
+    /// dismissing it would erase a transcript that still holds the earlier turns.
+    fn rebind_rotated_session_ids(&mut self, infos: &[orchestrator_host::SessionInfo]) {
+        for info in infos.iter().filter(|i| i.alive) {
+            let Some(fresh) = info.cli_session_id.as_deref() else {
+                continue;
+            };
+            match self.sess_cli_ids.get(&info.id) {
+                // unchanged, or first sight (spawn already recorded it)
+                Some(prev) if prev == fresh => continue,
+                None => {
+                    self.sess_cli_ids.insert(info.id, fresh.to_string());
+                    continue;
+                }
+                Some(prev) => {
+                    let prev = prev.clone();
+                    if let Ok(store) = self.store.lock() {
+                        if let Some((project_key, kind, cwd, profile_id)) =
+                            store.hosted_session_of(&prev)
+                        {
+                            let _ =
+                                store.record_session(fresh, &project_key, &kind, &cwd, profile_id);
+                            let _ = store.close_session(&prev);
+                        }
+                    }
+                    self.sess_cli_ids.insert(info.id, fresh.to_string());
+                }
+            }
+        }
     }
 
     /// Resolve a session's transcript by DISCOVERY (docs/019 slice 3 worker):

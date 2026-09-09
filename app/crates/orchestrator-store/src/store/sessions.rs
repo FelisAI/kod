@@ -192,6 +192,23 @@ impl Store {
         Ok(())
     }
 
+    /// One session row by its CLI id — the fields needed to re-record it under a
+    /// NEW id when the CLI rotates one (a resumed claude opens a fresh
+    /// transcript, so the handle it was recorded under stops being resumable).
+    pub fn hosted_session_of(
+        &self,
+        cli_session_id: &str,
+    ) -> Option<(String, String, String, Option<i64>)> {
+        self.conn
+            .query_row(
+                "SELECT project_key, kind, cwd, profile_id FROM hosted_session
+                 WHERE cli_session_id=?1",
+                params![cli_session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .ok()
+    }
+
     /// Which ACCOUNT each live-or-recent session was started under: keyed by the
     /// CLI's own session id, carrying the profile's label and colour.
     ///
@@ -559,6 +576,33 @@ mod session_profile_tests {
         assert_eq!(rows[0].0, "sess-with", "keyed by the CLI's own session id");
         assert_eq!(rows[0].1, "codex2", "joined to the wrong profile");
         assert_eq!(rows[0].2.as_deref(), Some("#8AB4F8"));
+    }
+
+    /// Following a rotated CLI handle: the new id becomes the recoverable row,
+    /// the old one is CLOSED (it really did end) but not erased.
+    #[test]
+    fn a_rotated_session_id_moves_the_recoverable_row() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_session("before", "path:/p", "claude", "/p", None).unwrap();
+        let (key, kind, cwd, prof) = s.hosted_session_of("before").unwrap();
+        assert_eq!((key.as_str(), kind.as_str(), cwd.as_str()), ("path:/p", "claude", "/p"));
+
+        // the resume opened a new transcript
+        s.record_session("after", &key, &kind, &cwd, prof).unwrap();
+        s.close_session("before").unwrap();
+
+        let offered: Vec<String> = s
+            .restorable_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.cli_session_id)
+            .collect();
+        assert!(offered.contains(&"after".to_string()), "the resumable id must be offered");
+        assert!(
+            !offered.contains(&"before".to_string()),
+            "the id that stopped must not be offered — restoring it loses everything since"
+        );
+        assert!(s.hosted_session_of("before").is_some(), "closed, not erased");
     }
 
     /// A profile with no colour still names itself — the colour is decoration,

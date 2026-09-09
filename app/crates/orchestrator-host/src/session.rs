@@ -1139,6 +1139,33 @@ impl HostedSession {
     /// Route a hook event for this session (docs/014). PermissionRequest raises
     /// a pending decision; Stop clears it + records the message.
     pub fn on_hook(&self, event: HookEvent) {
+        // A RESUMED CLAUDE CHANGES ITS SESSION ID, and this is the only place
+        // that ever learns the new one.
+        //
+        // `claude --resume <id>` does not continue writing <id>.jsonl — it opens
+        // a NEW transcript. So the handle Kod stored at spawn names the
+        // conversation as it was BEFORE the resume, and every later recovery
+        // resumes that, losing everything done since. It compounds: each cycle
+        // rolls back to the previous cycle's starting point.
+        //
+        // Measured on the reporter's machine: hosted_session row 556877b2 with
+        // `claude --resume 556877b2…` live in its cwd, while the conversation
+        // it was actually driving had moved to an untracked 28d5cb46 that
+        // started the minute the resume happened.
+        //
+        // Discovery could not catch it — `fresh_session_discovery_next` stops
+        // the moment a session HAS an id, which a resumed one always does. But
+        // every hook payload carries claude's CURRENT session_id, so the fork
+        // announces itself on the first tool call. Taken OUTSIDE the lock below
+        // because `cli_session_id` has its own.
+        if let Some(fresh) = event.payload().session_id.as_deref() {
+            if !fresh.is_empty() && self.cli_session_id().as_deref() != Some(fresh) {
+                self.set_cli_session_id(fresh.to_string());
+                // so the GUI notices and re-records the row against the id that
+                // can actually be resumed.
+                self.dirty.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut g = self.inner.lock().unwrap();
         // record the timeline event (#9) before the semantic handling below —
         // a parallel, source-agnostic sink; the consent path stays untouched.

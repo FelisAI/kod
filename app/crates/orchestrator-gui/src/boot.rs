@@ -614,6 +614,7 @@ pub(crate) fn run() {
                         prompt_profile_id,
                         sess_profiles: Default::default(),
                         blocked_dismissed: Default::default(),
+                        sess_cli_ids: Default::default(),
                         restore_expanded: false,
                         spawn_menu_open: false,
                         summaries: std::collections::HashMap::new(),
