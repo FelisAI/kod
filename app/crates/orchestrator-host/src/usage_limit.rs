@@ -656,6 +656,39 @@ fn fmt_reset_clock(reset_secs: i64, observed_ms: u64, local_off_secs: i64) -> St
 
 #[cfg(test)]
 mod tests {
+
+    /// A BANNER WITHOUT A ZONE ARMS NOTHING, AND SAYS NOTHING.
+    ///
+    /// `banner_reset_instant` needs the IANA zone to turn "2:20pm" into an
+    /// absolute instant, and `auto_continue_step`'s arm edge requires that
+    /// instant (`reset_known`). So if claude ever prints the reset WITHOUT the
+    /// parenthesised zone, the limit is still detected, still shown, and still
+    /// clears — while auto-continue never arms, and the no-prompt latch that
+    /// would have left a note is never reached either. Silent.
+    ///
+    /// This is the shape to check first when "the limit showed and cleared but
+    /// nothing was typed".
+    #[test]
+    fn a_zoneless_reset_yields_no_instant_and_therefore_no_arm() {
+        let now = 1_757_000_000_000u64;
+        assert!(
+            banner_reset_instant("2:20pm", "", "America/Los_Angeles", now).is_some(),
+            "with a zone the instant resolves"
+        );
+        assert!(
+            banner_reset_instant("2:20pm", "", "", now).is_none(),
+            "without a zone there is no instant — and thus no auto-continue"
+        );
+        // …and the limit is still a perfectly good HIT, which is why the UI shows
+        // it and the user sees it clear.
+        let u = super::parse_usage_limit("You've hit your session limit · resets 2:20pm", now);
+        if let Some(u) = u {
+            assert!(u.hit, "still a hit");
+            assert!(u.reset_at_unix.is_none(), "but nothing for auto-continue to wake on");
+            assert!(!u.reset_clock.is_empty(), "while the clock is still displayable");
+        }
+    }
+
     use super::*;
 
     /// Locks EVERY real usage-limit banner form (docs/019 auto-continue): the
