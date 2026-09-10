@@ -915,6 +915,29 @@ impl Orchestrator {
                             }
                         }
                     }
+                    // NOTICES ARE THE ANSWER TO "did Kod handle my limit?" —
+                    // and they were being thrown away here.
+                    //
+                    // The host already writes a full trail: the limit itself
+                    // ("usage limit hit — resets 4:30pm"), and every
+                    // auto-continue decision — fired and what it replayed, gave
+                    // up after reset+6h, died while blocked, or found no
+                    // recoverable prompt. All of it reached the daemon's ring and
+                    // stopped at this `_ => {}`, so the timeline showed nothing
+                    // and the question could not be answered afterwards by
+                    // anyone. Recording the limit was the whole point of the
+                    // commit that added it; the persister never learned about it.
+                    SessionEventKind::Notice { text } => {
+                        let t = text.trim();
+                        if !t.is_empty() {
+                            let _ = store.record_event(
+                                sess,
+                                &slug,
+                                e.at_ms,
+                                &t.chars().take(200).collect::<String>(),
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
