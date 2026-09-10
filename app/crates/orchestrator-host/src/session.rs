@@ -277,16 +277,6 @@ pub enum AcDecision {
     GiveUp,
 }
 
-/// The outcome of resolving a session's replay prompt from its CLI transcript
-/// (docs/019 rework). `NoUserMessage` (transcript readable, no genuine user turn)
-/// and `Unreadable` (no path / read error) are DISTINCT so the first-turn
-/// `initial_prompt` fallback applies ONLY to `Unreadable`.
-enum TranscriptPrompt {
-    Found(String),
-    NoUserMessage,
-    Unreadable,
-}
-
 /// A snapshot of ONE session's real state, the sole input to the auto-continue
 /// gate. Kept as a plain struct so `ac_decide` is PURE and every branch is
 /// unit-tested WITHOUT a live session (RULE ZERO: no subprocess in tests).
@@ -371,6 +361,30 @@ const LIMIT_SCAN_ROWS: usize = 24;
 /// The key asymmetry: we ARM on `hit == true` (the block appeared), but we FIRE
 /// only when `cleared == true` (the banner is GONE) — the reset genuinely
 /// happened, not merely the estimated clock.
+/// The #2 TOCTOU recheck, immediately before the pty write: has anything the
+/// FIRE gate depends on moved since the inputs were built?
+///
+/// ONLY the two things a client can move under us — the composer and the arm.
+/// It also demanded `usage_limit.is_none()`, which is precisely `cleared`, and
+/// that quietly killed the feature: `ac_decide` fires on `cleared || fire_on_reset`,
+/// and `fire_on_reset` exists because an idle blocked session never redraws, so
+/// its banner never clears. Every clock-driven fire was therefore downgraded to
+/// Skip, and auto-continue could only ever fire on a session that had already
+/// unblocked itself — the one case where nobody needed it. It stayed armed and
+/// silent until GiveUp six hours later.
+///
+/// Pure so the rule is a test rather than a reading of two files.
+fn fire_recheck_holds(g: &Inner) -> bool {
+    g.input_buffer.trim().is_empty() && g.ac_armed
+}
+
+/// What auto-continue types when a usage window reopens.
+///
+/// One word, and deliberately not a replay of the last prompt. An interrupted
+/// turn needs to CARRY ON; re-issuing the prompt that started it asks for the
+/// whole task again. It is also what a person types at that moment.
+pub const AC_RESUME_TEXT: &str = "continue";
+
 pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
     // 1. Flag off ⇒ never act; drop any arm we were holding.
     if !i.on {
@@ -378,7 +392,7 @@ pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
     }
     // 2. ARM on a fresh hit edge: not already armed, not still in a fired latch,
     //    a real hard hit, a captured prompt to replay, and a known reset instant.
-    if !i.armed && !i.fired && i.hit && i.has_held_prompt {
+    if !i.armed && !i.fired && i.hit {
         if let Some(reset_at) = i.reset_at {
             return AcDecision::Arm { reset_at };
         }
@@ -531,7 +545,7 @@ fn ac_apply(g: &mut Inner, decision: AcDecision, now: u64, hit: bool, alive: boo
             });
         }
         AcDecision::Fire => {
-            let text = g.ac_prompt.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
+            let text = AC_RESUME_TEXT.to_string();
             if !alive {
                 // ALIVE-ONLY: a session that DIED while blocked can't be resumed by
                 // typing — disarm and tell the user to resume it manually.
@@ -551,7 +565,7 @@ fn ac_apply(g: &mut Inner, decision: AcDecision, now: u64, hit: bool, alive: boo
                 // #8: record a BOUNDED PREFIX of what was injected (audit trail),
                 // not merely a char count — the timeline shows WHAT was replayed.
                 g.push_event(SessionEventKind::Notice {
-                    text: format!("auto-continued at reset — replayed: {}", prompt_prefix(&text, 80)),
+                    text: format!("auto-continued at reset — sent {AC_RESUME_TEXT:?}"),
                 });
                 return Some(text);
             }
@@ -568,23 +582,6 @@ fn ac_apply(g: &mut Inner, decision: AcDecision, now: u64, hit: bool, alive: boo
     None
 }
 
-/// A bounded, single-line PREFIX of a replayed prompt for the audit Notice (#8):
-/// the first `max` chars (ellipsized if longer), newlines flattened — so the
-/// timeline records WHAT was injected, not merely a char count.
-fn prompt_prefix(text: &str, max: usize) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let trimmed = flat.trim();
-    let head: String = trimmed.chars().take(max).collect();
-    if trimmed.chars().count() > max {
-        format!("{head}…")
-    } else {
-        head
-    }
-}
-
 /// A live, project-bound terminal session. Cheap to snapshot; the GUI holds an
 /// `Arc<HostedSession>` and never touches alacritty/pty types.
 pub struct HostedSession {
@@ -595,8 +592,6 @@ pub struct HostedSession {
     /// The dispatch prompt this session was spawned with (claude's final argv
     /// positional), retained so auto-continue can fall back to it ONLY when the
     /// transcript is unreadable AND the session is still on its first turn (no
-    /// user submit yet). "" for shells / composer-launched sessions.
-    initial_prompt: String,
     /// The CLI's own resume handle (claude --session-id / --resume id, codex
     /// rollout id) when known — None for a shell or a not-yet-discovered fresh
     /// codex. Surfaced in `SessionInfo` for crash-recovery reconcile. Interior-
@@ -683,7 +678,6 @@ impl HostedSession {
         let last_output = Arc::new(AtomicU64::new(0));
         let pending_set_ms = Arc::new(AtomicU64::new(0));
         let cwd = spec.cwd.clone();
-        let initial_prompt = spec.initial_prompt.clone();
 
         let inner_r = inner.clone();
         let dirty_r = dirty.clone();
@@ -731,7 +725,6 @@ impl HostedSession {
             kind,
             project_slug: Mutex::new(project_slug),
             cwd,
-            initial_prompt,
             cli_session_id: Mutex::new(cli_session_id),
             inner,
             pty,
@@ -975,46 +968,26 @@ impl HostedSession {
         // read runs AT MOST ONCE per limit block (arming OR the no-prompt latch both
         // close this edge). Poison-tolerant lock (#9): a session poisoned by an
         // earlier panic must still be swept, not permanently wedged.
-        let arm_edge = {
-            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let ul = g.usage_limit.as_ref();
-            let hit = ul.map(|u| u.hit).unwrap_or(false);
-            let reset_known = ul.and_then(|u| u.reset_at_unix).is_some();
-            on && hit && reset_known && !g.ac_armed && !g.ac_fired && g.ac_prompt.is_none()
-        };
-        let resolved = arm_edge.then(|| self.transcript_last_user_message());
-
-        // PHASE 2 (main lock): apply the resolved prompt (arm edge only), run the
-        // PURE gate, and actuate a Fire ATOMICALLY under THIS lock (#2 TOCTOU).
+        // NO TRANSCRIPT READ, AND NOTHING TO RESOLVE.
+        //
+        // This used to source a "ground-truth prompt" from the CLI transcript and
+        // replay it verbatim, refusing to arm without one — and LATCHING the
+        // block when the transcript yielded no user turn, which silently ended
+        // auto-continue for that session.
+        //
+        // Two problems. It made the feature depend on reading the right file,
+        // which a resumed claude quietly invalidates by rotating its session id;
+        // and replaying the last user message re-issues a whole task, when what
+        // an interrupted turn needs is simply to carry on.
+        //
+        // So it sends "continue" — see AC_RESUME_TEXT. Nothing to resolve, no
+        // file to read, no latch, and the same word a person would type.
+        //
+        // ONE lock for the whole step now (the two-phase dance existed only to
+        // keep a transcript read off the lock). Poison-tolerant (#9): a session
+        // poisoned by an earlier panic must still be swept, not wedged.
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_ms();
-        if let Some(resolved) = resolved {
-            // re-check the edge under the lock (state may have moved during the read).
-            let hit_now = g.usage_limit.as_ref().map(|u| u.hit).unwrap_or(false);
-            if hit_now && !g.ac_armed && !g.ac_fired && g.ac_prompt.is_none() {
-                match resolved {
-                    TranscriptPrompt::Found(p) => g.ac_prompt = Some((p, now)),
-                    TranscriptPrompt::Unreadable
-                        if g.last_submit_ms == 0 && !self.initial_prompt.is_empty() =>
-                    {
-                        // first-turn dispatch whose transcript isn't on disk yet —
-                        // the ONLY sanctioned fallback (docs/019 rework).
-                        g.ac_prompt = Some((self.initial_prompt.clone(), now));
-                    }
-                    _ => {
-                        // no recoverable prompt (empty / tool-only transcript, or an
-                        // unreadable one past turn 1) → LATCH this block so we don't
-                        // re-read every tick, surface it ONCE, and do NOT arm: we
-                        // never replay a fabricated prompt.
-                        g.ac_fired = true;
-                        g.push_event(SessionEventKind::Notice {
-                            text: "auto-continue: blocked — no recoverable prompt to auto-continue"
-                                .into(),
-                        });
-                    }
-                }
-            }
-        }
 
         // ── build the gate inputs from real session state ──
         // RAW read of `g.usage_limit`, NEVER the `usage_limit()` accessor: that one
@@ -1062,9 +1035,23 @@ impl HostedSession {
         // `cleared` / `armed` cannot have moved (every writer takes `inner`); this
         // recheck is defense-in-depth. Any mismatch downgrades Fire→Skip so we stay
         // armed and retry — never a fire past a stale check.
-        if decision == AcDecision::Fire
-            && !(g.input_buffer.trim().is_empty() && g.usage_limit.is_none() && g.ac_armed)
-        {
+        // THE RECHECK MUST NOT RE-ASK THE QUESTION THE GATE ALREADY ANSWERED.
+        //
+        // It required `g.usage_limit.is_none()` — which is exactly `cleared`
+        // (see its definition above). So a Fire reached on the OTHER half of
+        // rule 6, `fire_on_reset`, was downgraded to Skip every single time, and
+        // `fire_on_reset` is the half the design calls "the only signal that
+        // ever fires" for an idle blocked session, because such a session never
+        // redraws and its banner therefore never clears.
+        //
+        // Net effect: auto-continue could only ever fire on a session that had
+        // already un-blocked itself — the one case where it was not needed. It
+        // stayed armed, silent, until GiveUp six hours later.
+        //
+        // What this recheck is actually FOR (#2 TOCTOU) is the composer and the
+        // arm, which a client keystroke could move between the input build and
+        // the write. Those stay.
+        if decision == AcDecision::Fire && !fire_recheck_holds(&g) {
             decision = AcDecision::Skip;
         }
         // Everything except the pty keystrokes is a pure `Inner` mutation, so it's
@@ -1090,42 +1077,6 @@ impl HostedSession {
         decision
     }
 
-    /// Read the LAST user-submitted message from this session's on-disk CLI
-    /// transcript — the GROUND-TRUTH prompt to replay at a usage-limit reset
-    /// (docs/019 rework: the source is the transcript, never keystroke capture,
-    /// which the review proved replays stale/wrong/truncated prompts). Resolves the
-    /// path by the SAME id-glob the app already uses (`orchestrator_core::scan`),
-    /// reads it, and parses the last real user turn (mirroring the app's standup
-    /// extractors). Distinguishes "readable but no user turn" from "unreadable" so
-    /// the caller applies the first-turn `initial_prompt` fallback ONLY on the
-    /// latter. Runs OUTSIDE the `inner` lock (a large transcript read must not stall
-    /// the reader thread).
-    fn transcript_last_user_message(&self) -> TranscriptPrompt {
-        let Some(cli) = self.cli_session_id() else {
-            return TranscriptPrompt::Unreadable;
-        };
-        let (path, is_codex) = match self.kind {
-            CliKind::Claude => (orchestrator_core::scan::claude_transcript_path(&cli), false),
-            CliKind::Codex => (orchestrator_core::scan::codex_rollout_path(&cli), true),
-            // shells never hit a subscription usage limit → no prompt.
-            _ => return TranscriptPrompt::Unreadable,
-        };
-        let Some(path) = path else {
-            return TranscriptPrompt::Unreadable;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return TranscriptPrompt::Unreadable;
-        };
-        let found = if is_codex {
-            crate::transcript::codex_last_user_message(&text)
-        } else {
-            crate::transcript::claude_last_user_message(&text)
-        };
-        match found {
-            Some(p) => TranscriptPrompt::Found(p),
-            None => TranscriptPrompt::NoUserMessage,
-        }
-    }
 
     /// The project this session is filed under (rebindable — a session can be
     /// MOVED to the project the work actually belongs to, dogfooding #10).
@@ -2033,13 +1984,15 @@ mod tests {
     }
 
     #[test]
-    fn gate_hit_without_held_prompt_never_arms() {
-        // Nothing to replay ⇒ never arm (we never fabricate a prompt). With the
-        // rework this means the transcript yielded no user message → ac_prompt None.
+    fn gate_hit_arms_without_needing_anything_to_replay() {
+        // It used to refuse to arm unless the transcript yielded a prompt to
+        // replay — so a session whose transcript had no user turn (or whose id
+        // had rotated out from under the lookup) silently never auto-continued.
+        // Nothing is replayed now; AC_RESUME_TEXT is sent, so a hard hit with a
+        // known reset is all the edge needs.
         let mut i = base_inputs();
-        i.has_held_prompt = false;
         i.last_submit_ms = None;
-        assert_eq!(ac_decide(&i, 0), AcDecision::Skip);
+        assert_eq!(ac_decide(&i, 0), AcDecision::Arm { reset_at: R });
     }
 
     #[test]
@@ -2147,40 +2100,49 @@ mod tests {
         assert!(!g.ac_fired);
     }
 
+    /// THE BUG THAT MADE AUTO-CONTINUE LOOK DEAD: the recheck required the
+    /// banner to be GONE, so the clock-driven fire — the only one that can
+    /// happen on a session that has stopped drawing — never actuated.
     #[test]
-    fn apply_fire_alive_returns_text_latches_and_logs() {
+    fn the_fire_recheck_does_not_require_the_banner_to_be_gone() {
         let mut g = test_inner();
-        g.ac_prompt = Some(("finish the refactor".into(), 100));
+        g.ac_armed = true;
+        g.usage_limit = Some(ul(true, 0, "7:30pm", "America/Los_Angeles"));
+        assert!(
+            fire_recheck_holds(&g),
+            "a still-present banner must NOT block a fire the gate already allowed"
+        );
+
+        // what it IS for: a client keystroke landing between gate and write.
+        g.input_buffer = "half a line".into();
+        assert!(!fire_recheck_holds(&g), "never type over a half-written line");
+        g.input_buffer.clear();
+        g.ac_armed = false;
+        assert!(!fire_recheck_holds(&g), "never fire an unarmed session");
+    }
+
+    #[test]
+    fn apply_fire_alive_sends_continue_latches_and_logs() {
+        let mut g = test_inner();
         g.ac_armed = true;
         g.ac_reset_at = Some(R);
         let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, true);
         assert_eq!(
             out.as_deref(),
-            Some("finish the refactor"),
-            "replays the EXACT transcript prompt"
+            Some(AC_RESUME_TEXT),
+            "sends the resume word, not a replay of the prompt that started the turn"
         );
         assert!(g.ac_fired, "fired latch set before the pty write (no double-fire)");
         assert!(!g.ac_armed, "disarmed after firing");
         assert!(g.ac_reset_at.is_none());
-        assert!(g.ac_prompt.is_none(), "the resolved prompt is consumed on fire");
         assert!(
             g.events.iter().any(|e| matches!(&e.kind,
                 SessionEventKind::Notice { text }
-                    if text.contains("auto-continued at reset") && text.contains("finish the refactor"))),
-            "#8: the Notice logs the replayed prompt PREFIX, not just a count"
+                    if text.contains("auto-continued at reset") && text.contains(AC_RESUME_TEXT))),
+            "the timeline records what was sent"
         );
     }
 
-    #[test]
-    fn prompt_prefix_bounds_and_flattens() {
-        // short prompt: verbatim (newlines flattened, trimmed).
-        assert_eq!(prompt_prefix("  fix\nthe bug  ", 80), "fix the bug");
-        // long prompt: truncated to `max` chars + an ellipsis (audit trail #8).
-        let long = "x".repeat(200);
-        let pfx = prompt_prefix(&long, 80);
-        assert_eq!(pfx.chars().count(), 81, "80 chars + the ellipsis");
-        assert!(pfx.ends_with('…'));
-    }
 
     #[test]
     fn apply_fire_dead_skips_and_logs_manual_resume() {
