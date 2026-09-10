@@ -492,6 +492,19 @@ fn ac_apply(g: &mut Inner, decision: AcDecision, now: u64, hit: bool, alive: boo
             g.ac_reset_at = Some(reset_at);
             g.ac_armed_at_ms = now;
             g.ac_fired = false;
+            // THE MISSING HALF OF THE TRAIL.
+            //
+            // Every other outcome says so on the timeline — fired and what it
+            // replayed, gave up at reset+6h, died while blocked, found no
+            // recoverable prompt. Arming said nothing, so "the limit showed and
+            // cleared and nothing was typed" could not be told apart from "it
+            // never armed in the first place" — and those have completely
+            // different causes. With this, silence after an arm means the FIRE
+            // gate held it (busy / mid-output / an open dialog / a non-empty
+            // composer), and no arm line at all means the edge never opened.
+            g.push_event(SessionEventKind::Notice {
+                text: format!("auto-continue: armed — will resume when the limit resets ({reset_at})"),
+            });
         }
         AcDecision::Disarm => {
             g.ac_armed = false;
