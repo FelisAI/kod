@@ -200,7 +200,14 @@ impl Orchestrator {
         // ONE journal event for the whole restructure (never one-per-op — that
         // would let ⌘Z peel them off individually / half-apply the diff).
         if !kept.is_empty() {
-            let _ = store.accept_diff_from(&slug, &kept, "human:review", None);
+            if let Err(error) = store.accept_diff_from(&slug, &kept, "human:review", None) {
+                drop(store);
+                self.term_error = Some(format!(
+                    "Could not apply the reviewed changes; the card is still open: {error}"
+                ));
+                cx.notify();
+                return;
+            }
         }
         // drop the OLD rows; the leftover ops are re-persisted below.
         for pd in &rows {
@@ -560,6 +567,11 @@ impl Orchestrator {
             .filter(|(i, (op, _))| kept_of(*i, op))
             .count();
         let flagged_n = (0..total).filter(|i| flag_of(*i)).count();
+        let has_individual_rows = flat
+            .iter()
+            .any(|(op, _)| op_requires_individual_review(op));
+        let accept_label = changeset_accept_label(has_individual_rows, kept);
+        let can_apply = !has_individual_rows || kept > 0;
 
         // ---- header: title + op count + accept/reject ----
         let count_label = if kept == total {
@@ -594,15 +606,18 @@ impl Orchestrator {
                     .px(px(11.))
                     .py(px(4.))
                     .rounded(px(8.))
-                    .bg(rgb(ACCENT))
-                    .cursor_pointer()
+                    .bg(rgb(if can_apply { ACCENT } else { CARD2 }))
                     .text_size(px(12.))
-                    .text_color(rgb(0x0C140F))
+                    .text_color(rgb(if can_apply { 0x0C140F } else { MUTED2 }))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Accept all")
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.accept_changeset(cs_id, cx)
-                    })),
+                    .child(SharedString::from(accept_label))
+                    .when(can_apply, |button| {
+                        button.cursor_pointer().on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.accept_changeset(cs_id, cx)
+                            },
+                        ))
+                    }),
             )
             .child(
                 div()
@@ -625,9 +640,13 @@ impl Orchestrator {
         for (i, (op, evidence)) in flat.iter().enumerate() {
             let flagged = flag_of(i);
             let done = op_asserts_done(op);
+            let decision = matches!(
+                op,
+                DiffOp::AddDecision { .. } | DiffOp::RemoveDecision { .. }
+            );
             // "hold" = excluded from Accept all by default (unverified or a
-            // done-assertion) — individually accepted only (docs/019 slice 2).
-            let hold = flagged || done;
+            // semantic assertion) — individually accepted only.
+            let hold = flagged || op_requires_individual_review(op);
             let keep = kept_of(i, op);
             let off = !keep; // "off" = not currently kept (dropped or held back)
                              // reflect an Add name edit into the displayed row (same helper
@@ -699,6 +718,11 @@ impl Orchestrator {
             // unverified evidence flag, or a done-assertion needing confirmation.
             let hold_badge = if flagged {
                 Some(("⚠ no verified quote — accept it individually", 0xE6A08A))
+            } else if decision {
+                Some((
+                    "memory decision — verify meaning and placement individually",
+                    AMBER,
+                ))
             } else if done {
                 Some((
                     "done — string match isn't proof; confirm individually",

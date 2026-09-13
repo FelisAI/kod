@@ -6,7 +6,7 @@ impl Orchestrator {
 
     /// The live map (left) + outline (right) from the real tree.
     /// The living product map (#10): the canonical Map+Outline split — a
-    /// spatial brain-map CANVAS (mapview) + the Outline drill pane
+    /// application-owned project CANVAS (mapview) + the Outline drill pane
     /// (outlinepane: focus card, decision log, children, per-op proposals).
     /// Flow mode = the canvas full-width.
     pub(crate) fn render_map_outline(
@@ -698,6 +698,10 @@ impl Orchestrator {
                 | DiffOp::Rename { id, .. }
                 | DiffOp::Remove { id }
                 | DiffOp::Move { id, .. } => Some(*id),
+                DiffOp::AddDecision {
+                    part: PartRef::Id(id),
+                    ..
+                } => Some(*id),
                 DiffOp::Add {
                     parent: PartRef::Id(id),
                     ..
@@ -766,6 +770,10 @@ impl Orchestrator {
                     | DiffOp::Rename { id, .. }
                     | DiffOp::Remove { id }
                     | DiffOp::Move { id, .. } => Some(*id),
+                    DiffOp::AddDecision {
+                        part: PartRef::Id(id),
+                        ..
+                    } => Some(*id),
                     DiffOp::Add {
                         parent: PartRef::Id(id),
                         ..

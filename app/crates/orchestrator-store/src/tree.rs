@@ -286,6 +286,30 @@ pub enum DiffOp {
         id: PartId,
         kind: Kind,
     },
+    /// Project one independently reviewed memory-engine decision into a map node's
+    /// decision log. The text is an application-facing cache; the durable
+    /// evidence and revision history stay in the memory engine and are addressed by the
+    /// two opaque ids. Machine decisions require individual confirmation in
+    /// the changeset UI before this op is applied.
+    AddDecision {
+        part: PartRef,
+        text: String,
+        source_memory_id: String,
+        source_revision_id: String,
+    },
+    /// Internal inverse for `AddDecision`. Only memory-engine-backed projection rows
+    /// may be removed by this operation; user/session notes remain append-only.
+    RemoveDecision {
+        note_id: i64,
+    },
+    /// Internal node-removal inverse. It reattaches an append-only user/session
+    /// note (primary=true) or recreates one cross-cutting link (primary=false)
+    /// when undo materializes the removed node under a new database id.
+    RestoreNoteTarget {
+        note_id: i64,
+        part: PartRef,
+        primary: bool,
+    },
 }
 
 impl DiffOp {
@@ -301,6 +325,18 @@ impl DiffOp {
             DiffOp::Remove { id } => format!("− remove {}", name_of(*id)),
             DiffOp::SetDetail { id, .. } => format!("✎ describe {}", name_of(*id)),
             DiffOp::SetKind { id, kind } => format!("⊙ {} becomes {}", name_of(*id), kind.as_str()),
+            DiffOp::AddDecision { part, text, .. } => {
+                let target = match part {
+                    PartRef::Id(id) => name_of(*id),
+                    PartRef::Temp(_) => "new node".to_string(),
+                    PartRef::Root => "map".to_string(),
+                };
+                format!("◆ decision on {target}: {text}")
+            }
+            DiffOp::RemoveDecision { note_id } => format!("− decision #{note_id}"),
+            DiffOp::RestoreNoteTarget { note_id, .. } => {
+                format!("restore note #{note_id} target")
+            }
         }
     }
 }

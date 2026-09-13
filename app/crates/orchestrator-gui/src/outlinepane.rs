@@ -236,14 +236,18 @@ pub fn changeset_row(
 
 /// The provenance by-line of a log entry: `— you · 2m` for user entries,
 /// `— session a3f2c9d1 · 3h` for session-sourced ones (source `sess-<cli id>`,
-/// shown truncated to 8 chars). Unknown sources pass through verbatim rather
-/// than masquerading as the user.
+/// shown truncated to 8 chars). Memory-engine projection pointers intentionally
+/// collapse to a product label; the raw memory/revision ids belong in the
+/// evidence drill-in, not the everyday Outline. Unknown sources pass through
+/// verbatim rather than masquerading as the user.
 pub fn provenance(source: &str, ts_secs: u64, now_secs: u64) -> String {
     let ago = rel_time(now_secs.saturating_sub(ts_secs));
     let who = if source == "user" {
         "you".to_string()
     } else if let Some(id) = source.strip_prefix("sess-") {
         format!("session {}", id8(id))
+    } else if source.starts_with("memory:") {
+        "reviewed memory".to_string()
     } else {
         source.to_string()
     };
@@ -1444,6 +1448,10 @@ mod tests {
             "— session 01234567 · 18h"
         );
         assert_eq!(provenance("sess-a3f2", now, now), "— session a3f2 · now");
+        assert_eq!(
+            provenance(r#"memory:["decision-1","revision-2"]"#, now, now),
+            "— reviewed memory · now"
+        );
         // unknown sources pass through — never shown as "you".
         assert_eq!(provenance("agent", now - 86_400 * 3, now), "— agent · 3d");
         // a clock skewed into the future must not underflow.

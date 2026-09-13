@@ -221,6 +221,32 @@
     }
 
     #[test]
+    fn read_only_open_reads_without_migrating_or_writing_the_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "orch-read-only-store-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.sqlite");
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.ensure_project("k", "Project").unwrap();
+            s.accept_diff("k", &seed_ops()).unwrap();
+        }
+        let before = std::fs::read(&db).unwrap();
+
+        {
+            let s = Store::open_read_only(&db).unwrap();
+            assert_eq!(s.load_tree("k").unwrap().len(), 3);
+            assert!(s.ensure_project("other", "Other").is_err());
+        }
+
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn session_summaries_become_memory_documents() {
         let s = Store::open_in_memory().unwrap();
         s.record_summary(
@@ -1517,6 +1543,190 @@
         assert_eq!(p.detail_md, "", "pre-edit body restored");
     }
 
+    #[test]
+    fn memory_decision_projection_is_idempotent_journaled_and_undoable() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.accept_diff("k", &seed_ops()).unwrap();
+        let id = s
+            .load_tree("k")
+            .unwrap()
+            .iter()
+            .find(|p| p.name == "Flow map")
+            .unwrap()
+            .id;
+        let op = DiffOp::AddDecision {
+            part: PartRef::Id(id),
+            text: "The Map and Outline are the only product memory surface.".into(),
+            source_memory_id: "decision-map-surface".into(),
+            source_revision_id: "revision-1".into(),
+        };
+
+        let accept_id = s
+            .accept_diff_from_at("k", &[op.clone()], "memory", None, 4_242)
+            .unwrap();
+        assert!(accept_id.starts_with("acc-4242-"));
+        let notes = s.notes_for_part(id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].ts_secs, 4_242);
+        assert_eq!(notes[0].kind, "decision");
+        assert_eq!(
+            notes[0].text,
+            "The Map and Outline are the only product memory surface."
+        );
+        assert!(
+            notes[0].source.starts_with("memory:"),
+            "the display cache retains an opaque durable revision pointer"
+        );
+        let journal_time: i64 = s
+            .conn
+            .query_row(
+                "SELECT ts_secs FROM tree_event WHERE accept_id=?1",
+                rusqlite::params![accept_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal_time, 4_242);
+
+        // Replaying the same source revision is a no-op, including its inverse:
+        // undoing this second accept must not delete the first projection.
+        s.accept_diff_from("k", &[op], "memory", None).unwrap();
+        assert_eq!(s.notes_for_part(id).unwrap().len(), 1);
+        assert!(s.undo_last("k").unwrap());
+        assert_eq!(s.notes_for_part(id).unwrap().len(), 1);
+
+        assert!(s.undo_last("k").unwrap());
+        assert!(s.notes_for_part(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn memory_revision_collision_rolls_back_and_internal_remove_cannot_touch_user_note() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.accept_diff("k", &seed_ops()).unwrap();
+        let id = s.load_tree("k").unwrap()[0].id;
+        s.accept_diff(
+            "k",
+            &[DiffOp::AddDecision {
+                part: PartRef::Id(id),
+                text: "Accepted interpretation".into(),
+                source_memory_id: "memory-1".into(),
+                source_revision_id: "revision-1".into(),
+            }],
+        )
+        .unwrap();
+        let collision = s.accept_diff(
+            "k",
+            &[DiffOp::AddDecision {
+                part: PartRef::Id(id),
+                text: "Different interpretation".into(),
+                source_memory_id: "memory-1".into(),
+                source_revision_id: "revision-1".into(),
+            }],
+        );
+        assert!(collision.is_err());
+        assert_eq!(s.notes_for_part(id).unwrap().len(), 1);
+
+        let user_note = s.add_note("k", id, "decision", "Keep this", "user").unwrap();
+        let rejected = s.accept_diff("k", &[DiffOp::RemoveDecision { note_id: user_note }]);
+        assert!(rejected.is_err());
+        assert!(
+            s.notes_for_part(id)
+                .unwrap()
+                .iter()
+                .any(|note| note.id == user_note),
+            "journal-only memory undo can never delete a user decision"
+        );
+        let retarget = s.accept_diff(
+            "k",
+            &[DiffOp::RestoreNoteTarget {
+                note_id: user_note,
+                part: PartRef::Id(id),
+                primary: true,
+            }],
+        );
+        assert!(retarget.is_err(), "note retargeting is undo-internal only");
+    }
+
+    #[test]
+    fn node_removal_cleans_machine_projections_and_undo_restores_all_note_targets() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.accept_diff("k", &seed_ops()).unwrap();
+        let parts = s.load_tree("k").unwrap();
+        let removed = parts.iter().find(|part| part.name == "Flow map").unwrap();
+        let survivor = parts
+            .iter()
+            .find(|part| part.name == "Terminal host")
+            .unwrap();
+        s.accept_diff(
+            "k",
+            &[DiffOp::AddDecision {
+                part: PartRef::Id(removed.id),
+                text: "Map + Outline stays application-owned.".into(),
+                source_memory_id: "memory-remove-undo".into(),
+                source_revision_id: "revision-remove-undo".into(),
+            }],
+        )
+        .unwrap();
+        let primary_note = s
+            .add_note("k", removed.id, "note", "Keep node context", "user")
+            .unwrap();
+        let linked_note = s
+            .add_note("k", survivor.id, "decision", "Cross-cutting call", "user")
+            .unwrap();
+        s.link_note(linked_note, removed.id).unwrap();
+
+        s.accept_diff("k", &[DiffOp::Remove { id: removed.id }])
+            .unwrap();
+        assert!(!s.load_tree("k").unwrap().iter().any(|part| part.id == removed.id));
+        assert_eq!(
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM part_note WHERE source LIKE 'memory:%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "a removable projection never points at a deleted node"
+        );
+        assert_eq!(
+            s.conn
+                .query_row(
+                    "SELECT part_id FROM part_note WHERE id=?1",
+                    params![primary_note],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            removed.id,
+            "append-only user history is retained while its node is absent"
+        );
+        assert_eq!(
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM note_part WHERE note_id=?1",
+                    params![linked_note],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        assert!(s.undo_last("k").unwrap());
+        let restored = s
+            .load_tree("k")
+            .unwrap()
+            .into_iter()
+            .find(|part| part.name == "Flow map")
+            .unwrap();
+        assert_ne!(restored.id, removed.id);
+        let restored_notes = s.notes_for_part(restored.id).unwrap();
+        assert!(restored_notes.iter().any(|note| note.id == primary_note));
+        assert!(restored_notes.iter().any(|note| note.id == linked_note));
+        assert!(restored_notes.iter().any(|note| {
+            note.source.starts_with("memory:")
+                && note.text == "Map + Outline stays application-owned."
+        }));
+    }
+
     /// docs/019: changeset shells + the durable summary-job queue.
     #[test]
     fn changesets_and_summary_jobs_roundtrip() {
@@ -1568,6 +1778,184 @@
         s.finish_summary_job(id, None).unwrap();
         assert!(s.claim_summary_job().is_none());
         assert_eq!(s.dead_summary_jobs().len(), 1, "done jobs don't surface");
+    }
+
+    #[test]
+    fn external_changeset_staging_is_atomic_drift_checked_and_idempotent() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.accept_diff("k", &seed_ops()).unwrap();
+        let parts = s.load_tree("k").unwrap();
+        let expected = parts
+            .iter()
+            .map(|part| ChangesetTreeState {
+                id: part.id,
+                parent_id: part.parent_id,
+                name: part.name.clone(),
+                detail_md: part.detail_md.clone(),
+                kind: part.kind,
+                lifecycle: part.lifecycle,
+                sort_order: part.sort_order,
+                anchors: part.anchors.clone(),
+                status_at_secs: part.status_at_secs,
+            })
+            .collect::<Vec<_>>();
+        let target = parts[0].id;
+        let op = DiffOp::AddDecision {
+            part: PartRef::Id(target),
+            text: "Map + Outline is the product surface.".into(),
+            source_memory_id: "memory-map-surface".into(),
+            source_revision_id: "revision-map-surface-1".into(),
+        };
+        let evidence = vec![Some("authoritative quote".into())];
+        let flagged = vec![false];
+
+        let first = s
+            .stage_changeset_atomic(
+                "k",
+                "Reviewed memory",
+                "Confirm each decision",
+                None,
+                "memory:run-1",
+                "memory",
+                &[op.clone()],
+                &evidence,
+                &flagged,
+                &expected,
+            )
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(first.status, "open");
+        let pending_id = first.pending_diff_id.unwrap();
+        let pending = s.changeset_pending(first.changeset_id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].ops, vec![op.clone()]);
+
+        let replay = s
+            .stage_changeset_atomic(
+                "k",
+                "Reviewed memory",
+                "Confirm each decision",
+                None,
+                "memory:run-1",
+                "memory",
+                &[op.clone()],
+                &evidence,
+                &flagged,
+                &expected,
+            )
+            .unwrap();
+        assert_eq!(replay.changeset_id, first.changeset_id);
+        assert_eq!(replay.pending_diff_id, Some(pending_id));
+        assert!(!replay.created);
+        assert_eq!(s.open_changesets("k").len(), 1);
+
+        let collision = DiffOp::AddDecision {
+            part: PartRef::Id(target),
+            text: "Different content".into(),
+            source_memory_id: "memory-map-surface".into(),
+            source_revision_id: "revision-map-surface-1".into(),
+        };
+        assert!(s
+            .stage_changeset_atomic(
+                "k",
+                "Reviewed memory",
+                "Confirm each decision",
+                None,
+                "memory:run-1",
+                "memory",
+                &[collision],
+                &evidence,
+                &flagged,
+                &expected,
+            )
+            .is_err());
+        assert_eq!(s.open_changesets("k").len(), 1);
+
+        s.drop_pending_diff(pending_id).unwrap();
+        s.set_changeset_status(first.changeset_id, "accepted")
+            .unwrap();
+        let resolved_replay = s
+            .stage_changeset_atomic(
+                "k",
+                "Reviewed memory",
+                "Confirm each decision",
+                None,
+                "memory:run-1",
+                "memory",
+                &[op.clone()],
+                &evidence,
+                &flagged,
+                &expected,
+            )
+            .unwrap();
+        assert!(!resolved_replay.created);
+        assert_eq!(resolved_replay.status, "accepted");
+        assert_eq!(resolved_replay.pending_diff_id, None);
+
+        s.set_changeset_status(first.changeset_id, "unknown")
+            .unwrap();
+        assert!(s
+            .stage_changeset_atomic(
+                "k",
+                "Reviewed memory",
+                "Confirm each decision",
+                None,
+                "memory:run-1",
+                "memory",
+                &[op.clone()],
+                &evidence,
+                &flagged,
+                &expected,
+            )
+            .is_err());
+        s.set_changeset_status(first.changeset_id, "accepted")
+            .unwrap();
+        let stray_pending = s
+            .add_pending_diff_full("k", "memory", &[op.clone()], &evidence, &flagged)
+            .unwrap();
+        s.link_pending_to_changeset(stray_pending, first.changeset_id)
+            .unwrap();
+        assert!(s
+            .stage_changeset_atomic(
+                "k",
+                "Reviewed memory",
+                "Confirm each decision",
+                None,
+                "memory:run-1",
+                "memory",
+                &[op.clone()],
+                &evidence,
+                &flagged,
+                &expected,
+            )
+            .is_err());
+        s.drop_pending_diff(stray_pending).unwrap();
+
+        let mut drifted = expected;
+        drifted[0].name.push_str(" changed");
+        assert!(s
+            .stage_changeset_atomic(
+                "k",
+                "Second run",
+                "Confirm each decision",
+                None,
+                "memory:run-2",
+                "memory",
+                &[DiffOp::AddDecision {
+                    part: PartRef::Id(target),
+                    text: "Another decision".into(),
+                    source_memory_id: "memory-2".into(),
+                    source_revision_id: "revision-2".into(),
+                }],
+                &evidence,
+                &flagged,
+                &drifted,
+            )
+            .is_err());
+        assert!(s
+            .open_changesets("k")
+            .iter()
+            .all(|changeset| changeset.4 != "memory:run-2"));
     }
 
     /// docs/019 slice 3 review: queue hardening — trigger upgrade, transcript-

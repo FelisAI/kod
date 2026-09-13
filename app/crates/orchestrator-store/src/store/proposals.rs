@@ -1,10 +1,151 @@
 //! Pending diffs (proposals awaiting accept), changesets, and the summary job
 //! queue. Extracted verbatim from `store.rs` (decomposition; behavior unchanged).
 
-use rusqlite::params;
+use rusqlite::{params, TransactionBehavior};
 
-use super::{now, PendingDiff, Store};
-use crate::tree::DiffOp;
+use super::{now, ChangesetTreeState, PendingDiff, StagedChangeset, Store};
+use crate::tree::{DiffOp, Kind, Lifecycle};
+
+#[derive(Debug)]
+struct StagedPendingContent {
+    id: i64,
+    project_key: String,
+    kind: String,
+    ops: Vec<DiffOp>,
+    evidence: Vec<Option<String>>,
+    flagged: Vec<bool>,
+}
+
+fn invalid_changeset_stage(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(message.into())
+}
+
+fn sql_json<T: serde::Serialize + ?Sized>(value: &T) -> rusqlite::Result<String> {
+    serde_json::to_string(value)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn strict_json<T: serde::de::DeserializeOwned>(
+    value: &str,
+    label: &str,
+) -> rusqlite::Result<T> {
+    serde_json::from_str(value).map_err(|error| {
+        invalid_changeset_stage(format!("invalid {label} in existing changeset: {error}"))
+    })
+}
+
+fn pending_for_changeset(
+    tx: &rusqlite::Transaction<'_>,
+    changeset_id: i64,
+) -> rusqlite::Result<Vec<StagedPendingContent>> {
+    let raw = {
+        let mut statement = tx.prepare(
+            "SELECT id,project_key,kind,ops_json,evidence_json,flagged_json
+             FROM pending_diff WHERE changeset_id=?1 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![changeset_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    raw.into_iter()
+        .map(
+            |(id, project_key, kind, ops_json, evidence_json, flagged_json)| {
+                let ops: Vec<DiffOp> = strict_json(&ops_json, "ops_json")?;
+                let evidence: Vec<Option<String>> = evidence_json
+                    .as_deref()
+                    .map(|value| strict_json(value, "evidence_json"))
+                    .transpose()?
+                    .unwrap_or_default();
+                let flagged: Vec<bool> = flagged_json
+                    .as_deref()
+                    .map(|value| strict_json(value, "flagged_json"))
+                    .transpose()?
+                    .unwrap_or_default();
+                if ops.len() != evidence.len() || ops.len() != flagged.len() {
+                    return Err(invalid_changeset_stage(
+                        "existing changeset arrays are not index-aligned",
+                    ));
+                }
+                Ok(StagedPendingContent {
+                    id,
+                    project_key,
+                    kind,
+                    ops,
+                    evidence,
+                    flagged,
+                })
+            },
+        )
+        .collect()
+}
+
+fn changeset_tree_state(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> rusqlite::Result<Vec<ChangesetTreeState>> {
+    let raw = {
+        let mut statement = tx.prepare(
+            "SELECT id,parent_id,name,COALESCE(detail_md,detail),kind,lifecycle,sort_order,status_at_secs
+             FROM part WHERE project_key=?1 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut state = Vec::with_capacity(raw.len());
+    for (id, parent_id, name, detail_md, kind, lifecycle, sort_order, status_at_secs) in raw {
+        let anchors = {
+            let mut statement =
+                tx.prepare("SELECT glob FROM part_anchor WHERE part_id=?1 ORDER BY glob")?;
+            let rows = statement
+                .query_map(params![id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        state.push(ChangesetTreeState {
+            id,
+            parent_id,
+            name,
+            detail_md,
+            kind: Kind::parse(&kind),
+            lifecycle: Lifecycle::parse(&lifecycle),
+            sort_order,
+            anchors,
+            status_at_secs: status_at_secs.max(0) as u64,
+        });
+    }
+    normalize_tree_state(&mut state);
+    Ok(state)
+}
+
+fn normalize_tree_state(state: &mut [ChangesetTreeState]) {
+    state.sort_by_key(|part| part.id);
+    for part in state {
+        part.anchors.sort();
+    }
+}
 
 impl Store {
     // --- pending diffs (proposals awaiting accept) ---
@@ -130,6 +271,173 @@ impl Store {
         )?;
         self.bump_gen();
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Atomically stage one externally compiled changeset and its pending row.
+    ///
+    /// `origin_run` is the idempotency key within a project. An exact replay
+    /// returns the existing row; a collision fails closed. For a new origin,
+    /// the application-authoritative Map is compared with `expected_tree`
+    /// inside the same IMMEDIATE transaction as both inserts, so a concurrent
+    /// app write cannot slip between drift detection and staging.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_changeset_atomic(
+        &mut self,
+        key: &str,
+        title: &str,
+        instruction: &str,
+        scope_part_id: Option<i64>,
+        origin_run: &str,
+        kind: &str,
+        ops: &[DiffOp],
+        evidence: &[Option<String>],
+        flagged: &[bool],
+        expected_tree: &[ChangesetTreeState],
+    ) -> rusqlite::Result<StagedChangeset> {
+        if key.trim().is_empty()
+            || title.trim().is_empty()
+            || instruction.trim().is_empty()
+            || origin_run.trim().is_empty()
+            || kind.trim().is_empty()
+            || ops.is_empty()
+            || ops.len() != evidence.len()
+            || ops.len() != flagged.len()
+            || expected_tree.is_empty()
+        {
+            return Err(invalid_changeset_stage(
+                "staged changeset fields and aligned arrays must be non-empty",
+            ));
+        }
+        let ops_json = sql_json(ops)?;
+        let evidence_json = sql_json(evidence)?;
+        let flagged_json = sql_json(flagged)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing = {
+            let mut statement = tx.prepare(
+                "SELECT id,title,instruction,scope_part_id,status FROM changeset
+                 WHERE project_key=?1 AND origin_run=?2 ORDER BY id",
+            )?;
+            let rows = statement
+                .query_map(params![key, origin_run], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        if existing.len() > 1 {
+            return Err(invalid_changeset_stage(format!(
+                "multiple changesets reuse origin {origin_run}"
+            )));
+        }
+        if let Some((changeset_id, old_title, old_instruction, old_scope, status)) =
+            existing.into_iter().next()
+        {
+            if old_title != title || old_instruction != instruction || old_scope != scope_part_id {
+                return Err(invalid_changeset_stage(format!(
+                    "changeset origin {origin_run} collides with a different shell"
+                )));
+            }
+            let pending = pending_for_changeset(&tx, changeset_id)?;
+            if pending.len() > 1 {
+                return Err(invalid_changeset_stage(format!(
+                    "changeset origin {origin_run} has multiple pending rows"
+                )));
+            }
+            let pending_diff_id = if let Some(row) = pending.into_iter().next() {
+                if row.project_key != key
+                    || row.kind != kind
+                    || row.ops != ops
+                    || row.evidence != evidence
+                    || row.flagged != flagged
+                {
+                    return Err(invalid_changeset_stage(format!(
+                        "changeset origin {origin_run} collides with different pending content"
+                    )));
+                }
+                Some(row.id)
+            } else {
+                None
+            };
+            if !matches!(status.as_str(), "open" | "accepted" | "rejected" | "partial") {
+                return Err(invalid_changeset_stage(format!(
+                    "changeset origin {origin_run} has unknown status {status}"
+                )));
+            }
+            if (status == "open" && pending_diff_id.is_none())
+                || (status != "open" && pending_diff_id.is_some())
+            {
+                return Err(invalid_changeset_stage(format!(
+                    "changeset origin {origin_run} has pending content inconsistent with status {status}"
+                )));
+            }
+            tx.commit()?;
+            return Ok(StagedChangeset {
+                changeset_id,
+                pending_diff_id,
+                status,
+                created: false,
+            });
+        }
+
+        let current_tree = changeset_tree_state(&tx, key)?;
+        let mut expected_tree = expected_tree.to_vec();
+        normalize_tree_state(&mut expected_tree);
+        if current_tree != expected_tree {
+            return Err(invalid_changeset_stage(
+                "target Map changed after shadow capture; refusing to stage stale decisions",
+            ));
+        }
+        if scope_part_id.is_some_and(|scope| !current_tree.iter().any(|part| part.id == scope)) {
+            return Err(invalid_changeset_stage(
+                "changeset scope does not exist in the target Map",
+            ));
+        }
+
+        let created_secs = now() as i64;
+        tx.execute(
+            "INSERT INTO changeset(project_key,title,instruction,scope_part_id,origin_run,created_secs)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                key,
+                title,
+                instruction,
+                scope_part_id,
+                origin_run,
+                created_secs
+            ],
+        )?;
+        let changeset_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO pending_diff(project_key,kind,ops_json,evidence_json,changeset_id,flagged_json,created_secs)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                key,
+                kind,
+                ops_json,
+                evidence_json,
+                changeset_id,
+                flagged_json,
+                created_secs
+            ],
+        )?;
+        let pending_diff_id = tx.last_insert_rowid();
+        tx.commit()?;
+        self.bump_gen();
+        Ok(StagedChangeset {
+            changeset_id,
+            pending_diff_id: Some(pending_diff_id),
+            status: "open".into(),
+            created: true,
+        })
     }
 
     /// Attach a pending diff to a changeset (grouped review).

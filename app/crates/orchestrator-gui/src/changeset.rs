@@ -38,13 +38,44 @@ pub fn op_asserts_done(op: &DiffOp) -> bool {
     )
 }
 
+/// Semantic memory projections are true claims, not ordinary structural
+/// cleanup. Like `done`, each one must be vouched individually even when its
+/// quote verifies; an exact span proves grounding, not that the interpretation
+/// or relation to this node is correct. RemoveDecision is internal undo
+/// currency, but is held too if it ever reaches a review row.
+pub fn op_requires_individual_review(op: &DiffOp) -> bool {
+    op_asserts_done(op)
+        || matches!(
+            op,
+            DiffOp::AddDecision { .. }
+                | DiffOp::RemoveDecision { .. }
+                | DiffOp::RestoreNoteTarget { .. }
+        )
+}
+
+/// The primary changeset action must describe what it will actually do. A
+/// semantic card has no "Accept all": its rows begin held, then the action
+/// applies only the claims the user explicitly confirmed.
+pub fn changeset_accept_label(has_individual_rows: bool, kept: usize) -> String {
+    if !has_individual_rows {
+        "Accept all".into()
+    } else if kept == 0 {
+        "Confirm rows below".into()
+    } else {
+        format!(
+            "Apply {kept} confirmed row{}",
+            if kept == 1 { "" } else { "s" }
+        )
+    }
+}
+
 /// The effective keep-state of a changeset op (docs/019 slice 2 review surface).
-/// A plain, verified op is kept by DEFAULT; a FLAGGED (unverified) or `done` op
-/// is EXCLUDED by default (individually accepted only — it never rides Accept
-/// all). The user's per-op toggle FLIPS that default either way, so one
+/// A plain, verified op is kept by DEFAULT; a FLAGGED (unverified), `done`, or
+/// semantic-decision op is EXCLUDED by default (individually accepted only —
+/// it never rides Accept all). The user's per-op toggle FLIPS that default, so one
 /// toggle mechanic serves both "drop this" and "accept this flagged one anyway".
 pub fn changeset_kept(op: &DiffOp, flagged: bool, flipped: bool) -> bool {
-    let default_kept = !(flagged || op_asserts_done(op));
+    let default_kept = !(flagged || op_requires_individual_review(op));
     default_kept ^ flipped
 }
 
@@ -58,6 +89,10 @@ fn op_temp_parent(op: &DiffOp) -> Option<&str> {
         }
         | DiffOp::Move {
             parent: PartRef::Temp(t),
+            ..
+        }
+        | DiffOp::AddDecision {
+            part: PartRef::Temp(t),
             ..
         } => Some(t),
         _ => None,
@@ -117,7 +152,8 @@ pub fn plan_changeset_accept(
             }
             // an explicitly toggled-off VERIFIED op is a deliberate reject —
             // dropped, not kept. Held/deferred ops persist.
-            let default_kept = !(flagged(i) || op_asserts_done(&flat[i].0));
+            let default_kept =
+                !(flagged(i) || op_requires_individual_review(&flat[i].0));
             let explicitly_rejected = default_kept && off.contains(&i);
             !explicitly_rejected
         })
@@ -148,6 +184,15 @@ mod tests {
     }
     fn flat(ops: Vec<DiffOp>) -> Vec<(DiffOp, Option<String>)> {
         ops.into_iter().map(|o| (o, None)).collect()
+    }
+
+    fn decision(part: PartRef) -> DiffOp {
+        DiffOp::AddDecision {
+            part,
+            text: "Map is the only memory surface".into(),
+            source_memory_id: "memory-map-surface".into(),
+            source_revision_id: "revision-1".into(),
+        }
     }
 
     #[test]
@@ -207,6 +252,41 @@ mod tests {
             leftover.is_empty(),
             "an explicitly rejected verified op is dropped, not persisted"
         );
+    }
+
+    #[test]
+    fn verified_decision_is_held_until_individually_confirmed() {
+        let f = flat(vec![decision(PartRef::Id(7))]);
+        let (applied, leftover) = plan_changeset_accept(&f, &[false], &HashSet::new());
+        assert!(applied.is_empty());
+        assert_eq!(leftover, vec![0]);
+
+        let confirmed: HashSet<usize> = [0].into_iter().collect();
+        let (applied, leftover) = plan_changeset_accept(&f, &[false], &confirmed);
+        assert_eq!(applied, vec![0]);
+        assert!(leftover.is_empty());
+        assert_eq!(changeset_accept_label(true, 0), "Confirm rows below");
+        assert_eq!(
+            changeset_accept_label(true, 1),
+            "Apply 1 confirmed row"
+        );
+        assert_eq!(
+            changeset_accept_label(true, 3),
+            "Apply 3 confirmed rows"
+        );
+        assert_eq!(changeset_accept_label(false, 3), "Accept all");
+    }
+
+    #[test]
+    fn decision_for_held_temp_parent_is_dependency_deferred() {
+        let f = flat(vec![
+            add("g1", PartRef::Root),
+            decision(PartRef::Temp("g1".into())),
+        ]);
+        let confirmed: HashSet<usize> = [1].into_iter().collect();
+        let (applied, leftover) = plan_changeset_accept(&f, &[true, false], &confirmed);
+        assert!(applied.is_empty());
+        assert_eq!(leftover, vec![0, 1]);
     }
 
     #[test]

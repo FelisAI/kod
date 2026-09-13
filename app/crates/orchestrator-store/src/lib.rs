@@ -5,6 +5,7 @@
 //! the registry's canonical_key. Pure tree/diff model (`tree`) + SQLite shell
 //! (`store`).
 
+pub mod map_outline_memory;
 pub mod memory;
 pub mod memory_adapter;
 pub mod memory_engine;
@@ -14,6 +15,11 @@ pub mod reconcile;
 pub mod store;
 pub mod tree;
 
+pub use map_outline_memory::{
+    MapOutlineDecision, MapOutlineMemorySource, MapOutlineNode, MapOutlineProjection,
+    MapOutlineProjectionError, MapOutlineQuestion, KOD_ABOUT_RELATION, KOD_AREA_KIND,
+    KOD_CONTAINS_RELATION, KOD_DECISION_KIND, KOD_IDEA_KIND, KOD_QUESTION_KIND, KOD_TASK_KIND,
+};
 pub use memory::{
     HumanCorrection, InMemoryMemoryBackend, MemoryBackend, MemoryEdge, MemoryEdgeKind, MemoryError,
     MemoryId, MemoryObject, MemoryObjectKind, MemoryObjectState, MemoryResult, MemorySource,
@@ -37,8 +43,9 @@ pub use memory_extract::{
 };
 pub use memory_llm::{llm_memory_extraction_prompt, parse_llm_memory_candidates};
 pub use store::{
-    flatten_changeset_flags, flatten_changeset_ops, HostedSessionRow, MemoryCandidateRow,
-    PendingDiff, ProfileRow, SeedState, Store, SummaryRow, TimelineEvent, TimelineKind,
+    flatten_changeset_flags, flatten_changeset_ops, ChangesetTreeState, HostedSessionRow,
+    MemoryCandidateRow, PendingDiff, ProfileRow, SeedState, StagedChangeset, Store, SummaryRow,
+    TimelineEvent, TimelineKind,
 };
 pub use tree::{
     build_tree, countable_ratio, dissolve_node_ops, dissolve_tech_target, done_ratio, first_line,

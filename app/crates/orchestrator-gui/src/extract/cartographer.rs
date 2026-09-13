@@ -1210,6 +1210,10 @@ Output ONLY minified JSON, no prose, shape: {{\"ops\":[...]}}\n\n{git_facts}"
             DiffOp::SetDetail { id, .. } => id_ok(id),
             DiffOp::SetKind { id, .. } => id_ok(id),
             DiffOp::SetStatus { id, .. } => id_ok(id),
+            DiffOp::AddDecision { part, .. } => parent_ok(part),
+            // This is journal-only inverse currency. A cartographer output can
+            // never prove the note-id belongs to its fence, so reject it.
+            DiffOp::RemoveDecision { .. } | DiffOp::RestoreNoteTarget { .. } => false,
         }
     }
 

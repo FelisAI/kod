@@ -8,9 +8,34 @@
 set -e
 cd "$(dirname "$0")/.."
 PROFILE="${1:-debug}"
-BINS="-p orchestrator-gui -p orchestrator-daemon -p orchestrator-bridge"
-if [ "$PROFILE" = "release" ]; then cargo build --release $BINS
-else cargo build $BINS; fi
+GUI_FEATURES="${KOD_GUI_FEATURES:-}"
+APP_NAME="${KOD_APP_NAME:-Kod}"
+BUNDLE_ID="${KOD_BUNDLE_ID:-ai.felis.kod}"
+APP="${KOD_APP_PATH:-../Kod.app}"
+
+case "$PROFILE" in
+  debug|release) ;;
+  *) echo "profile must be debug or release" >&2; exit 1;;
+esac
+case "$APP" in
+  *.app) ;;
+  *) echo "KOD_APP_PATH must name a .app bundle" >&2; exit 1;;
+esac
+
+build() {
+  if [ "$PROFILE" = "release" ]; then cargo build --release "$@"
+  else cargo build "$@"; fi
+}
+
+# Build the GUI separately so an opt-in GUI feature does not get applied to the
+# daemon or bridge packages. Building it last also guarantees the binary copied
+# below has the requested feature set.
+build -p orchestrator-daemon -p orchestrator-bridge
+if [ -n "$GUI_FEATURES" ]; then
+  build -p orchestrator-gui --features "$GUI_FEATURES"
+else
+  build -p orchestrator-gui
+fi
 # Read the version from the crate rather than repeating it here. It was hardcoded
 # and went stale: the crates were bumped to 0.3.0 and a freshly built, signed,
 # notarized bundle still reported 0.2.0 — a shipped artifact that misidentifies
@@ -18,7 +43,6 @@ else cargo build $BINS; fi
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/orchestrator-gui/Cargo.toml | head -1)"
 [ -n "$VERSION" ] || { echo "cannot read version from crates/orchestrator-gui/Cargo.toml" >&2; exit 1; }
 
-APP="../Kod.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/$PROFILE/orchestrator" "$APP/Contents/MacOS/kod"
@@ -34,9 +58,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Kod</string>
-  <key>CFBundleDisplayName</key><string>Kod</string>
-  <key>CFBundleIdentifier</key><string>ai.felis.kod</string>
+  <key>CFBundleName</key><string>__APP_NAME__</string>
+  <key>CFBundleDisplayName</key><string>__APP_NAME__</string>
+  <key>CFBundleIdentifier</key><string>__BUNDLE_ID__</string>
   <key>CFBundleExecutable</key><string>kod</string>
   <key>CFBundleIconFile</key><string>kod</string>
   <key>CFBundlePackageType</key><string>APPL</string>
@@ -48,5 +72,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 sed -i '' "s/__VERSION__/$VERSION/g" "$APP/Contents/Info.plist"
+sed -i '' "s/__APP_NAME__/$APP_NAME/g" "$APP/Contents/Info.plist"
+sed -i '' "s/__BUNDLE_ID__/$BUNDLE_ID/g" "$APP/Contents/Info.plist"
 echo "assembled: $(cd "$APP" && pwd)"
-echo "launch:    open ../Kod.app"
+echo "launch:    open '$APP'"

@@ -203,8 +203,10 @@ impl Store {
         )?;
         self.conn.execute_batch(
             r#"
-            -- the DECISION/NOTE log (#10 memory layer): append-only, provenanced.
-            -- Answers "what did we decide about X" — a mutable field never can.
+            -- the DECISION/NOTE log (#10 memory layer): provenanced. User and
+            -- session entries are append-only. Reserved memory-engine sources are
+            -- reversible application projections whose truth remains in the
+            -- external revision store.
             CREATE TABLE IF NOT EXISTS part_note (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 part_id INTEGER NOT NULL,

@@ -9,8 +9,11 @@ use crate::tree::PartId;
 
 impl Store {
     /// Append a decision/note to a node's log (#10). LLM callers must pass
-    /// source="sess-<cli id>"; user edits pass "user". Entries are never
-    /// updated or deleted — the log IS the memory.
+    /// source="sess-<cli id>"; user edits pass "user". Those authoritative
+    /// user/session entries are never updated or deleted — the log IS the
+    /// memory. Reviewed memory-engine display projections use a reserved source and
+    /// are journaled through DiffOp so undo may remove that cache row without
+    /// deleting the durable memory-engine revision.
     pub fn add_note(
         &self,
         project_key: &str,

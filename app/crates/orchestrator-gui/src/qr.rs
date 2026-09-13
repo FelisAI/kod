@@ -1089,7 +1089,16 @@ mod roundtrip_dump {
     #[ignore]
     fn dump_pbms_for_external_decode() {
         let dir = std::env::var("QR_DUMP_DIR").expect("set QR_DUMP_DIR");
-        for (name, payload) in super::super::qr::roundtrip_dump::CASES {
+        // One-off: dump a specific payload instead of the fixed cases, so a real
+        // pairing code can be rendered without a screenshot of the settings pane.
+        let owned = std::env::var("QR_DUMP_TEXT").unwrap_or_default();
+        let cases: &[(&str, &str)] = if owned.is_empty() {
+            super::super::qr::roundtrip_dump::CASES
+        } else {
+            &[("adhoc", "")]
+        };
+        for (name, payload) in cases {
+            let payload: &str = if *name == "adhoc" { owned.as_str() } else { payload };
             let q = Qr::encode(payload).expect("encode");
             // 8px per module with a 4-module quiet zone; decoders need both.
             let scale = 8usize;

@@ -13,9 +13,16 @@ credentials*
 # local scratch
 *.tmp
 /Kod.app/
+/Kod Demo.app/
 # separate side projects that live beside this repo but are NOT part of it —
 # ecphory is the private memory-system prototype; must never ship in the OSS repo.
 /ecphory/
+# ...and the incubating adapter that bridges to it. It is deliberately NOT a
+# workspace member (its own [workspace]) and it path-depends on /ecphory/ above,
+# so committing it would put a permanently unbuildable crate in the public repo
+# pointing at a directory that is never published. Keep it local until the
+# shadow runs justify a real in-workspace dependency.
+/app/adapters/
 # local working artifacts — design notes, docs, and spikes/experiments. Kept on
 # disk but OUT of the repo (untracked): they're our scratch, not for collaborators
 # or the public build. (The OSS publish already dropped them via its whitelist.)

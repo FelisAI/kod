@@ -120,7 +120,8 @@ impl Orchestrator {
         let mode = self.mode;
         let rec_n = self.recoverable_count_for_project();
 
-        // a centered Mac-style tab (Map/Flow/Brain switch the view mode).
+        // A centered Mac-style mode tab. Memory remains behind the existing
+        // Map + Outline surface; it never creates a Brain destination.
         let tab = |id: &'static str,
                    label: &'static str,
                    this_mode: Mode,

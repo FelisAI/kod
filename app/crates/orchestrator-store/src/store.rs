@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 
 // The memory + tree type imports below are consumed by the `tests` module
 // (store/tests.rs) through `use super::*`; the non-test lib build sees them as
@@ -91,6 +91,31 @@ pub struct PendingDiff {
     /// accept-all — individually accepted only). Rows from before the column
     /// existed load as all-`false` (a legacy/canned op carries no flag).
     pub flagged: Vec<bool>,
+}
+
+/// Application-authoritative Map state that must still match when an external
+/// changeset is staged. The comparison runs inside the same IMMEDIATE SQLite
+/// transaction as insertion, closing the read/check/write race with a live app.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangesetTreeState {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub detail_md: String,
+    pub kind: Kind,
+    pub lifecycle: Lifecycle,
+    pub sort_order: f64,
+    pub anchors: Vec<String>,
+    pub status_at_secs: u64,
+}
+
+/// Result of idempotently staging a named changeset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedChangeset {
+    pub changeset_id: i64,
+    pub pending_diff_id: Option<i64>,
+    pub status: String,
+    pub created: bool,
 }
 
 /// Flatten a changeset's linked pending rows into ONE ops+evidence list, in
@@ -269,6 +294,24 @@ impl Store {
         };
         s.migrate()?;
         Ok(s)
+    }
+
+    /// Opens an existing current-schema store with SQLite write access disabled.
+    ///
+    /// This deliberately does not run migrations: diagnostics and shadow readers must never
+    /// change their input snapshot. Callers should fail if the snapshot is too old for the read
+    /// they request, then make a separate disposable migrated copy if needed.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Store> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Store {
+            conn,
+            fts_dirty: std::cell::Cell::new(true),
+            write_gen: std::cell::Cell::new(0),
+        })
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Store> {
@@ -743,8 +786,6 @@ impl Store {
     }
 
 }
-
-
 
 
 

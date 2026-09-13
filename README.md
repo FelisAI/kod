@@ -109,6 +109,19 @@ Preview them while they bake:
 cargo run -p orchestrator-gui --features map,memory
 ```
 
+If the real app is already carrying live sessions, preview Map against a
+consistent copy instead of attaching a rebuilt client to the real daemon:
+
+```sh
+ORCH_DEMO=flow KOD_SANDBOX=/Users/Shared/kod-memory-review \
+  app/scripts/dev-sandbox.sh --snapshot --map --demo-app
+```
+
+That launches a separately identified **Kod Demo** app with its own HOME,
+database copy, and daemon socket. The real app and its sessions stay connected
+to their original daemon. Review actions in Kod Demo change only the snapshot;
+stop and remove it later with the same `KOD_SANDBOX` plus `--stop`.
+
 Everything else — Standup, sessions, profiles, recover — is always on, and the
 only background LLM a default build uses is Standup's session summaries.
 

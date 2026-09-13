@@ -5,6 +5,8 @@
 #
 #   scripts/dev-sandbox.sh              # isolated daemon + demo projects
 #   scripts/dev-sandbox.sh --empty      # isolated daemon, no seeded data
+#   scripts/dev-sandbox.sh --snapshot --map --demo-app
+#                                       # real-store copy in a separate Kod Demo app
 #   scripts/dev-sandbox.sh --no-daemon  # in-process host, no daemon at all
 #   scripts/dev-sandbox.sh --stop       # stop the sandbox daemon, delete the sandbox
 #
@@ -51,7 +53,9 @@ esac
 MODE=seeded
 SNAPSHOT=0
 BUNDLE=0
+DEMO_APP=0
 NOTIFY=0
+MAP=0
 for a in "$@"; do
   case "$a" in
     --empty)     MODE=empty;;
@@ -70,6 +74,13 @@ for a in "$@"; do
     # bundle, NOT from gpui's set_menus) and the Dock shows kod.icns. The bare
     # binary can do neither — it has no Info.plist to read them from.
     --bundle)    BUNDLE=1;;
+    # Give the sandbox its own visible name and bundle identifier as well as its
+    # own HOME/socket. This lets it coexist with the real Kod process without
+    # LaunchServices treating the review window as another launch of that app.
+    --demo-app)  BUNDLE=1; DEMO_APP=1;;
+    # The normal product build deliberately compiles Map + Outline out. A review
+    # snapshot needs the feature so its staged changeset can actually be seen.
+    --map)       MAP=1;;
     # Fire one test notification 3s after boot. Implies --bundle, because the
     # whole point is seeing which app macOS attributes the banner to.
     --notify)    BUNDLE=1; NOTIFY=1;;
@@ -157,17 +168,38 @@ if [ "$SNAPSHOT" = 1 ]; then
      || ' projects' FROM session_summary;" 2>/dev/null || true
 fi
 
-cargo build -p orchestrator-gui -p orchestrator-daemon
+cargo build -p orchestrator-daemon
+GUI_FEATURES=""
+if [ "$MAP" = 1 ]; then
+  GUI_FEATURES=map
+  cargo build -p orchestrator-gui --features "$GUI_FEATURES"
+else
+  cargo build -p orchestrator-gui
+fi
 
 BIN=./target/debug/orchestrator
 IDENTITY="bare binary — menu bar will read \"orchestrator\", no Dock icon"
 if [ "$BUNDLE" = 1 ]; then
-  bash "$APP/scripts/make-app.sh" >/dev/null
+  BUNDLE_PATH="$APP/../Kod.app"
+  if [ "$DEMO_APP" = 1 ]; then
+    BUNDLE_PATH="$APP/../Kod Demo.app"
+    KOD_GUI_FEATURES="$GUI_FEATURES" \
+      KOD_APP_NAME="Kod Demo" \
+      KOD_BUNDLE_ID="ai.felis.kod.demo" \
+      KOD_APP_PATH="$BUNDLE_PATH" \
+      bash "$APP/scripts/make-app.sh" >/dev/null
+  else
+    KOD_GUI_FEATURES="$GUI_FEATURES" bash "$APP/scripts/make-app.sh" >/dev/null
+  fi
   # Exec the binary INSIDE the bundle rather than `open`ing the app: `open`
   # launches via LaunchServices and would drop HOME/XDG_RUNTIME_DIR, silently
   # pointing the "sandbox" at the real store and the real daemon socket.
-  BIN="$APP/../Kod.app/Contents/MacOS/kod"
-  IDENTITY="Kod.app — menu bar reads \"Kod\", Dock shows kod.icns"
+  BIN="$BUNDLE_PATH/Contents/MacOS/kod"
+  if [ "$DEMO_APP" = 1 ]; then
+    IDENTITY="Kod Demo.app (ai.felis.kod.demo) — separate from the real Kod app"
+  else
+    IDENTITY="Kod.app — menu bar reads \"Kod\", Dock shows kod.icns"
+  fi
 fi
 
 echo "── sandbox ──────────────────────────────────────────────"
@@ -178,6 +210,7 @@ echo "  your real socket $REAL_SOCK   (untouched)"
 echo "  identity         $IDENTITY"
 [ "$MODE" = nodaemon ] && echo "  host             in-process (ORCH_NO_DAEMON=1)"
 [ "$MODE" = seeded ]   && echo "  seeded           4 demo projects"
+[ "$MAP" = 1 ]         && echo "  product surface  Map + Outline enabled"
 if [ "$NOTIFY" = 1 ]; then
   echo "  notify test      one banner ~3s after launch"
   echo "                   UNSIGNED bundle => the native path is taken but macOS"
