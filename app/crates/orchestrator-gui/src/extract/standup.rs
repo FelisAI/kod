@@ -289,25 +289,54 @@ fn claude_digest(text: &str) -> (Option<String>, Option<String>, u32) {
     (goal, outcome, turns)
 }
 
+/// The text of a codex `message` payload, whose `content` is an ARRAY of typed
+/// items (`{"type":"input_text","text":…}` / `output_text`).
+///
+/// CODEX CHANGED ITS ROLLOUT FORMAT. It used to write `user_message` /
+/// `agent_message` payloads with a flat `message` string; it now writes
+/// `message` payloads carrying a role and this array. The old reader found
+/// neither, so `codex_digest` returned no goal, `build_standup_digest` returned
+/// None, and every one of those sessions died as "transcript: empty or
+/// unreadable" — measured: 91 dead jobs, on rollouts of 273 to 4632 lines that
+/// were nothing of the kind.
+///
+/// Both shapes are read, because rollouts written before the change are still
+/// on disk and still summarised.
+fn codex_message_text(p: &serde_json::Value) -> Option<String> {
+    let joined: String = p
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let t = joined.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 fn codex_digest(text: &str) -> (Option<String>, Option<String>, u32) {
     let mut goal = None;
     let mut turns = 0u32;
     for line in text.lines() {
-        if !line.contains("\"user_message\"") {
+        // cheap pre-filter for BOTH shapes before parsing the line
+        if !line.contains("\"user_message\"") && !line.contains("\"role\":\"user\"") {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         let p = v.get("payload").unwrap_or(&v);
-        if p.get("type").and_then(|t| t.as_str()) != Some("user_message") {
-            continue;
-        }
-        let Some(t) = p
-            .get("message")
-            .and_then(|m| m.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        let kind = p.get("type").and_then(|t| t.as_str());
+        let role = p.get("role").and_then(|r| r.as_str());
+        let Some(t) = (match (kind, role) {
+            (Some("user_message"), _) => p
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.trim().to_string()),
+            (Some("message"), Some("user")) => codex_message_text(p),
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
         else {
             continue;
         };
@@ -320,16 +349,20 @@ fn codex_digest(text: &str) -> (Option<String>, Option<String>, u32) {
             goal = Some(t);
         }
     }
-    let outcome = last_match(text, &["\"agent_message\""], |v| {
+    let outcome = last_match(text, &["\"agent_message\"", "\"role\":\"assistant\""], |v| {
         let p = v.get("payload").unwrap_or(v);
-        (p.get("type").and_then(|t| t.as_str()) == Some("agent_message"))
-            .then(|| {
-                p.get("message")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.trim().to_string())
-            })
-            .flatten()
-            .filter(|s| !s.is_empty())
+        match (
+            p.get("type").and_then(|t| t.as_str()),
+            p.get("role").and_then(|r| r.as_str()),
+        ) {
+            (Some("agent_message"), _) => p
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.trim().to_string()),
+            (Some("message"), Some("assistant")) => codex_message_text(p),
+            _ => None,
+        }
+        .filter(|s| !s.is_empty())
     });
     (goal, outcome, turns)
 }
@@ -482,6 +515,36 @@ mod tests {
 
 #[cfg(test)]
 mod standup_live_tests {
+
+    /// CODEX CHANGED ITS ROLLOUT FORMAT and the digest went blind.
+    ///
+    /// Both shapes, from a real rollout: the old flat `user_message` /
+    /// `agent_message` payloads, and the current `message` payloads carrying a
+    /// role and a `content` ARRAY of typed items. Reading only the old one is
+    /// what produced 91 dead summary jobs saying "transcript: empty or
+    /// unreadable" about rollouts thousands of lines long.
+    #[test]
+    fn codex_digest_reads_both_rollout_formats() {
+        let old = concat!(
+            r#"{"payload":{"type":"user_message","message":"fix the flaky test"}}"#, "\n",
+            r#"{"payload":{"type":"agent_message","message":"fixed it, 12 tests pass"}}"#, "\n",
+        );
+        let (goal, outcome, turns) = super::codex_digest(old);
+        assert_eq!(goal.as_deref(), Some("fix the flaky test"));
+        assert_eq!(outcome.as_deref(), Some("fixed it, 12 tests pass"));
+        assert_eq!(turns, 1);
+
+        let new = concat!(
+            r#"{"payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<skills_instructions>ignore me"}]}}"#, "\n",
+            r#"{"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the flaky test"}]}}"#, "\n",
+            r#"{"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fixed it, 12 tests pass"}]}}"#, "\n",
+        );
+        let (goal, outcome, turns) = super::codex_digest(new);
+        assert_eq!(goal.as_deref(), Some("fix the flaky test"), "the new shape must yield a goal");
+        assert_eq!(outcome.as_deref(), Some("fixed it, 12 tests pass"));
+        assert_eq!(turns, 1, "a developer-role preamble is not a user turn");
+    }
+
     use super::*;
 
     // LIVE: one real standup summary (uses quota, sonnet):

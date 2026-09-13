@@ -147,6 +147,9 @@ struct Inner {
     /// perfectly faithful — erring toward "non-empty" only ever blocks a fire (the
     /// safe direction). It is NO LONGER the source of the replayed prompt.
     input_buffer: String,
+    /// When `input_buffer` last changed. Auto-continue submits a draft that was
+    /// already sitting there, but must not submit one being typed RIGHT NOW.
+    input_touched_ms: u64,
     /// unix-ms of the last NON-BLANK composer submit (Enter). 0 = never. Drives
     /// the manual-resume disarm (a submit AFTER we armed means the user is
     /// driving again, so back off) and the first-turn fallback gate. Not text.
@@ -306,6 +309,10 @@ pub struct AcInputs {
     /// a non-empty composer BLOCKS a fire so auto-continue never types over a
     /// half-typed line. Erring toward "non-empty" only ever blocks (the safe way).
     pub composer_empty: bool,
+    /// The composer is either EMPTY, or holds a draft nobody has touched for
+    /// `AC_INPUT_SETTLE_MS`. A non-empty draft no longer BLOCKS the fire — it
+    /// becomes what the fire sends — but one still being typed does.
+    pub draft_settled: bool,
     /// unix-ms of the last non-blank composer submit (the manual-resume check).
     pub last_submit_ms: Option<u64>,
     /// there is a resolved `ac_prompt` (from the transcript) to replay at all.
@@ -374,8 +381,43 @@ const LIMIT_SCAN_ROWS: usize = 24;
 /// silent until GiveUp six hours later.
 ///
 /// Pure so the rule is a test rather than a reading of two files.
-fn fire_recheck_holds(g: &Inner) -> bool {
-    g.input_buffer.trim().is_empty() && g.ac_armed
+fn fire_recheck_holds(g: &Inner, now_ms: u64) -> bool {
+    g.ac_armed && draft_settled(g, now_ms)
+}
+
+/// Is the composer safe to act on — empty, or holding a draft that has stopped
+/// moving? A draft being typed right now is the one case where firing would
+/// submit half a thought.
+fn draft_settled(g: &Inner, now_ms: u64) -> bool {
+    g.input_buffer.trim().is_empty()
+        || now_ms.saturating_sub(g.input_touched_ms) >= AC_INPUT_SETTLE_MS
+}
+
+/// A bounded, single-line prefix of a draft, for the audit notice.
+fn draft_prefix(text: &str, max: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    }
+}
+
+/// How long a draft must have sat still before auto-continue will submit it.
+///
+/// Your half-written line is almost certainly what you meant to send when the
+/// limit interrupted you — but submitting one mid-keystroke is a different
+/// thing entirely. A draft nobody has touched for this long is settled.
+pub const AC_INPUT_SETTLE_MS: u64 = 30_000;
+
+/// What a fire should put into the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcFire {
+    /// A draft is already sitting in the composer — press Enter and send THAT,
+    /// rather than typing over the user's own words.
+    SubmitDraft(String),
+    /// Nothing waiting, so say the thing a person would say.
+    Send(&'static str),
 }
 
 /// What auto-continue types when a usage window reopens.
@@ -425,7 +467,7 @@ pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
         && !i.busy
         && !i.recently_working
         && !i.has_dialog
-        && i.composer_empty
+        && i.draft_settled
     {
         return AcDecision::Fire;
     }
@@ -468,6 +510,8 @@ fn limit_note(limit: Option<&UsageLimit>, noted_since: Option<u64>) -> Option<(u
 /// not model claude's own line editing; erring toward a non-empty buffer or a
 /// spurious submit only ever BLOCKS/DISARMS a fire (the safe direction).
 fn capture_key(g: &mut Inner, key: &KeyInput) {
+    // Every arm below moves the draft, so stamp once here.
+    g.input_touched_ms = now_ms();
     match key {
         // text-bearing keys extend the composed draft.
         KeyInput::Char(s) | KeyInput::Paste(s) => g.input_buffer.push_str(s),
@@ -498,7 +542,13 @@ fn capture_key(g: &mut Inner, key: &KeyInput) {
 /// LATER new hit edge can re-arm. PURE w.r.t. the pty, so the arm-state
 /// transitions + the fired latch + the Notices are unit-tested on a bare `Inner`
 /// (RULE ZERO: no subprocess in tests).
-fn ac_apply(g: &mut Inner, decision: AcDecision, now: u64, hit: bool, alive: bool) -> Option<String> {
+fn ac_apply(
+    g: &mut Inner,
+    decision: AcDecision,
+    now: u64,
+    hit: bool,
+    alive: bool,
+) -> Option<AcFire> {
     match decision {
         AcDecision::Skip => {}
         AcDecision::Arm { reset_at } => {
@@ -545,7 +595,15 @@ fn ac_apply(g: &mut Inner, decision: AcDecision, now: u64, hit: bool, alive: boo
             });
         }
         AcDecision::Fire => {
-            let text = AC_RESUME_TEXT.to_string();
+            // A DRAFT ALREADY IN THE COMPOSER IS THE BETTER ANSWER. It is what you
+            // were about to send when the limit cut in, so sending "continue"
+            // instead would both discard it and ask for something vaguer.
+            let draft = g.input_buffer.trim().to_string();
+            let fire = if draft.is_empty() {
+                AcFire::Send(AC_RESUME_TEXT)
+            } else {
+                AcFire::SubmitDraft(draft)
+            };
             if !alive {
                 // ALIVE-ONLY: a session that DIED while blocked can't be resumed by
                 // typing — disarm and tell the user to resume it manually.
@@ -565,9 +623,16 @@ fn ac_apply(g: &mut Inner, decision: AcDecision, now: u64, hit: bool, alive: boo
                 // #8: record a BOUNDED PREFIX of what was injected (audit trail),
                 // not merely a char count — the timeline shows WHAT was replayed.
                 g.push_event(SessionEventKind::Notice {
-                    text: format!("auto-continued at reset — sent {AC_RESUME_TEXT:?}"),
+                    text: match &fire {
+                        AcFire::SubmitDraft(d) => {
+                            format!("auto-continued at reset — submitted your draft: {}", draft_prefix(d, 60))
+                        }
+                        AcFire::Send(t) => format!("auto-continued at reset — sent {t:?}"),
+                    },
                 });
-                return Some(text);
+                // The draft is about to be submitted, so it is no longer pending.
+                g.input_buffer.clear();
+                return Some(fire);
             }
         }
     }
@@ -666,6 +731,7 @@ impl HostedSession {
             last_restore_ms: 0,
             trouble_muted_until_ms: 0,
             input_buffer: String::new(),
+            input_touched_ms: 0,
             last_submit_ms: 0,
             ac_prompt: None,
             ac_armed: false,
@@ -1010,6 +1076,7 @@ impl HostedSession {
         let busy = g.busy || phase == Phase::AwaitingDecision;
         let has_dialog = grid_has_dialog(&g.emu.snapshot());
         let composer_empty = g.input_buffer.trim().is_empty();
+        let draft_settled = draft_settled(&g, now);
         let last_submit_ms = (g.last_submit_ms != 0).then_some(g.last_submit_ms);
         let has_held_prompt = g.ac_prompt.is_some();
         let inputs = AcInputs {
@@ -1021,6 +1088,7 @@ impl HostedSession {
             recently_working: recently,
             has_dialog,
             composer_empty,
+            draft_settled,
             last_submit_ms,
             has_held_prompt,
             armed: g.ac_armed,
@@ -1051,23 +1119,26 @@ impl HostedSession {
         // What this recheck is actually FOR (#2 TOCTOU) is the composer and the
         // arm, which a client keystroke could move between the input build and
         // the write. Those stay.
-        if decision == AcDecision::Fire && !fire_recheck_holds(&g) {
+        if decision == AcDecision::Fire && !fire_recheck_holds(&g, now) {
             decision = AcDecision::Skip;
         }
         // Everything except the pty keystrokes is a pure `Inner` mutation, so it's
         // unit-tested on a bare `Inner` (RULE ZERO). `ac_apply` returns the exact
         // ground-truth text ONLY when a live session must be fired into.
         let fire_text = ac_apply(&mut g, decision, now, hit, alive);
-        if let Some(text) = fire_text {
-            // Replay EXACTLY the resolved ground-truth prompt (never fabricated): a
-            // bracketed paste of the line, then Enter. Written WHILE STILL HOLDING
-            // `g` (lock-held raw-write path, #2) so a client keystroke can't
-            // interleave between the composer check and the write. `pty.write` locks
-            // only its own writer mutex, and no path locks `writer` then `inner`, so
-            // this `inner`→`writer` ordering cannot deadlock.
+        if let Some(fire) = fire_text {
+            // Written WHILE STILL HOLDING `g` (lock-held raw-write path, #2) so a
+            // client keystroke cannot interleave between the gate and the write.
+            // `pty.write` locks only its own writer mutex, and no path locks
+            // `writer` then `inner`, so this `inner`→`writer` ordering cannot
+            // deadlock.
             let mode = g.emu.mode_flags();
-            if let Some(bytes) = input::encode(&KeyInput::Paste(text), mode) {
-                self.pty.write(&bytes);
+            // A DRAFT IS ALREADY ON THE LINE — send Enter alone. Pasting it again
+            // would double it.
+            if let AcFire::Send(text) = &fire {
+                if let Some(bytes) = input::encode(&KeyInput::Paste(text.to_string()), mode) {
+                    self.pty.write(&bytes);
+                }
             }
             if let Some(bytes) = input::encode(&KeyInput::Enter, mode) {
                 self.pty.write(&bytes);
@@ -1548,6 +1619,7 @@ mod tests {
             last_restore_ms: 0,
             trouble_muted_until_ms: 0,
             input_buffer: String::new(),
+            input_touched_ms: 0,
             last_submit_ms: 0,
             ac_prompt: None,
             ac_armed: false,
@@ -1908,6 +1980,7 @@ mod tests {
         );
         // ...but every OTHER safety gate still binds with the config on.
         i.composer_empty = false; // a half-typed line
+        i.draft_settled = false; // …still being typed
         assert_eq!(
             ac_decide(&i, R_MS),
             AcDecision::Skip,
@@ -1938,6 +2011,7 @@ mod tests {
             recently_working: false,
             has_dialog: false,
             composer_empty: true,
+            draft_settled: true,
             last_submit_ms: Some(500),
             has_held_prompt: true,
             armed: false,
@@ -2035,16 +2109,20 @@ mod tests {
     }
 
     #[test]
-    fn gate_no_fire_when_composer_nonempty() {
-        // #1/#6: a half-typed composer BLOCKS the fire (never type over the user)
-        // but stays ARMED to retry once the draft clears — the safe direction.
+    fn a_settled_draft_is_sent_and_one_being_typed_waits() {
+        // A draft used to BLOCK the fire outright ("never type over a half-written
+        // line"), which meant leaving anything in the box silently disabled
+        // auto-continue for that session. It is now what the fire SENDS — your
+        // half-written line is what the limit interrupted — while one still
+        // moving keeps it waiting rather than submitting half a thought.
         let mut i = armed_ready();
+        i.cleared = true;
         i.composer_empty = false;
-        assert_eq!(ac_decide(&i, R_MS), AcDecision::Skip);
-        // and the moment the composer is empty again (every other cond still met)
-        // it fires — proving the gate is the ONLY thing that was holding it.
-        i.composer_empty = true;
-        assert_eq!(ac_decide(&i, R_MS), AcDecision::Fire);
+        i.draft_settled = true;
+        assert_eq!(ac_decide(&i, R_MS), AcDecision::Fire, "a settled draft is sendable");
+
+        i.draft_settled = false;
+        assert_eq!(ac_decide(&i, R_MS), AcDecision::Skip, "mid-keystroke: wait, stay armed");
     }
 
     #[test]
@@ -2109,16 +2187,19 @@ mod tests {
         g.ac_armed = true;
         g.usage_limit = Some(ul(true, 0, "7:30pm", "America/Los_Angeles"));
         assert!(
-            fire_recheck_holds(&g),
+            fire_recheck_holds(&g, 1_000_000),
             "a still-present banner must NOT block a fire the gate already allowed"
         );
 
         // what it IS for: a client keystroke landing between gate and write.
         g.input_buffer = "half a line".into();
-        assert!(!fire_recheck_holds(&g), "never type over a half-written line");
+        g.input_touched_ms = 1_000_000; // just typed
+        assert!(!fire_recheck_holds(&g, 1_000_000), "never submit a line being typed");
+        g.input_touched_ms = 0; // …but a settled draft IS what we send
+        assert!(fire_recheck_holds(&g, 1_000_000), "a draft left sitting is the answer");
         g.input_buffer.clear();
         g.ac_armed = false;
-        assert!(!fire_recheck_holds(&g), "never fire an unarmed session");
+        assert!(!fire_recheck_holds(&g, 1_000_000), "never fire an unarmed session");
     }
 
     #[test]
@@ -2128,8 +2209,8 @@ mod tests {
         g.ac_reset_at = Some(R);
         let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, true);
         assert_eq!(
-            out.as_deref(),
-            Some(AC_RESUME_TEXT),
+            out,
+            Some(AcFire::Send(AC_RESUME_TEXT)),
             "sends the resume word, not a replay of the prompt that started the turn"
         );
         assert!(g.ac_fired, "fired latch set before the pty write (no double-fire)");

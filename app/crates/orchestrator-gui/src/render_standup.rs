@@ -562,7 +562,8 @@ impl Orchestrator {
                 // so a feature that exists to handle exactly this moment is invisible
                 // at exactly this moment — which is how its owner concluded it was
                 // never built.
-                let promise = resume_promise(self.auto_continue, u.reset_at_unix.is_some());
+                let promise =
+                    resume_plan(self.auto_continue, u.reset_at_unix.is_some(), &u.reset_label());
                 let (jslug, jid) = (info.project_slug.clone(), info.id);
                 let reset_at = u.reset_at_unix;
                 let slug = info.project_slug.clone();
@@ -616,7 +617,7 @@ impl Orchestrator {
                                         .truncate()
                                         .text_size(px(11.))
                                         .text_color(rgb(MUTED2))
-                                        .child(SharedString::from(promise.to_string())),
+                                        .child(SharedString::from(promise.clone())),
                                 ),
                         )
                         .child(
@@ -1949,12 +1950,19 @@ pub(crate) fn fail_signature(failed: &[(String, String)]) -> String {
 /// Which set of failed summary jobs the user has already waved off. A SET, not
 /// a flag — see the dismiss handler.
 const FAIL_DISMISSED_KEY: &str = "standup_fail_dismissed";
-
-pub(crate) fn resume_promise(auto_on: bool, has_reset_instant: bool) -> &'static str {
+/// The blocked row's plan, in words, WITH the time it happens.
+///
+/// "Kod will resume it" answered whether, never when — so the one row that
+/// exists to say a session is waiting could not tell you how long, and there
+/// was no way to see that a resume was even scheduled. `when` is the banner's
+/// own reset label (`UsageLimit::reset_label`), so this cannot promise a moment
+/// the gate will not act on: both read the same parsed instant.
+pub(crate) fn resume_plan(auto_on: bool, has_reset_instant: bool, when: &str) -> String {
     match (auto_on, has_reset_instant) {
-        (false, _) => "auto-continue off",
-        (true, true) => "Kod will resume it",
-        (true, false) => "no reset time — Kod can't resume it",
+        (false, _) => "auto-continue off — resume it yourself".to_string(),
+        (true, false) => "no reset time in the banner — Kod can't resume it".to_string(),
+        (true, true) if when.is_empty() => "Kod will resume it at the reset".to_string(),
+        (true, true) => format!("Kod will resume it at {when}"),
     }
 }
 
@@ -2171,7 +2179,7 @@ fn sub_heading(text: &'static str, color: u32) -> impl IntoElement {
 /// The standup's one grey line (pure — no store, no window).
 #[cfg(test)]
 mod tests {
-    use super::{limit_reset_passed, resume_promise, standup_bucket, Bucket};
+    use super::{limit_reset_passed, resume_plan, standup_bucket, Bucket};
 
     /// ONE definition, two surfaces. This file already carries the scar: the ⛔
     /// branch records the day the Dock badge, the toast, the notification and the
@@ -2289,27 +2297,36 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_row_says_which_of_the_three_things_will_happen() {
+    fn a_blocked_row_says_which_of_the_three_things_will_happen_and_when() {
         // Off: the switch is the news, because it is the only one the user acts on.
-        assert_eq!(resume_promise(false, true), "auto-continue off");
-        assert_eq!(resume_promise(false, false), "auto-continue off");
-        // On, with a resolvable instant: the one case where waiting is correct.
-        assert_eq!(resume_promise(true, true), "Kod will resume it");
+        assert_eq!(
+            resume_plan(false, true, "7:30pm"),
+            "auto-continue off — resume it yourself"
+        );
         // On, but the banner carried no time. `ac_decide` arms only on
         // `reset_at.is_some()`, so promising a resume here would be a lie the gate
         // then refuses — and the user would wait for something that never comes.
-        assert_eq!(resume_promise(true, false), "no reset time — Kod can't resume it");
+        assert_eq!(
+            resume_plan(true, false, ""),
+            "no reset time in the banner — Kod can't resume it"
+        );
+        // On, with a resolvable instant: say WHEN. "Kod will resume it" answered
+        // whether and never when, so the row could not tell you how long to wait
+        // or that anything was scheduled at all.
+        assert_eq!(resume_plan(true, true, "7:30pm"), "Kod will resume it at 7:30pm");
+        // …and degrades honestly if the label is missing while the instant is not.
+        assert_eq!(resume_plan(true, true, ""), "Kod will resume it at the reset");
+
         // Three states, three sentences: none may collapse into another.
         let all = [
-            resume_promise(false, true),
-            resume_promise(true, true),
-            resume_promise(true, false),
+            resume_plan(false, true, "7:30pm"),
+            resume_plan(true, false, ""),
+            resume_plan(true, true, "7:30pm"),
         ];
-        assert_eq!(
-            all.iter().collect::<std::collections::HashSet<_>>().len(),
-            3,
-            "two of the three read the same, so one of them is unactionable"
-        );
+        let mut uniq = all.clone().to_vec();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), all.len(), "two states read the same");
     }
 
     use super::standup_thread_hint;
