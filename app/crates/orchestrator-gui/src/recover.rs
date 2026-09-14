@@ -39,22 +39,31 @@ impl Orchestrator {
         }
     }
 
-    /// Give a cwd a home project, minting an ad-hoc one if none exists (orphan
-    /// import). Idempotent by the FOLDED slug — two cwds under the same project
-    /// dir (and re-resuming the same orphan) reuse one project, never duplicate.
-    fn ensure_home_for(&mut self, cwd: &std::path::Path) -> String {
-        // `adhoc` folds the cwd, so its slug is the dedup key (a raw-path compare
-        // would miss when two nested cwds share a folded home).
-        let proj = Project::adhoc(cwd.to_path_buf());
-        if let Some(p) = self.projects.iter().find(|p| p.slug == proj.slug) {
+    /// Give a cwd a home project, minting one if none exists (orphan import).
+    /// The home is keyed the way the SCAN keys that directory (git remote →
+    /// `github:…`, else the folded `path:…`) and it OWNS the directory, so the
+    /// next scan re-derives the same row and `rekey_moved_projects` can follow
+    /// it if the key ever moves. Idempotent: two cwds under one project dir (and
+    /// re-resuming the same orphan) reuse one project.
+    ///
+    /// It used to mint a git-blind `path:<folded>` home. For a repo with a
+    /// remote that is a TWIN of the row the scan emits — a phantom the next scan
+    /// dropped, taking every session bound to it off the rail (rehome.rs).
+    pub(crate) fn ensure_home_for(&mut self, cwd: &std::path::Path) -> String {
+        let (key, dir) = orchestrator_core::scan::project_home_for_dir(cwd);
+        if let Some(p) = self.projects.iter().find(|p| p.slug == key) {
             return p.slug.clone();
         }
-        let slug = proj.slug.clone();
+        let name = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
         if let Ok(store) = self.store.lock() {
-            let _ = store.ensure_project(&slug, &proj.name);
+            let _ = store.ensure_project(&key, &name);
+            let _ = store.set_project_path(&key, &dir.to_string_lossy());
         }
-        self.projects.push(proj);
-        slug
+        self.projects.push(Project::at_dir(&key, dir, &name));
+        key
     }
 
     /// Every PROFILED codex account's rollout root.
@@ -540,14 +549,17 @@ impl Orchestrator {
             self.term_error = Some(format!("can't restore — {} is gone", row.cwd));
             return None;
         }
-        let mut key = self
+        let stored = self
             .overrides
             .get(&row.cli_session_id)
             .cloned()
             .unwrap_or_else(|| row.project_key.clone());
-        if !self.projects.iter().any(|p| p.slug == key) {
-            key = self.ensure_home_for(&cwd);
-        }
+        // a key the rail no longer has (the `path:` twin of a repo the scan
+        // keys `github:`) is translated to the live row BEFORE falling back to
+        // minting from the cwd — a restore must land where the rail can see it.
+        let key = self
+            .current_home_key(&stored)
+            .unwrap_or_else(|| self.ensure_home_for(&cwd));
         // `program`, not `shell`, as the base — see resume_session: shell()'s
         // `-l` would now survive into the resumed CLI's argv.
         let mut spec = self.stage_spec(SpawnSpec::program(restored_kind.label(), &cwd));

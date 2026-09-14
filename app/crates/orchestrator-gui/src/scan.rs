@@ -170,6 +170,10 @@ impl Orchestrator {
         // EMPTY row under the new key and leave the project's map behind).
         self.rekey_moved_projects();
         self.ensure_projects_in_store();
+        // a session bound to a slug this scan no longer has would be fetched by
+        // nothing (the rail asks the host PER SLUG) — rebind it where the rail
+        // can see it.
+        self.rehome_orphaned_sessions();
         match sel_slug.and_then(|slug| self.projects.iter().position(|p| p.slug == slug)) {
             Some(i) => self.selected = i,
             None => {

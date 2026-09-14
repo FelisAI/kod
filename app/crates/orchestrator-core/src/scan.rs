@@ -37,20 +37,32 @@ pub fn home() -> PathBuf {
 /// project is keyed `github:…` from birth instead of a `path:` key its own
 /// sessions would never produce.
 pub fn key_for_dir(dir: &Path) -> String {
+    project_home_for_dir(dir).0
+}
+
+/// `key_for_dir` plus the directory that key NAMES: the git toplevel for a
+/// repo, else the folded dir. A home minted for an orphan cwd needs both — the
+/// key so the row matches what the next scan emits, the dir so the row owns
+/// it (which is what lets `rekey_moved_projects` follow the row if its key
+/// ever moves). Minting a git-blind `path:<folded>` home for a repo directory
+/// is exactly the twin a scan drops: 8 of 19 restored sessions vanished from
+/// the rail that way on 2026-09-14.
+pub fn project_home_for_dir(dir: &Path) -> (String, PathBuf) {
     let mut git = GitCache::new();
-    match git.facts(dir) {
-        Some(g) if g.is_git => {
-            if let Some(r) = &g.remote {
-                let norm = crate::registry::normalize_remote(r);
-                return format!("github:{norm}").replacen("github:github:", "github:", 1);
-            }
-            if let Some(t) = &g.toplevel {
-                return format!("path:{}", t.display());
-            }
-            format!("path:{}", crate::registry::fold_to_project_dir(dir).display())
+    if let Some(g) = git.facts(dir).filter(|g| g.is_git) {
+        let top = g
+            .toplevel
+            .clone()
+            .unwrap_or_else(|| crate::registry::fold_to_project_dir(dir));
+        if let Some(r) = &g.remote {
+            let norm = crate::registry::normalize_remote(r);
+            let key = format!("github:{norm}").replacen("github:github:", "github:", 1);
+            return (key, top);
         }
-        _ => format!("path:{}", crate::registry::fold_to_project_dir(dir).display()),
+        return (format!("path:{}", top.display()), top);
     }
+    let folded = crate::registry::fold_to_project_dir(dir);
+    (format!("path:{}", folded.display()), folded)
 }
 
 pub fn store_path_source(key: &str, name: &str, path: &Path) -> ScanSource {

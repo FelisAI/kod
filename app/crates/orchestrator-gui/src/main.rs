@@ -51,6 +51,7 @@ mod qr;
 mod rail_order;
 mod ratelimit;
 mod recover;
+mod rehome;
 mod render_agent;
 mod render_map;
 mod render_sidebar;
