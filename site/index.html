@@ -185,6 +185,7 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
     <nav class="nav">
         <a href="#standup">Standup</a>
         <a href="#what">How it helps</a>
+        <a href="#limits">Usage limits</a>
         <a href="#install">Install</a>
       <a href="https://github.com/FelisAI/kod">Source</a>
     </nav>
@@ -278,6 +279,33 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
         context.</p>
       </div>
       </div>
+  </section>
+
+  <section id="limits">
+    <h2>A usage limit shouldn't cost you the afternoon</h2>
+    <p class="sub">
+      Claude stops mid-task when you hit a session limit, and the work sits there until
+      you notice, come back, and type into it — which, if it happened while you were
+      asleep or in a meeting, is hours after the window reopened. Kod reads the limit
+      from claude's own record, so it knows the reset to the minute, and the blocked
+      session says what will happen before it happens: <em>"Kod will resume it at
+      7:30pm."</em>
+    </p>
+    <p class="note" style="max-width:64ch">
+      Switch on <strong>auto-continue</strong> and it resumes that session itself the
+      moment the window reopens. It submits the draft you had already typed when the
+      limit interrupted you — or plain <code>continue</code> when there was none — and
+      only once that draft has sat untouched for thirty seconds, so a half-written line
+      is never sent on your behalf. Every arm and every resume is written to the
+      timeline, so what Kod did while you were away is a thing you can read afterwards
+      rather than guess at. It ships off; turn it on in Settings → Automation.
+    </p>
+    <p class="note" style="max-width:64ch; margin-top:14px">
+      Nothing here is scraped off the terminal. Claude writes a real limit into its own
+      transcript, and codex reports its windows as telemetry — Kod reads those, so a
+      session that merely <em>mentions</em> a limit is never mistaken for one that hit
+      it, and the countdown you see is the CLI's own.
+    </p>
   </section>
 
   <section id="next">
