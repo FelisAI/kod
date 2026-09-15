@@ -140,9 +140,9 @@ h1{
 @media (prefers-reduced-motion:reduce){.row.needs .dot{animation:none}}
 
 /* ── sections ── */
-section{padding:66px 0; border-top:1px solid var(--hair-soft)}
+section{padding:92px 0; border-top:1px solid var(--hair-soft)}
 h2{font-size:27px; line-height:1.2; letter-spacing:-.02em; color:var(--strong); margin:0 0 12px; font-weight:660}
-.sub{color:var(--muted); margin:0 0 34px; max-width:52ch}
+.sub{color:var(--muted); margin:0 0 34px; max-width:46ch; font-size:16.5px}
 figure{margin:0}
 figure img{
   width:100%; height:auto; display:block; border-radius:12px;
@@ -195,9 +195,8 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
     <div>
       <h1>Run a fleet of AI&nbsp;coding agents without frying your brain.</h1>
       <p class="lede">
-        Agents made it cheap to run ten things at once. The part that didn't scale is
-        <strong>you</strong> — tracking which one is stuck, and carrying a model of
-        every project in your head. That ceiling is what Kod is built to lift.
+        Agents made it cheap to run ten at once. Keeping track of them is the part
+        that didn't scale — and that part is <strong>you</strong>.
       </p>
       <div class="cta">
         <a class="btn btn-primary" href="https://github.com/FelisAI/kod/releases/latest/download/Kod.dmg">Download for macOS</a>
@@ -214,12 +213,9 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
         macOS 13+ · Apple silicon &amp; Intel · signed and notarized · Apache-2.0
       </p>
       <p class="alpha">
-        Kod is early. It is built and used daily by one person, and rough edges are
-          real: projects cannot be renamed or deleted, and the map and memory
-          surfaces are compiled out by default. If that is
-        interesting rather than disqualifying, the
-        <a href="https://github.com/FelisAI/kod/issues">issues</a> are the honest
-        list.
+        Early, and built by one person who uses it daily. Projects can't be renamed
+        or deleted yet; map and memory are compiled out. The
+        <a href="https://github.com/FelisAI/kod/issues">issues</a> are the honest list.
       </p>
     </div>
 </div>
@@ -228,10 +224,8 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
   <section id="standup">
     <h2>Standup: you shouldn't have to reread every transcript</h2>
     <p class="sub">
-      Standup is the reason Kod exists. Every session writes down what it got done as
-      it goes idle, so coming back to a morning's work is reading a list — not opening
-      each session in turn to remember where it was. What needs you sits at the top;
-      what merely happened sits under it; what is still running stays out of the way.
+      Every session writes down what it finished as it goes idle. So a morning's work
+      is a list you read — not ten terminals you reopen. What needs you sits on top.
     </p>
     <figure>
       <img src="assets/standup.png" width="1348" height="974"
@@ -239,44 +233,38 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
         <figcaption>Every project that moved while you were away, one line each — and what to do next about it.</figcaption>
     </figure>
     <p class="note" style="max-width:64ch">
-      It also tracks <em>when you last looked</em>, so "what happened" means what
-      happened since you last read it — not an undifferentiated wall that starts again
-      from the beginning every time you open the app.
+      It tracks <em>when you last looked</em>, so "what happened" means since then.
     </p>
   </section>
 
   <section id="what">
     <h2>You shouldn't have to track what's running</h2>
     <p class="sub">
-      Which agent is working, which is idle, which hit a usage limit, which has been
-      sitting on a question for twenty minutes. That is state a machine should hold, not
-      a person. Kod keeps it across every project, notifies you the moment one is
-      genuinely blocked, and stays quiet otherwise — a count on the Dock icon and
-      nothing more. A background daemon owns the sessions, so closing the window does
-      not kill the work.
+      Which one is working, which is stuck, which hit a limit — held for you, across
+      every project. Kod speaks up the moment something is genuinely blocked, and stays
+      quiet the rest of the time. A daemon owns the sessions, so closing the window
+      never kills the work.
     </p>
     <figure>
       <img src="assets/workspace.png" width="1348" height="974"
              alt="Kod's workspace. A rail down the left lists fifteen active projects — orchestrator, teams, ai-video, landscaping, hyatt-points, gouge and more — each with a count of its live sessions, one showing a usage-limit chip at 44 percent. The main pane holds a live claude session, mid-answer, noting it has been working for 7 minutes 53 seconds.">
-        <figcaption>Every project and every agent in one window, each showing what is live and what is near a usage limit — so the fleet is a glance rather than a hunt.</figcaption>
+        <figcaption>Every project and every agent in one window — a glance, not a hunt.</figcaption>
     </figure>
     <div class="grid">
       <div class="card">
         <h3>Real terminals</h3>
-        <p>Full-fidelity PTYs, not a chat box over an API — the agent's own TUI, colour and
-        all. Drag a file onto one to paste its path, or paste a screenshot and Kod hands
-        the agent a file it can actually read.</p>
+        <p>Full-fidelity PTYs, not a chat box — the agent's own TUI, colour and all.
+        Drop in a file or a screenshot and the agent gets something it can read.</p>
       </div>
       <div class="card">
         <h3>Profiles</h3>
-        <p>Named per-CLI accounts, isolated by <code>CLAUDE_CONFIG_DIR</code> and
-        <code>CODEX_HOME</code>. Run two claude accounts and pick one per session.</p>
+        <p>Named accounts, isolated per CLI. Run two claude logins and pick one per
+        session.</p>
       </div>
       <div class="card">
         <h3>Recover</h3>
-        <p>Sessions that crashed, or that you started in a terminal somewhere and lost
-        track of, are findable and resumable — losing one stops meaning losing its
-        context.</p>
+        <p>Crashed sessions — and ones you started in a terminal and lost — come back
+        with their context.</p>
       </div>
       </div>
   </section>
@@ -284,27 +272,13 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
   <section id="limits">
     <h2>A usage limit shouldn't cost you the afternoon</h2>
     <p class="sub">
-      Claude stops mid-task when you hit a session limit, and the work sits there until
-      you notice, come back, and type into it — which, if it happened while you were
-      asleep or in a meeting, is hours after the window reopened. Kod reads the limit
-      from claude's own record, so it knows the reset to the minute, and the blocked
-      session says what will happen before it happens: <em>"Kod will resume it at
-      7:30pm."</em>
+      Claude stops when you hit a session limit — usually while you're asleep. Kod knows
+      when the window reopens, says so on the blocked session, and picks the work back
+      up itself: <em>"Kod will resume it at 7:30pm."</em>
     </p>
     <p class="note" style="max-width:64ch">
-      Switch on <strong>auto-continue</strong> and it resumes that session itself the
-      moment the window reopens. It submits the draft you had already typed when the
-      limit interrupted you — or plain <code>continue</code> when there was none — and
-      only once that draft has sat untouched for thirty seconds, so a half-written line
-      is never sent on your behalf. Every arm and every resume is written to the
-      timeline, so what Kod did while you were away is a thing you can read afterwards
-      rather than guess at. It ships off; turn it on in Settings → Automation.
-    </p>
-    <p class="note" style="max-width:64ch; margin-top:14px">
-      Nothing here is scraped off the terminal. Claude writes a real limit into its own
-      transcript, and codex reports its windows as telemetry — Kod reads those, so a
-      session that merely <em>mentions</em> a limit is never mistaken for one that hit
-      it, and the countdown you see is the CLI's own.
+      It sends the draft the limit interrupted, or <code>continue</code>. Read from
+      claude's own record, never the terminal. Off by default — Settings → Automation.
     </p>
   </section>
 
@@ -315,18 +289,13 @@ footer{padding:44px 0 60px; border-top:1px solid var(--hair-soft); color:var(--m
       <em>project</em> is.
     </p>
     <p class="note" style="max-width:64ch">
-      Every project you run lives as a model in your head: what it is, what you decided
-      and why, what you ruled out, what comes next. That model is the real ceiling —
-      not how many agents you can start, but how many projects you can keep a model of
-      at once. Kod is growing a memory system to <strong>put that model down</strong>:
-      you offload the thinking into it, and the map draws it back as something you can
-      look at. Picking a project up after two weeks becomes reading, not remembering —
-      and your agents work against the same model rather than whatever you can recall
-      to tell them.
+      Every project lives as a model in your head: what it is, what you decided, what
+      comes next. How many of those you can hold is the real ceiling. Kod is growing a
+      memory to <strong>put one down</strong> — so picking a project up after two weeks
+      is reading, not remembering.
     </p>
     <p class="note" style="max-width:64ch; margin-top:14px">
-      The memory and the map ship behind default-off feature flags today, because
-      neither is finished. They are in the source if you want to read where it is going.
+      Both ship behind default-off flags today. Neither is finished.
     </p>
   </section>
 
