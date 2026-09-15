@@ -39,8 +39,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 # Both are already in the tree; neither is hand-rolled here, because the phone
 # refuses every connection for the rest of time if this encoding is off by one
 # character.
-sha2 = "0.10"
-base64 = "0.22"
+sha2 = "0.11"
+base64 = "0.23"
 
 [[bin]]
 name = "kod-bridge"
