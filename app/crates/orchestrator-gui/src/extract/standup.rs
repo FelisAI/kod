@@ -493,7 +493,7 @@ mod tests {
     #[test]
     #[ignore]
     fn summarize_live() {
-        let mut sessions = orchestrator_core::scan::recoverable_sessions(7, 40);
+        let mut sessions = orchestrator_core::scan::recoverable_sessions(7, 40, &orchestrator_core::cli_homes([]));
         sessions.sort_by_key(|s| s.bytes);
         let pick = sessions
             .iter()
@@ -552,7 +552,7 @@ mod standup_live_tests {
     #[test]
     #[ignore]
     fn standup_live() {
-        let mut sessions = orchestrator_core::scan::recoverable_sessions(7, 40);
+        let mut sessions = orchestrator_core::scan::recoverable_sessions(7, 40, &orchestrator_core::cli_homes([]));
         sessions.sort_by_key(|s| s.bytes);
         let pick = sessions
             .iter()

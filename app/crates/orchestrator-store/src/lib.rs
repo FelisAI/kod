@@ -45,7 +45,7 @@ pub use memory_llm::{llm_memory_extraction_prompt, parse_llm_memory_candidates};
 pub use store::{
     flatten_changeset_flags, flatten_changeset_ops, ChangesetTreeState, HostedSessionRow,
     MemoryCandidateRow, PendingDiff, ProfileRow, SeedState, StagedChangeset, Store, SummaryRow,
-    TimelineEvent, TimelineKind,
+    TimelineEvent, TimelineKind, EventKind,
 };
 pub use tree::{
     build_tree, countable_ratio, dissolve_node_ops, dissolve_tech_target, done_ratio, first_line,

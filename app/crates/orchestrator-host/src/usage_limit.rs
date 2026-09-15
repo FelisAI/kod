@@ -1,11 +1,11 @@
 //! Usage limits + the reset clock (docs/019) — the banner PARSE layer, split out
 //! of session.rs so the hosted-session file stays about I/O planes and phase.
 //!
-//! Everything here is PURE and deterministic: text (a claude footer lifted off
-//! the grid) or telemetry (codex's `rate_limits` rollout lines) in, a
-//! [`UsageLimit`] out. That purity is what lets the whole banner corpus be
-//! unit-tested directly against fixture strings with no PTY, no CLI, no clock —
-//! the live `HostedSession::scan_limit` only feeds it `emu.bottom_plain(..)`.
+//! Everything here is PURE and deterministic: a CLI's own structured transcript
+//! record in — claude's `rate_limit` refusal ([`crate::transcript::ClaudeLimitRecord`])
+//! or codex's `rate_limits` telemetry — and a [`UsageLimit`] out. Never the
+//! terminal: a screen cannot tell Claude's banner from the same words in a
+//! conversation (2026-09-14: 55 such messages in three weeks of transcripts).
 //!
 //! The consumers care about three things this module owns: is it a HARD block
 //! (`hit`), WHEN does it reset (`reset_at_unix` — auto-continue's wake target),
@@ -119,11 +119,11 @@ impl UsageLimit {
     }
 
     /// A limit whose reset instant has PASSED is dead — but neither CLI ever
-    /// retracts one. Claude will not re-render a banner it already painted (the
-    /// text simply stays on the emulator grid until something overwrites it), and
-    /// codex re-asserts its last `token_count` telemetry on every poll forever. So
-    /// nothing upstream can produce the "cleared" edge, and the VIEW must expire the
-    /// limit on the clock or a long-reset window shows until the session dies.
+    /// retracts one. Claude's refusal stays the newest record until someone sends
+    /// and a real response comes back, and codex re-asserts its last `token_count`
+    /// telemetry on every poll forever. So an idle session never produces the
+    /// "cleared" edge, and the VIEW must expire the limit on the clock or a
+    /// long-reset window shows until the session dies.
     ///
     /// `since_ms == 0` is the codex 1970 landmine: `transcript::codex_rate_limits`
     /// falls back to `observed_ms = 0` for a timestamp-less rollout line, and a
@@ -206,12 +206,12 @@ impl UsageLimit {
     }
 }
 
-/// Lift a usage-limit banner out of a blob of rendered grid text (the bottom
-/// rows). Returns `None` when no banner is present. PURE + deterministic so the
-/// parse is unit-tested directly against the real fixture strings; the live
-/// `scan_limit` just feeds it `emu.bottom_plain(..)`. Anchors on "session
-/// limit"/"usage limit" and tolerates the ANSI-positioned spacing (words are
-/// column-placed, so runs of spaces vary) plus the "·"/apostrophe glyphs.
+/// Parse Claude's limit SENTENCE — the text of a structured refusal record —
+/// for its reset clock, date and zone. It no longer decides whether a session is
+/// blocked (the record does, see `ClaudeLimitRecord::to_usage_limit`), so its
+/// hit/warning heuristics only shape what an old record's text reports. Anchors
+/// on "session limit"/"usage limit" and tolerates the spacing and "·"/apostrophe
+/// glyphs Claude renders.
 pub fn parse_usage_limit(text: &str, now_ms: u64) -> Option<UsageLimit> {
     let lower = text.to_lowercase();
     // overload noise: "API Error: … (not your usage limit) · Rate limited" is a
@@ -298,13 +298,10 @@ fn parse_reset(orig: &str) -> (String, String, String) {
         return (String::new(), String::new(), String::new());
     };
     let cut = pos + needle.len();
-    // WRAP-TOLERANT: on a narrow grid the banner SOFT-WRAPS, and `bottom_plain` emits
-    // one line per GRID ROW — so a row break lands mid-token ("(America/Los_\nAngeles)"
-    // at ~52-71 cols, "4:3\n0pm" at ~48). Rejoin the rows before scanning, or the zone
-    // (or the clock) is lost, `banner_reset_instant` returns None, and the hit goes
-    // UNDATED — no auto-continue wake at all, and the view then ages the block out at
-    // 6h while it is still live. The `'\n'` clause guard in the `hit` detection is
-    // deliberately NOT touched: there it is load-bearing (it rejects "not your usage
+    // LINE-TOLERANT: rejoin the region's lines before scanning, so a reset split
+    // across lines ("(America/Los_\nAngeles)") still resolves — if it doesn't, the
+    // hit goes UNDATED and auto-continue never wakes. The `'\n'` clause guard in the
+    // `hit` detection is deliberately NOT touched (it rejects "not your usage
     // limit"). Only the reset REGION is rejoined.
     let region = orig[cut..].replace('\n', "");
     let region_lower = region.to_lowercase();
@@ -607,6 +604,48 @@ impl crate::transcript::CodexRateLimits {
     }
 }
 
+impl crate::transcript::ClaudeLimitRecord {
+    /// Map claude's decisive transcript record onto the SAME [`UsageLimit`] slot
+    /// codex telemetry fills, so the chip, the ⛔ BLOCKED tier and auto-continue
+    /// treat both CLIs identically.
+    ///
+    /// `Answered` → `None`: a real response is the proof a block ended.
+    /// `Blocked` is ALWAYS a hit — Claude said so structurally, so the banner's
+    /// WORDING (which changes across versions) is read only for display and, when
+    /// the record carries no `quotaLimits` (older CLIs: 119 of 243 measured
+    /// records), for the reset. The banner is parsed against the record's OWN
+    /// time, so "resets 7:10pm" resolves to the day it was written, not today.
+    /// No reset either way (a model/credit cap) → `reset_at_unix: None`, which
+    /// `ac_decide` never arms on: you top those up, you don't wait.
+    pub fn to_usage_limit(&self, local_off_secs: i64) -> Option<UsageLimit> {
+        let crate::transcript::ClaudeLimitRecord::Blocked { observed_ms, resets_at, text } = self else {
+            return None;
+        };
+        let banner = parse_usage_limit(text, *observed_ms);
+        let reset_at_unix = resets_at.or_else(|| banner.as_ref().and_then(|b| b.reset_at_unix));
+        let (reset_clock, reset_date, reset_tz) = match banner.filter(|b| !b.reset_clock.is_empty()) {
+            // Claude's own words for the reset read best ("7:10pm", with its zone).
+            Some(b) => (b.reset_clock, b.reset_date, b.reset_tz),
+            None => (
+                reset_at_unix
+                    .map(|secs| fmt_reset_clock(secs, *observed_ms, local_off_secs))
+                    .unwrap_or_default(),
+                String::new(),
+                String::new(),
+            ),
+        };
+        Some(UsageLimit {
+            hit: true,
+            percent: None,
+            reset_clock,
+            reset_date,
+            reset_tz,
+            reset_at_unix,
+            since_ms: *observed_ms,
+        })
+    }
+}
+
 /// A window's reset instant in unix SECONDS: an explicit `resets_at` epoch, else
 /// the observation time plus `resets_in_seconds`. `None` when the window carries
 /// neither (the clock is then omitted, mirroring claude's no-time banner).
@@ -687,6 +726,44 @@ mod tests {
             assert!(u.reset_at_unix.is_none(), "but nothing for auto-continue to wake on");
             assert!(!u.reset_clock.is_empty(), "while the clock is still displayable");
         }
+    }
+
+    #[test]
+    fn a_claude_refusal_maps_to_a_hit_with_the_records_reset() {
+        use crate::transcript::ClaudeLimitRecord as R;
+        // the REAL record (e16b6a47, line 6805): written 2026-09-14T20:01:26.059Z.
+        let observed = 1789416086059u64;
+        let banner = "You've hit your session limit · resets 2pm (America/Los_Angeles)";
+        let quota = R::Blocked { observed_ms: observed, resets_at: Some(1_789_419_600), text: banner.into() };
+        let u = quota.to_usage_limit(-7 * 3600).unwrap();
+        assert!(u.hit);
+        assert_eq!(u.reset_at_unix, Some(1_789_419_600), "quotaLimits wins: exact, not parsed");
+        assert_eq!((u.reset_clock.as_str(), u.reset_tz.as_str()), ("2pm", "America/Los_Angeles"));
+        assert_eq!(u.since_ms, observed);
+
+        // an older CLI: no quotaLimits, so the reset comes from Claude's own
+        // sentence, resolved against the RECORD's time — and lands on the very
+        // instant the newer record states. Two sources, one answer.
+        let old = R::Blocked { observed_ms: observed, resets_at: None, text: banner.into() };
+        let u = old.to_usage_limit(-7 * 3600).unwrap();
+        assert!(u.hit);
+        assert_eq!(u.reset_at_unix, Some(1_789_419_600), "2pm PDT on the record's day");
+
+        // a model cap: a hit auto-continue can never arm on.
+        let cap = R::Blocked {
+            observed_ms: observed,
+            resets_at: None,
+            text: "You've reached your Fable 5 limit. Run /usage-credits to continue.".into(),
+        };
+        let u = cap.to_usage_limit(0).unwrap();
+        assert!(u.hit);
+        assert_eq!(u.reset_at_unix, None);
+
+        // wording Claude has not shipped yet is still a hit — the record decided.
+        let novel = R::Blocked { observed_ms: observed, resets_at: None, text: "Quota exhausted.".into() };
+        assert!(novel.to_usage_limit(0).unwrap().hit);
+
+        assert_eq!(R::Answered.to_usage_limit(0), None);
     }
 
     use super::*;
@@ -1105,41 +1182,6 @@ mod tests {
             "…and its reset is AHEAD of us, not a day in the past"
         );
         assert!(!folded.is_expired(day2), "so the chip SHOWS instead of being born expired");
-    }
-
-    /// REGRESSION (docs/019, the undated 6h age-out hiding a LIVE block): on a narrow
-    /// window the footer SOFT-WRAPS, and `bottom_plain` emits one line per GRID row —
-    /// so the zone arrives split across rows ("(America/Los_\nAngeles)"). A row-blind
-    /// scan loses it, `banner_reset_instant` returns None, the hit goes UNDATED, and
-    /// the view ages a WEEKLY block (which runs for DAYS) out after 6h. The reset parse
-    /// rejoins the rows first.
-    #[test]
-    fn soft_wrapped_banner_still_resolves_its_reset_instant() {
-        use crate::emulator::Emulator;
-        let mut emu = Emulator::new(10, 100);
-        // the footer sits at the GRID BOTTOM (below the composer), which is exactly
-        // where `bottom_plain` reads — put it there.
-        emu.advance(
-            "\r\n\r\n\r\n\r\n\r\n\r\nYou've hit your weekly limit · resets Jun 5 at 7am (America/Los_Angeles)\r\n"
-                .as_bytes(),
-        );
-        emu.resize(10, 67); // an ordinary narrow window (reflow_terminal clamps at 40)
-        let text = emu.bottom_plain(6);
-        // MEASURED: the reflow splits the zone mid-token across two GRID rows.
-        assert!(
-            text.contains("(America/Los_Ang\neles)"),
-            "the wrap must actually split the zone, else this test proves nothing: {text:?}"
-        );
-        let t: u64 = 1_700_000_000_000;
-        let ul = parse_usage_limit(&text, t).expect("a wrapped banner is still a banner");
-        assert!(ul.hit);
-        assert_eq!(ul.reset_tz, "America/Los_Angeles", "the zone survives the row break");
-        assert_eq!(ul.reset_clock, "7am");
-        assert_eq!(ul.reset_date, "Jun 5");
-        assert!(
-            ul.reset_at_unix.is_some(),
-            "…so the reset RESOLVES: the block is dated, and auto-continue can arm"
-        );
     }
 
     /// The undated age-out is for a block with NO reset info at all (a credit cap, a

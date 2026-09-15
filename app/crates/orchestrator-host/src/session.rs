@@ -34,22 +34,11 @@ pub use crate::usage_limit::{parse_usage_limit, UsageLimit};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CliKind {
-    Claude,
-    Codex,
-    Shell,
-}
-
-impl CliKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            CliKind::Claude => "claude",
-            CliKind::Codex => "codex",
-            CliKind::Shell => "shell",
-        }
-    }
-}
+// Defined in core so the ONE account resolver (`orchestrator_core::cli`) can
+// name it; re-exported here so every `host::session::CliKind` path, and the
+// wire encoding, are unchanged.
+pub use orchestrator_core::cli::CliKind;
+use orchestrator_core::cli::CliHome;
 
 /// Coarse session phase, derived from live signals (docs/013 §1 state model).
 /// `AwaitingDecision` is set by the WHEN layer (OSC approval / waiting); the
@@ -122,8 +111,8 @@ struct Inner {
     usage_limit: Option<UsageLimit>,
     /// `since_ms` of the last usage-limit HIT written to the timeline.
     ///
-    /// Dedupe, not bookkeeping: `scan_limit` runs on every grid change, so
-    /// without it a blocked session would push one "limit hit" event per repaint.
+    /// Dedupe, not bookkeeping: the limit poller re-reads the same refusal every
+    /// ~10s, so without it a blocked session would push one "limit hit" per poll.
     /// Keyed on `since_ms` (first-observation, preserved by `carry_forward`)
     /// rather than a bool, so a genuinely NEW block after an old one still gets
     /// its own line.
@@ -332,34 +321,6 @@ pub struct AcInputs {
 /// we've given up waking on is a block we no longer believe).
 pub(crate) const AC_GIVEUP_MS: i64 = 6 * 3600 * 1000;
 
-/// How many rows up from the bottom `scan_limit` reads looking for the banner.
-///
-/// SIX WAS NOT ENOUGH, and being too small is a total failure rather than a
-/// degraded one: the banner is never seen, so no limit is ever recorded, no chip
-/// is ever drawn and auto-continue never arms — the whole feature is inert with
-/// nothing anywhere reporting why. That is what it did in the wild, on
-/// Claude Code 2.1.258. Captured from a real blocked session:
-///
-/// ```text
-///     ⎿  You've hit your session limit · resets 2:20pm (America/Los_Angeles)
-///        /login to switch to an API usage-billed account.
-///
-///     ✻ Crunched for 5m 40s · done 1:05 PM
-///     <claude's input composer: a multi-row bordered box + a hint line>
-/// ```
-///
-/// The banner is ordinary conversation output, NOT the pinned footer the older
-/// comments here assumed, so the composer alone pushes it past six rows. The
-/// wording still parses perfectly — that was never the problem, and it took a
-/// paste of the real screen to see it, after two wrong conclusions drawn from
-/// the CLI binary and from its transcripts.
-///
-/// Kept modest rather than "the whole screen": every extra row is another
-/// chance for a SPENT banner further up the scrollback to be re-read as a live
-/// one. `UsageLimit::is_expired` catches the ones whose reset has passed; this
-/// bound is what keeps a still-future one from being re-detected after the user
-/// has already resumed by hand.
-const LIMIT_SCAN_ROWS: usize = 24;
 
 /// THE auto-continue gate (docs/019 slice 2) — PURE and exhaustively tested.
 /// This is the safety boundary: every reason NOT to type into a live session
@@ -480,9 +441,9 @@ pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
 ///
 /// `noted_since` is the `since_ms` of the last hit already written. Keying on
 /// first-observation rather than a bool is what lets a genuinely NEW block after
-/// an old one get its own line while a repaint of the SAME one gets none —
-/// `scan_limit` runs on every grid change, so a bool would write one event per
-/// repaint for as long as the session stayed blocked.
+/// an old one get its own line while a re-read of the SAME one gets none — the
+/// poller re-reads the refusal every ~10s, so a bool would write one event per
+/// poll for as long as the session stayed blocked.
 ///
 /// A WARNING is never recorded. "You've used 92%" is not an event, it is a
 /// gauge; a timeline that logged it would fill with lines nothing happened on.
@@ -652,6 +613,12 @@ fn ac_apply(
 pub struct HostedSession {
     pub id: SessionId,
     pub kind: CliKind,
+    /// The account this session runs under, read back out of its spawn env
+    /// (`CliHome::from_env`). The daemon has no store, so this is the ONLY way
+    /// it can find the session's own files — before it existed the codex limit
+    /// poller looked in `~/.codex` for every session, and a profiled codex
+    /// session never got limit detection or auto-continue. `None` for a shell.
+    home: Option<CliHome>,
     project_slug: Mutex<String>,
     pub cwd: std::path::PathBuf,
     /// The dispatch prompt this session was spawned with (claude's final argv
@@ -687,11 +654,9 @@ pub struct HostedSession {
     last_trouble_dirty: AtomicU64,
     /// wall-clock of the last tail walk — the scan's 500ms time floor.
     last_trouble_scan_ms: AtomicU64,
-    /// `dirty` + wall-clock at the last usage-limit scan — its OWN gate (a
-    /// shared gate would eat the trouble scan's edges). 1s floor: the footer is
-    /// static, so a coarse cadence loses nothing (docs/019).
-    last_limit_dirty: AtomicU64,
-    last_limit_scan_ms: AtomicU64,
+    /// This session's transcript, remembered per CLI id: the limit poller asks
+    /// every 10s, and a fresh lookup walks the whole account's project dirs.
+    transcript: Mutex<Option<(String, std::path::PathBuf)>>,
 }
 
 fn now_ms() -> u64 {
@@ -789,6 +754,7 @@ impl HostedSession {
         Ok(Arc::new(HostedSession {
             id,
             kind,
+            home: CliHome::from_env(kind, &spec.env),
             project_slug: Mutex::new(project_slug),
             cwd,
             cli_session_id: Mutex::new(cli_session_id),
@@ -800,8 +766,7 @@ impl HostedSession {
             pending_set_ms,
             last_trouble_dirty: AtomicU64::new(0),
             last_trouble_scan_ms: AtomicU64::new(0),
-            last_limit_dirty: AtomicU64::new(0),
-            last_limit_scan_ms: AtomicU64::new(0),
+            transcript: Mutex::new(None),
         }))
     }
 
@@ -809,6 +774,27 @@ impl HostedSession {
     /// once via the CAS in `PtyProcess` (docs/018 §10).
     pub fn terminate(&self) {
         self.pty.terminate();
+    }
+
+    /// The account this session runs under — where its transcript lives.
+    pub fn home(&self) -> Option<&CliHome> {
+        self.home.as_ref()
+    }
+
+    /// This session's transcript, in its own account. Remembered per CLI id, and
+    /// re-resolved when the id rotates (`claude --resume` opens a new file) or
+    /// the remembered file is gone. `None` for a shell or a not-yet-known id.
+    pub fn transcript_path(&self) -> Option<std::path::PathBuf> {
+        let cli = self.cli_session_id()?;
+        let mut memo = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((id, path)) = memo.as_ref() {
+            if *id == cli && path.exists() {
+                return Some(path.clone());
+            }
+        }
+        let found = self.home()?.transcript_path(&cli)?;
+        *memo = Some((cli, found.clone()));
+        Some(found)
     }
 
     /// The CLI resume handle, if known (the crash-recovery reconcile key).
@@ -925,58 +911,6 @@ impl HostedSession {
         }
     }
 
-    /// Scan the live GRID BOTTOM for claude's usage-limit footer and mirror it
-    /// into `usage_limit`. Deliberately NOT the `scan_trouble` path: that one is
-    /// Busy-gated, latching, and explicitly SKIPS this banner (it would pin a
-    /// false red chip). This one is non-Busy-gated (the footer persists while
-    /// idle) and non-latching (Some while present, None the moment it clears —
-    /// the natural reset edge). The banner sits BELOW the composer/cursor, so
-    /// `tail_plain` (cursor-anchored) would miss it — `bottom_plain` reads UP
-    /// from the grid bottom, scroll-immune (docs/019).
-    pub fn scan_limit(&self) {
-        // CODEX (and every non-claude kind) owns its usage limit via the rollout
-        // `rate_limits` telemetry (`set_usage_limit`, driven by the summaries
-        // poll). This claude GRID scan must NEVER run on such a session or it
-        // would parse the codex grid (no claude footer there → None) and clobber
-        // the rollout value on every reconcile tick.
-        if self.kind != CliKind::Claude {
-            return;
-        }
-        let now = now_ms();
-        if now.saturating_sub(self.last_limit_scan_ms.load(Ordering::Relaxed)) < 1000 {
-            return;
-        }
-        let dirty = self.dirty.load(Ordering::SeqCst);
-        if self.last_limit_dirty.swap(dirty, Ordering::SeqCst) == dirty {
-            return;
-        }
-        self.last_limit_scan_ms.store(now, Ordering::Relaxed);
-        let mut g = self.inner.lock().unwrap();
-        let parsed = parse_usage_limit(&g.emu.bottom_plain(LIMIT_SCAN_ROWS), now);
-        let old = g.usage_limit.take();
-        g.usage_limit = parsed.map(|new| UsageLimit::carry_forward(new, old.as_ref()));
-
-        // RECORD THE BLOCK. A usage limit was live-only until here: parsed off the
-        // grid every second, held in memory, and written nowhere — so once it
-        // cleared there was no trace it had ever happened, and "did Kod handle my
-        // limit?" could not be answered by anyone, afterwards, at all. It is the
-        // one event most worth a record and it left none.
-        //
-        // Auto-continue's own outcomes (fired / gave up / died while blocked) are
-        // already on the timeline from `auto_continue_step`. This is the missing
-        // half: the block that those outcomes are ABOUT.
-        //
-        // Edge-triggered on `since_ms`, which `carry_forward` preserves across
-        // repaints. The residual case it cannot dedupe is a banner that leaves the
-        // bottom six rows and comes back — `parsed` is then None and the stored
-        // limit is dropped, so the return reads as a new block. A blocked session
-        // is not printing, so its grid is static and that stays theoretical.
-        if let Some((since, text)) = limit_note(g.usage_limit.as_ref(), g.limit_noted_since) {
-            g.limit_noted_since = Some(since);
-            g.push_event(SessionEventKind::Notice { text });
-        }
-    }
-
     /// The usage-limit banner lifted off the live grid, if present (docs/019) —
     /// CLOCK-EXPIRED here via [`UsageLimit::is_expired`]. This accessor IS the view
     /// boundary: its only caller is `SessionHost::info_of`, i.e. everything it
@@ -992,23 +926,30 @@ impl HostedSession {
         g.usage_limit.as_ref().filter(|u| !u.is_expired(now)).cloned()
     }
 
-    /// Store a usage limit computed OFF-GRID — codex's rollout `rate_limits`
-    /// telemetry, mapped via [`crate::transcript::CodexRateLimits::to_usage_limit`]
-    /// — into the same `usage_limit` slot the claude footer scan fills, so it
-    /// rides `SessionInfo` uniformly (docs/019 codex limit). Folds onto the stored
-    /// banner via [`UsageLimit::carry_forward`] (as `scan_limit` does), so the chip
-    /// age ticks from first observation rather than from each poll — an IDLE codex
-    /// session re-derives the SAME stale `token_count` telemetry every ~10s forever,
-    /// which is exactly why the view expires it. Bumps `dirty` only on a real change
-    /// (a repaint per ~12s poll
-    /// when nothing moved would be noise). Never clobbered by `scan_limit`, which
-    /// is gated to claude.
+    /// Store a usage limit read from the session's OWN transcript — claude's
+    /// structured refusal or codex's `rate_limits` telemetry — the ONE writer of
+    /// this slot, for both CLIs (`SessionHost::poll_transcript_limits`). Folds
+    /// onto the stored limit via [`UsageLimit::carry_forward`], so the chip age
+    /// ticks from first observation rather than from each poll — an IDLE session
+    /// re-derives the SAME record every ~10s forever, which is exactly why the
+    /// view expires it. Bumps `dirty` only on a real change.
     pub fn set_usage_limit(&self, ul: Option<UsageLimit>) {
         let mut g = self.inner.lock().unwrap();
         let old = g.usage_limit.take();
         let next = ul.map(|new| UsageLimit::carry_forward(new, old.as_ref()));
         let changed = next != old;
         g.usage_limit = next;
+        // RECORD THE BLOCK, once per block (`since_ms` is the refusal's own
+        // time, stable across polls). The ONE writer of this slot, so both CLIs
+        // leave the same trail — "did Kod handle my limit?" has an answer.
+        // Only a LIVE block: the first poll after a restart can find a refusal
+        // weeks old (measured: a model cap from July 12 with nothing after it),
+        // and a note stamped now would report a block that ended long ago.
+        let live = g.usage_limit.as_ref().filter(|u| !u.is_expired(now_ms()));
+        if let Some((since, text)) = limit_note(live, g.limit_noted_since) {
+            g.limit_noted_since = Some(since);
+            g.push_event(SessionEventKind::Notice { text });
+        }
         drop(g);
         if changed {
             self.dirty.fetch_add(1, Ordering::SeqCst);
@@ -1858,47 +1799,6 @@ mod tests {
         }
     }
 
-    /// THE REAL SCREEN, from a session that actually blocked on Claude Code
-    /// 2.1.258 — and the reason nothing ever fired: the banner parses fine, it
-    /// simply sits above the composer, outside the six rows that used to be read.
-    #[test]
-    fn the_banner_is_above_claudes_composer_and_six_rows_could_not_reach_it() {
-        // Sized so the capture fills the grid, as it does on a real screen —
-        // a tall emulator with content at the TOP puts blank rows at the bottom
-        // and measures nothing.
-        let mut emu = Emulator::new(10, 120);
-        let screen = "\
-\u{23BF}  You've hit your session limit \u{b7} resets 2:20pm (America/Los_Angeles)\r\n\
-   /login to switch to an API usage-billed account.\r\n\
-\r\n\
-\u{273B} Crunched for 5m 40s \u{b7} done 1:05 PM\r\n\
-\r\n\
-\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256E}\r\n\
-\u{2502} >                    \u{2502}\r\n\
-\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256F}\r\n\
-  ? for shortcuts\r\n";
-        emu.advance(screen.as_bytes());
-        let now = 1_788_200_000_000u64;
-
-        // What shipped: six rows reach the composer and the hint line, and stop.
-        assert!(
-            parse_usage_limit(&emu.bottom_plain(6), now).is_none(),
-            "six rows must NOT reach the banner — if this starts passing the \
-             composer shrank, and the constant should be re-derived, not deleted"
-        );
-        // What the constant is set to now.
-        let u = parse_usage_limit(&emu.bottom_plain(LIMIT_SCAN_ROWS), now)
-            .expect("the banner is right there, seven rows up");
-        assert!(u.hit, "a session limit is a hard block, not a warning");
-        assert_eq!(u.reset_clock, "2:20pm");
-        assert_eq!(u.reset_tz, "America/Los_Angeles");
-        assert!(
-            u.reset_at_unix.is_some(),
-            "without a resolved instant `ac_decide` can never arm, so detection \
-             alone would still leave the feature inert"
-        );
-    }
-
     /// A usage limit was live-only: parsed off the grid every second, held in
     /// memory, written nowhere. Once it cleared there was no trace it had
     /// happened, so "did Kod handle my limit?" was unanswerable afterwards by
@@ -1911,8 +1811,8 @@ mod tests {
         assert!(text.starts_with("usage limit hit"), "{text}");
         assert!(text.contains("2:30pm"), "the reset is the actionable half: {text}");
 
-        // The SAME block, repainted. `scan_limit` runs on every grid change, so a
-        // bool here would write one line per repaint for as long as the session
+        // The SAME block, re-read. The poller re-reads the refusal every 10s, so a
+        // bool here would write one line per poll for as long as the session
         // stayed blocked.
         assert_eq!(limit_note(Some(&hit), Some(1_000)), None);
 

@@ -4,7 +4,7 @@
 
 use rusqlite::params;
 
-use super::{Store, SummaryRow};
+use super::{EventKind, Store, SummaryRow, EVENT_IS_TURN};
 use crate::memory::MemorySourceKind;
 use crate::memory_extract::MemoryDocument;
 
@@ -66,12 +66,14 @@ impl Store {
         Ok(rows)
     }
 
-    /// Newest recorded event per session — the durable freshness anchor for
+    /// Newest recorded TURN per session — the durable freshness anchor for
     /// summaries (in-memory event seqs reset across restarts; wall-clock doesn't).
+    /// A notice is not new content: counting one made a covering summary look
+    /// stale and re-queued it.
     pub fn latest_event_by_sess(&self) -> rusqlite::Result<Vec<(String, u64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT sess, MAX(at_ms) FROM session_event GROUP BY sess")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT sess, MAX(at_ms) FROM session_event WHERE {EVENT_IS_TURN} GROUP BY sess"
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
@@ -81,18 +83,20 @@ impl Store {
         Ok(rows)
     }
 
-    /// Record a TurnEnd activity event for the Today digest (idempotent on
-    /// (sess, at_ms) so a resume/backfill re-observing a turn doesn't dup).
+    /// Record a session event (idempotent on (sess, at_ms) so a resume/backfill
+    /// re-observing a turn doesn't dup). `kind` is what separates the agent's
+    /// work from what happened to it — see `EventKind`.
     pub fn record_event(
         &self,
         sess: &str,
         project_key: &str,
         at_ms: u64,
+        kind: EventKind,
         summary: &str,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO session_event(sess,project_key,at_ms,summary) VALUES(?1,?2,?3,?4)",
-            params![sess, project_key, at_ms as i64, summary],
+            "INSERT OR IGNORE INTO session_event(sess,project_key,at_ms,summary,kind) VALUES(?1,?2,?3,?4,?5)",
+            params![sess, project_key, at_ms as i64, summary, kind.as_str()],
         )?;
         Ok(())
     }
@@ -102,7 +106,9 @@ impl Store {
     pub fn events_since(&self, since_ms: u64) -> rusqlite::Result<Vec<(String, u64, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT project_key,at_ms,summary FROM session_event WHERE at_ms>=?1 ORDER BY at_ms DESC")?;
+            .prepare(&format!(
+                "SELECT project_key,at_ms,summary FROM session_event WHERE at_ms>=?1 AND {EVENT_IS_TURN} ORDER BY at_ms DESC"
+            ))?;
         let rows = stmt.query_map(params![since_ms as i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -121,7 +127,7 @@ impl Store {
     pub fn count_events_since_sess(&self, sess: &str, since_ms: u64) -> u64 {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM session_event WHERE sess=?1 AND at_ms>?2",
+                &format!("SELECT COUNT(*) FROM session_event WHERE sess=?1 AND at_ms>?2 AND {EVENT_IS_TURN}"),
                 params![sess, since_ms as i64],
                 |r| r.get::<_, i64>(0),
             )
@@ -135,7 +141,7 @@ impl Store {
     pub fn count_events_since(&self, project_key: &str, since_ms: u64) -> u64 {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM session_event WHERE project_key=?1 AND at_ms>?2",
+                &format!("SELECT COUNT(*) FROM session_event WHERE project_key=?1 AND at_ms>?2 AND {EVENT_IS_TURN}"),
                 params![project_key, since_ms as i64],
                 |r| r.get::<_, i64>(0),
             )
@@ -148,7 +154,7 @@ impl Store {
     pub fn latest_event_ms(&self, project_key: &str) -> u64 {
         self.conn
             .query_row(
-                "SELECT COALESCE(MAX(at_ms),0) FROM session_event WHERE project_key=?1",
+                &format!("SELECT COALESCE(MAX(at_ms),0) FROM session_event WHERE project_key=?1 AND {EVENT_IS_TURN}"),
                 params![project_key],
                 |r| r.get::<_, i64>(0),
             )

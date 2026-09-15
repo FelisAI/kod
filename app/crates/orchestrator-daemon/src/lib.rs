@@ -277,7 +277,7 @@ pub fn run_default() -> io::Result<()> {
             // codex limit self-poll (docs/019): self-throttled to ~10s inside, so
             // riding every 1s tick is free. This is why codex limits surface in
             // DEFAULT daemon mode — the GUI's trait call is a no-op here.
-            sweeper.poll_codex_limits();
+            sweeper.poll_transcript_limits();
             // auto-continue-on-limit-reset (docs/019 slice 2): replay a blocked
             // session's held prompt when its window resets — ONLY when the global
             // flag is on (checked inside). Off-by-default; returns immediately when

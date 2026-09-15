@@ -523,36 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn usage_limit_banner_parses_off_the_replayed_grid() {
-        // claude_raw2.log carries the real "You've used 92% of your session
-        // limit · resets 4:30pm (America/Los_Angeles)" footer, ANSI cursor-
-        // positioned so it never appears contiguously in the raw bytes (proven
-        // below) — only after emulator replay does it reassemble on the grid,
-        // which is exactly the surface `scan_limit` reads via `bottom_plain`.
-        let bytes = fixture("claude/2.1.172/pty/claude_raw2.log");
-        assert!(
-            !String::from_utf8_lossy(&bytes).contains("session limit"),
-            "fixture changed: banner now contiguous in the raw stream?"
-        );
-        let mut emu = Emulator::new(30, 130);
-        let mut best: Option<crate::session::UsageLimit> = None;
-        for chunk in bytes.chunks(256) {
-            emu.advance(chunk);
-            // keep the most COMPLETE parse across frames (a chunk boundary can
-            // land mid-draw, before the reset time is painted).
-            if let Some(u) = crate::session::parse_usage_limit(&emu.bottom_plain(30), 1234) {
-                if u.reset_clock == "4:30pm" && u.reset_tz == "America/Los_Angeles" {
-                    best = Some(u);
-                }
-            }
-        }
-        let u = best.expect("usage-limit banner never fully parsed off the replayed grid");
-        assert!(!u.hit, "the used-N% banner is a warning, not a hard hit");
-        assert!(matches!(u.percent, Some(92) | Some(93)), "percent = {:?}", u.percent);
-        assert_eq!(u.since_ms, 1234);
-    }
-
-    #[test]
     fn claude_titles_flow_as_events() {
         // claude_raw2.log carries 11 OSC-0 title updates (busy spinner etc.)
         let bytes = fixture("claude/2.1.172/pty/claude_raw2.log");

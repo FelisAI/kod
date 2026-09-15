@@ -451,9 +451,168 @@ pub fn claude_transcript_events(text: &str) -> Vec<TimelineItem> {
     text.lines().flat_map(claude_line_events).collect()
 }
 
+/// The newest LIMIT-DECISIVE record in a CLAUDE transcript tail.
+///
+/// Claude writes a real limit as a STRUCTURED record — an `assistant` entry with
+/// `isApiErrorMessage: true`, `error: "rate_limit"`, a `<synthetic>` model and,
+/// on current CLIs, `quotaLimits.resetsAt` — which no conversation can produce.
+/// The terminal grid was read instead, and it cannot tell Claude's banner from
+/// the same words in a message: measured across 594 transcripts, 243 real
+/// refusal records, and 55 ordinary user/assistant messages whose TEXT read like
+/// a banner, every one a false ⛔ waiting to be scraped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaudeLimitRecord {
+    /// Claude refused a turn on quota. `text` is Claude's own banner sentence;
+    /// `resets_at` is the exact instant when the record carries one.
+    Blocked { observed_ms: u64, resets_at: Option<i64>, text: String },
+    /// A real model response arrived after any refusal — not blocked.
+    Answered,
+}
+
+/// Lift the newest decisive record out of a claude `.jsonl` tail. `None` = the
+/// tail decides nothing (no assistant record in it), so a stored limit must be
+/// left exactly as it is.
+///
+/// What does NOT decide, deliberately:
+/// - a USER record. You typing, `/login`, `/usage` all land while still blocked;
+///   only a response proves the quota came back. Counting them as a clear would
+///   drop the ⛔ and disarm auto-continue before the reset.
+/// - a SIDECHAIN (subagent) record — it says nothing about the main thread.
+/// - any OTHER API error (overload, network) — neither a block nor a response.
+/// - another `<synthetic>` record — injected, not a model answering.
+///
+/// PURE string parsing, no subprocess (RULE ZERO).
+pub fn claude_limit_record(text: &str) -> Option<ClaudeLimitRecord> {
+    let mut last = None;
+    for line in text.lines() {
+        if !line.contains("assistant") {
+            continue; // cheap prefilter: only an assistant record can decide
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant")
+            || v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true)
+        {
+            continue;
+        }
+        if v.get("isApiErrorMessage").and_then(|b| b.as_bool()) == Some(true) {
+            if v.get("error").and_then(|e| e.as_str()) != Some("rate_limit") {
+                continue;
+            }
+            // an undated record would anchor its reset to 1970 — not decisive.
+            let Some(observed_ms) = v.get("timestamp").and_then(|t| t.as_str()).and_then(iso_to_ms)
+            else {
+                continue;
+            };
+            last = Some(ClaudeLimitRecord::Blocked {
+                observed_ms,
+                resets_at: v.pointer("/quotaLimits/resetsAt").and_then(|r| r.as_i64()),
+                text: message_text(v.get("message")),
+            });
+            continue;
+        }
+        if v.pointer("/message/model").and_then(|m| m.as_str()) == Some("<synthetic>") {
+            continue;
+        }
+        last = Some(ClaudeLimitRecord::Answered);
+    }
+    last
+}
+
+/// A claude message's text: `content` is either a plain string or an array of
+/// blocks, of which only `text` blocks carry words.
+fn message_text(message: Option<&serde_json::Value>) -> String {
+    match message.and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── claude limit records (real shapes, 2026-09-14 transcripts) ──
+    fn refusal(ts: &str, resets_at: Option<i64>, text: &str) -> String {
+        let quota = resets_at
+            .map(|r| format!(r#","quotaLimits":{{"status":"rejected","resetsAt":{r},"rateLimitType":"five_hour"}}"#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429{quota},"message":{{"role":"assistant","model":"<synthetic>","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+    fn response(ts: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"role":"assistant","model":"claude-opus-5","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+    fn user(ts: &str, text: &str) -> String {
+        format!(r#"{{"type":"user","timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#)
+    }
+
+    #[test]
+    fn a_structured_refusal_blocks_with_its_exact_reset() {
+        let t = [
+            response("2026-09-14T19:00:00.000Z", "working"),
+            refusal("2026-09-14T20:01:26.059Z", Some(1789419600), "You've hit your session limit · resets 7:10pm (America/Los_Angeles)"),
+        ]
+        .join("\n");
+        match claude_limit_record(&t) {
+            Some(ClaudeLimitRecord::Blocked { observed_ms, resets_at, text }) => {
+                assert_eq!(observed_ms, iso_to_ms("2026-09-14T20:01:26.059Z").unwrap());
+                assert_eq!(resets_at, Some(1789419600));
+                assert!(text.starts_with("You've hit your session limit"));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// THE BUG: a message that merely TALKS about a limit — quoting the banner,
+    /// pasting it, a monitor line — must decide nothing. The grid scan read all
+    /// of these as a ⛔.
+    #[test]
+    fn banner_words_in_conversation_are_not_a_limit() {
+        let t = [
+            user("2026-09-14T21:00:00.000Z", "this is the limit message i get: You've hit your session limit · resets 7:30pm (America/Los_Angeles)"),
+            response("2026-09-14T21:00:05.000Z", "The parser matched /usage-credits and 'hit your session limit' in prose; you've used 92% of your session limit is a gauge"),
+        ]
+        .join("\n");
+        assert_eq!(claude_limit_record(&t), Some(ClaudeLimitRecord::Answered));
+        assert_eq!(claude_limit_record(&user("2026-09-14T21:00:00.000Z", "You've hit your session limit · resets 2pm")), None);
+    }
+
+    #[test]
+    fn only_a_real_response_clears_a_refusal() {
+        let blocked = refusal("2026-09-14T20:01:26.059Z", Some(1789419600), "You've hit your session limit · resets 7:10pm (America/Los_Angeles)");
+        // you typing /login or /usage while blocked is not the quota coming back.
+        let t = [blocked.clone(), user("2026-09-14T20:05:00.000Z", "/usage")].join("\n");
+        assert!(matches!(claude_limit_record(&t), Some(ClaudeLimitRecord::Blocked { .. })));
+        // a subagent's turn says nothing about the main thread.
+        let side = r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-09-14T20:06:00.000Z","message":{"model":"claude-opus-5","content":"sub"}}"#;
+        assert!(matches!(claude_limit_record(&[blocked.clone(), side.to_string()].join("\n")), Some(ClaudeLimitRecord::Blocked { .. })));
+        // an overload is neither a block nor a response.
+        let overload = r#"{"type":"assistant","timestamp":"2026-09-14T20:07:00.000Z","isApiErrorMessage":true,"error":"overloaded","message":{"model":"<synthetic>","content":"Overloaded"}}"#;
+        assert!(matches!(claude_limit_record(&[blocked.clone(), overload.to_string()].join("\n")), Some(ClaudeLimitRecord::Blocked { .. })));
+        // …a real answer after the reset is.
+        let t = [blocked, user("2026-09-15T02:10:00.000Z", "continue"), response("2026-09-15T02:10:04.000Z", "Resuming.")].join("\n");
+        assert_eq!(claude_limit_record(&t), Some(ClaudeLimitRecord::Answered));
+    }
+
+    #[test]
+    fn a_model_cap_blocks_without_a_reset() {
+        let t = refusal("2026-09-14T14:00:00.000Z", None, "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.");
+        assert!(matches!(
+            claude_limit_record(&t),
+            Some(ClaudeLimitRecord::Blocked { resets_at: None, .. })
+        ));
+    }
 
     #[test]
     fn claude_last_user_message_picks_newest_real_prompt() {

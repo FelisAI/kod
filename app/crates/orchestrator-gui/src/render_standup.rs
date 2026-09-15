@@ -195,7 +195,12 @@ impl Orchestrator {
                             )
                             .on_click(cx.listener(
                                 move |this: &mut Orchestrator, _: &ClickEvent, _, cx| {
-                                    this.select_project(&kopen, cx)
+                                    // a block keyed by a twin the rail no longer has
+                                    // must still open ITS project, not stay put.
+                                    let k = this
+                                        .current_home_key(&kopen)
+                                        .unwrap_or_else(|| kopen.clone());
+                                    this.select_project(&k, cx)
                                 },
                             )),
                         ),
@@ -722,8 +727,12 @@ impl Orchestrator {
                 // SUMMARIES are dropped: a decision or a map change from the same
                 // session is genuinely other news and stays.
                 .filter(|e| {
-                    !(e.kind == orchestrator_store::TimelineKind::Summary
-                        && ready_sess.contains(&e.sess))
+                    // …and its uncovered TURNS, which are the same report.
+                    !(matches!(
+                        e.kind,
+                        orchestrator_store::TimelineKind::Summary
+                            | orchestrator_store::TimelineKind::Activity
+                    ) && ready_sess.contains(&e.sess))
                 })
                 .collect()
         } else {
@@ -1591,7 +1600,7 @@ impl Orchestrator {
                 }
                 let key = ev.ts_ms ^ ((ev.kind.clone() as u64) << 1) ^ (ev.count as u64);
                 let line: String = match ev.kind {
-                    K::Summary => ev.text.clone(),
+                    K::Summary | K::Activity => ev.text.clone(),
                     K::Trail => {
                         let node = ev.node.as_ref().map(|(_, n)| n.as_str()).unwrap_or("?");
                         match ev.text.split_once('—') {
@@ -1655,7 +1664,7 @@ impl Orchestrator {
                     body = body.child(det);
                 }
                 let jump: Option<AnyElement> = match ev.kind {
-                    K::Summary => self.find_live_by_cli_id(&ev.sess).map(|(jslug, jid)| {
+                    K::Summary | K::Activity => self.find_live_by_cli_id(&ev.sess).map(|(jslug, jid)| {
                         div()
                             .id(SharedString::from(format!("tlj-{key}")))
                             .flex_none()
@@ -2086,10 +2095,10 @@ pub(crate) fn blocked_tier_claims(
 /// Has this limit's own reset time already gone by?
 ///
 /// THE TIER CONSULTS THE CLOCK, because the flag it used to trust cannot clear
-/// itself. `Session::scan_limit` re-reads the banner only when the PTY produced
-/// new bytes — and a blocked session produces none, by definition — so `hit`
-/// stays true after the window reopens, until something makes that session
-/// redraw. The reset instant is right there on the limit; a block whose reset
+/// itself. A limit only clears when the session's transcript shows a real
+/// response after the refusal — and a blocked session sends nothing until
+/// someone (or auto-continue) does — so `hit` stays true after the window
+/// reopens. The reset instant is right there on the limit; a block whose reset
 /// is in the past is over whatever the flag still says.
 ///
 /// A limit with no parseable reset (a credit cap) never expires this way, which
@@ -2266,9 +2275,9 @@ mod tests {
     /// auto-continue had never been built: the feature's whole job is this moment,
     /// and this moment said nothing about it.
     /// A BLOCK ENDS. It used to be true until the daemon noticed, and for a
-    /// session producing no output that could be never: `scan_limit` re-reads
-    /// the banner only when the PTY went dirty, and a blocked session is exactly
-    /// the one that has stopped writing. So the tier reads the clock instead.
+    /// session producing no output that could be never: a limit clears only on a
+    /// real response after the refusal, and a blocked session is exactly the one
+    /// that has stopped answering. So the tier reads the clock instead.
     #[test]
     fn a_block_stops_claiming_the_session_once_its_reset_has_passed() {
         use orchestrator_host::Phase;

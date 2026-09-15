@@ -938,6 +938,22 @@ mod tests {
 
     /// Frozen-wire guard: a shape change to any wire type changes this hash, so
     /// the change must be a CONSCIOUS act paired with a WIRE_VERSION bump.
+    /// `CliKind` moved into `orchestrator_core::cli` (2026-09-14). The hash corpus
+    /// above only encodes `Shell`, so it could not see a reorder or rename of the
+    /// other two — pin all three explicitly, in both encodings that cross a wire:
+    /// bincode (daemon: the variant INDEX) and JSON (bridge → phone: the NAME).
+    #[test]
+    fn cli_kind_wire_encoding_is_pinned_for_every_variant() {
+        for (kind, index, name) in [
+            (CliKind::Claude, 0u32, "\"Claude\""),
+            (CliKind::Codex, 1, "\"Codex\""),
+            (CliKind::Shell, 2, "\"Shell\""),
+        ] {
+            assert_eq!(bincode::serialize(&kind).unwrap(), index.to_le_bytes().to_vec(), "{kind:?}");
+            assert_eq!(serde_json::to_string(&kind).unwrap(), name, "{kind:?}");
+        }
+    }
+
     #[test]
     fn protocol_hash_is_stable() {
         const PROTOCOL_HASH: u64 = 0x3a52a2a51aae7ca8; // WIRE_VERSION 26

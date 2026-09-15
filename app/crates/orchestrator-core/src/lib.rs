@@ -4,9 +4,12 @@
 //! The organizing unit is the PROJECT and its anatomy (a tree of Parts), each
 //! carrying live STATUS. No "thesis"; structure + status IS the state.
 
+pub mod cli;
 pub mod recap;
 pub mod registry;
 pub mod scan;
+
+pub use cli::{cli_homes, CliHome, CliKind};
 
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -269,7 +272,7 @@ fn derive_status(parts: &[Part], mins: u64) -> Status {
 /// seeded structure where we have it. Blocking + I/O-heavy — run off the UI
 /// thread. Falls back to the seed if the scan finds nothing (offline/fresh).
 pub fn live_projects() -> Vec<Project> {
-    live_projects_with_store(&[])
+    live_projects_with_store(&[], &cli_homes([]))
 }
 
 /// `live_projects` + the store's own project rows. Core can't read the store
@@ -283,8 +286,10 @@ pub fn live_projects() -> Vec<Project> {
 ///   any session in that dir produces. The two sources therefore fold into ONE
 ///   group, so the folder the user's agent works in can never mint a second,
 ///   separate rail row for the project they just created.
-pub fn live_projects_with_store(rows: &[StoreProject]) -> Vec<Project> {
-    let mut snap = scan::build_snapshot();
+///
+/// `homes` is every account to discover sessions in (`cli::cli_homes`).
+pub fn live_projects_with_store(rows: &[StoreProject], homes: &[CliHome]) -> Vec<Project> {
+    let mut snap = scan::build_snapshot(homes);
     for r in rows {
         snap.sources.push(match &r.path {
             Some(p) => scan::store_path_source(&r.key, &r.name, p),

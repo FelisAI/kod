@@ -3,7 +3,7 @@
 
 use rusqlite::{params, TransactionBehavior};
 
-use super::{now, ChangesetTreeState, PendingDiff, StagedChangeset, Store};
+use super::{now, ChangesetTreeState, PendingDiff, StagedChangeset, Store, EVENT_IS_TURN};
 use crate::tree::{DiffOp, Kind, Lifecycle};
 
 #[derive(Debug)]
@@ -648,10 +648,10 @@ impl Store {
     /// latest_summary_ms) per session that has ANY event — the GUI folds it so
     /// the project reads 'blind' if ANY session is behind.
     pub fn project_session_freshness(&self, project_key: &str) -> Vec<(u64, Option<u64>)> {
-        let Ok(mut stmt) = self.conn.prepare(
+        let Ok(mut stmt) = self.conn.prepare(&format!(
             "SELECT e.sess, MAX(e.at_ms), (SELECT MAX(s.at_ms) FROM session_summary s WHERE s.sess=e.sess)
-             FROM session_event e WHERE e.project_key=?1 GROUP BY e.sess",
-        ) else {
+             FROM session_event e WHERE e.project_key=?1 AND {EVENT_IS_TURN} GROUP BY e.sess"
+        )) else {
             return Vec::new();
         };
         stmt.query_map(params![project_key], |r| {

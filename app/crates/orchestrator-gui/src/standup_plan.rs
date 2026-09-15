@@ -138,7 +138,12 @@ impl UpdatePlan {
 /// A discriminant for TimelineKind, which is neither Copy nor Hash.
 fn kind_ord(k: &TimelineKind) -> u8 {
     match k {
-        TimelineKind::Summary => 0,
+        // ONE thread per session across both: an Activity row is a turn no
+        // summary covers yet, i.e. the same session's state, newer. Sharing the
+        // thread is what makes the collapsed view show whichever is newest — as
+        // separate threads, a failing summariser would put the stale summary
+        // and the fresh turn side by side as two "updates".
+        TimelineKind::Summary | TimelineKind::Activity => 0,
         TimelineKind::Trail => 1,
         TimelineKind::Decision => 2,
         TimelineKind::Map => 3,
@@ -435,6 +440,26 @@ mod tests {
             count: 1,
         }
     }
+    /// Collapsed, a session shows ONE line — its newest, whether that is a
+    /// summary or a turn no summary covers yet. Expanded, both.
+    #[test]
+    fn an_uncovered_turn_replaces_its_sessions_stale_summary_when_collapsed() {
+        let mut stale = ev("orch", 1_000, "summary from 15:08");
+        stale.sess = "A".into();
+        let mut fresh = ev("orch", 9_000, "c07 landed at 21:35.");
+        fresh.sess = "A".into();
+        fresh.kind = TimelineKind::Activity;
+        let events = vec![fresh, stale];
+
+        let collapsed = plan_updates(&events, &|_| true, &|_| false, &|_| 0, false);
+        let lines: Vec<&str> = collapsed.projects[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(lines, vec!["c07 landed at 21:35."]);
+        assert_eq!(collapsed.projects[0].total, 2, "the count still reports both");
+
+        let expanded = plan_updates(&events, &|_| true, &|_| true, &|_| 0, false);
+        assert_eq!(expanded.projects[0].lines.len(), 2);
+    }
+
     /// n projects, one event each, newest first at ts = n, n-1, ...
     fn spread(n: usize) -> Vec<TimelineEvent> {
         (0..n)

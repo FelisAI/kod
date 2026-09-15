@@ -60,10 +60,10 @@ pub struct SessionHost {
     /// window (two clients racing a resume both saw "not live" while the slow
     /// pty fork ran; adversarial review). Entries live from guard to insert.
     resuming: Mutex<std::collections::HashSet<String>>,
-    /// wall-clock ms of the last codex rate-limit poll — self-throttles
-    /// `poll_codex_limits` to ~10s so the 1s daemon sweep doesn't thrash disk
-    /// (codex only rewrites `rate_limits` per `token_count`). 0 = never polled.
-    last_codex_poll_ms: AtomicU64,
+    /// wall-clock ms of the last transcript limit poll — self-throttles
+    /// `poll_transcript_limits` to ~10s so the 1s daemon sweep doesn't thrash
+    /// disk (both CLIs write their limit record per turn). 0 = never polled.
+    last_limit_poll_ms: AtomicU64,
     /// the global auto-continue-on-limit-reset flag. The daemon is STORAGE-FREE,
     /// so the GUI (which owns the store) pushes this over the wire and re-pushes
     /// on attach; cached here for the later reset scheduler to read. Default OFF.
@@ -163,7 +163,7 @@ impl SessionHost {
             ingress: OnceLock::new(),
             self_ref: Mutex::new(Weak::new()),
             resuming: Mutex::new(std::collections::HashSet::new()),
-            last_codex_poll_ms: AtomicU64::new(0),
+            last_limit_poll_ms: AtomicU64::new(0),
             auto_continue: AtomicBool::new(false),
             ac_fire_on_reset: AtomicBool::new(false),
         });
@@ -277,8 +277,9 @@ impl SessionHost {
     }
 
     /// RESUME an existing codex session by id, in its recorded cwd (spike: codex
-    /// resume <id> re-renders + appends to the same rollout in place). Uses the
-    /// user's real ~/.codex (where the rollout lives) — no custom CODEX_HOME.
+    /// resume <id> re-renders + appends to the same rollout in place). Runs under
+    /// whatever account `spec.env` carries (the caller layers the row's profile
+    /// on), which is the account the rollout was written in.
     /// Guards: disable the update modal; omit -m so the account-default model is
     /// used (a forced -m 400s on a ChatGPT plan).
     pub fn resume_codex(
@@ -370,7 +371,6 @@ impl SessionHost {
             s.reconcile_pending();
             s.observe_phase();
             s.scan_trouble();
-            s.scan_limit();
         }
     }
 
@@ -563,46 +563,53 @@ impl SessionHost {
         self.ac_fire_on_reset.load(Ordering::Relaxed)
     }
 
-    /// Self-poll every live Codex session's rollout for its STRUCTURED
-    /// `rate_limits` telemetry and mirror it onto the SAME `UsageLimit` claude's
-    /// grid scan produces — so the chip + Standup BLOCKED tier (and auto-continue)
-    /// work for codex with ZERO render changes (docs/019 codex limit). Runs
-    /// HOST-SIDE (not the GUI) so it fires from the daemon's detached 1s sweep
-    /// with no client attached: daemon (default), local, and headless all surface
-    /// codex limits. Off the claude grid-scan path entirely — `scan_limit` is
-    /// gated to claude, so this value is never clobbered on a reconcile tick.
+    /// Read every session's usage limit out of its OWN transcript, for both
+    /// CLIs, and store it (docs/019). Never the terminal: a screen cannot tell
+    /// Claude's "You've hit your session limit" banner from the same words in a
+    /// message — the old claude grid scan put a false ⛔ on sessions that were
+    /// only TALKING about limits (2026-09-14). Each CLI writes its limit as a
+    /// structured record instead: claude a `rate_limit` refusal
+    /// ([`crate::transcript::claude_limit_record`]), codex `rate_limits`
+    /// telemetry. Found through the session's account (`transcript_path`), so a
+    /// profiled session is read in its own config dir.
     ///
-    /// SELF-THROTTLED to ~10s off `last_codex_poll_ms`: codex only rewrites
-    /// `rate_limits` per `token_count`, so polling every 1s tick would just thrash
-    /// disk. Reads the rollout's structured telemetry, NOT the terminal grid
-    /// (codex's on-hit strings are unconfirmed binary templates).
-    pub fn poll_codex_limits(&self) {
+    /// Runs HOST-SIDE so the daemon's detached sweep surfaces limits with no
+    /// client attached. SELF-THROTTLED to ~10s: both records change per turn,
+    /// and polling every 1s tick would just thrash disk.
+    pub fn poll_transcript_limits(&self) {
         let now = crate::events::now_ms();
-        let prev = self.last_codex_poll_ms.load(Ordering::Relaxed);
+        let prev = self.last_limit_poll_ms.load(Ordering::Relaxed);
         if prev != 0 && now.saturating_sub(prev) < 10_000 {
             return;
         }
-        self.last_codex_poll_ms.store(now, Ordering::Relaxed);
+        self.last_limit_poll_ms.store(now, Ordering::Relaxed);
         let local_off = local_off_secs();
         for s in self.sessions() {
-            if s.kind != CliKind::Codex {
-                continue;
-            }
-            let Some(cli) = s.cli_session_id() else {
+            // a shell has no transcript; a fresh codex has no id yet.
+            let Some(path) = s.transcript_path() else {
                 continue;
             };
-            let Some(path) = orchestrator_core::scan::codex_rollout_path(&cli) else {
-                continue;
-            };
-            let text = crate::transcript::read_rollout_tail(&path, 64 * 1024);
-            // F6 GUARD (critical): only STORE on Some. `codex_rate_limits` is None
-            // when the rollout carries no usable `rate_limits` window at all, and
-            // calling `set_usage_limit(None)` here would CLEAR a real limit hit off
-            // absent/empty telemetry — a false "cleared". Never write None from here.
-            if let Some(ul) = crate::transcript::codex_rate_limits(&text)
-                .and_then(|rl| rl.to_usage_limit(local_off))
-            {
-                s.set_usage_limit(Some(ul));
+            let text = crate::transcript::read_rollout_tail(&path, LIMIT_TAIL_BYTES);
+            match s.kind {
+                // F6 GUARD (critical): codex telemetry only ever STORES. A rollout
+                // with no usable window is absence, not a clear — writing None
+                // here would drop a real hit off empty telemetry.
+                CliKind::Codex => {
+                    if let Some(ul) = crate::transcript::codex_rate_limits(&text)
+                        .and_then(|rl| rl.to_usage_limit(local_off))
+                    {
+                        s.set_usage_limit(Some(ul));
+                    }
+                }
+                // Claude's record decides BOTH ways: a refusal blocks, a real
+                // response after it clears. A tail with neither decides nothing
+                // and leaves the stored limit exactly as it is.
+                CliKind::Claude => {
+                    if let Some(rec) = crate::transcript::claude_limit_record(&text) {
+                        s.set_usage_limit(rec.to_usage_limit(local_off));
+                    }
+                }
+                CliKind::Shell => {}
             }
         }
     }
@@ -610,7 +617,7 @@ impl SessionHost {
     /// Auto-continue-on-limit-reset sweep (docs/019 slice 2): replay each blocked
     /// session's captured held prompt when its usage window resets — ONLY when the
     /// global flag is on. Runs HOST-side from the daemon's 1s sweep next to
-    /// `poll_codex_limits`; the per-session gate (`ac_decide`) is self-cheap, so a
+    /// `poll_transcript_limits`; the per-session gate (`ac_decide`) is self-cheap, so a
     /// per-tick call is fine. Returns IMMEDIATELY when the flag is off, so a
     /// user who never opted in is NEVER typed at. The pure gate lives in
     /// `session::ac_decide`; this just drives it once per session.
@@ -651,6 +658,12 @@ impl SessionHost {
         before - g.len()
     }
 }
+
+/// How much of a transcript's END the limit poller reads. A limit record is
+/// the newest line when it matters, but a claude turn can end in a large tool
+/// result; 256 KiB keeps the deciding record in view without slurping a
+/// many-MB transcript every ~10s.
+const LIMIT_TAIL_BYTES: u64 = 256 * 1024;
 
 /// Seconds EAST of UTC (the local offset), read once from `date +%z` — std has
 /// no tz and the app is macOS-only. Added to a UTC unix instant to render a
@@ -742,15 +755,15 @@ pub trait SessionBackend: Send + Sync {
     fn close(&self, id: SessionId) -> bool;
     /// Tell the backend a fresh codex's discovered rollout id (docs/018 §12).
     fn set_cli_session_id(&self, id: SessionId, cli: String);
-    /// Poll live Codex sessions' rollouts for their STRUCTURED `rate_limits`
-    /// telemetry and store any hit onto the session (docs/019 codex limit).
+    /// Read every live session's usage limit from its own transcript
+    /// (`SessionHost::poll_transcript_limits`).
     /// DEFAULTED to a no-op: `RemoteHost` (the daemon client) inherits the no-op
     /// because the DAEMON's own in-process `SessionHost` self-polls this in its 1s
     /// sweep — so the GUI's `tick_needs` calling it through the trait is a no-op in
     /// daemon (default) mode and the REAL poll in local (in-process `SessionHost`)
     /// mode. Mirrors the `reconcile_pending` split: the daemon calls the concrete
     /// `SessionHost`; the GUI reaches the backend through the trait.
-    fn poll_codex_limits(&self) {}
+    fn poll_transcript_limits(&self) {}
     /// Push the global auto-continue-on-limit-reset flag (docs/019). DEFAULTED to
     /// a no-op so only the two backends that need it act: `RemoteHost` fires it
     /// over the wire; the in-process `SessionHost` caches it. The daemon is
@@ -861,8 +874,8 @@ impl SessionBackend for SessionHost {
     fn set_cli_session_id(&self, id: SessionId, cli: String) {
         SessionHost::set_cli_session_id(self, id, cli)
     }
-    fn poll_codex_limits(&self) {
-        SessionHost::poll_codex_limits(self)
+    fn poll_transcript_limits(&self) {
+        SessionHost::poll_transcript_limits(self)
     }
     fn set_auto_continue(&self, on: bool, fire_on_reset: bool) {
         SessionHost::set_auto_continue(self, on, fire_on_reset)
@@ -883,6 +896,204 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         f()
+    }
+
+    /// 2026-09-14: a codex session under a PROFILE must get limit detection —
+    /// and therefore auto-continue — exactly like an ambient one. The daemon
+    /// polled `~/.codex` for every session, so a profiled rollout's 100%
+    /// telemetry was never read. End to end through the real poller: a session
+    /// spawned with `CODEX_HOME=<acct>` whose rollout lives only in `<acct>`.
+    #[test]
+    fn a_profiled_codex_sessions_limit_is_read_from_its_own_account() {
+        let acct = std::env::temp_dir().join(format!(
+            "kod-host-acct-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let day = acct.join("sessions/2026/09/14");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout_id = "01a0beef-0000-7000-8000-000000000001";
+        // resets far in the future so the view accessor cannot expire it.
+        std::fs::write(
+            day.join(format!("rollout-2026-09-14T10-00-00-{rollout_id}.jsonl")),
+            concat!(
+                r#"{"timestamp":"2026-09-14T17:00:00.000Z","type":"event_msg","payload":{"type":"token_count","#,
+                r#""rate_limits":{"primary":{"used_percent":100.0,"window_minutes":300,"resets_at":4102444800}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let host = SessionHost::new();
+        let mut spec = SpawnSpec::program("cat", std::env::temp_dir());
+        spec.env.push(("CODEX_HOME".to_string(), acct.to_string_lossy().into_owned()));
+        let id = host.spawn("proj", CliKind::Codex, spec).unwrap();
+        host.set_cli_session_id(id, rollout_id.to_string());
+
+        let session = host.get(id).unwrap();
+        assert_eq!(
+            session.home().map(|h| h.root().to_path_buf()),
+            Some(acct.clone()),
+            "the session must remember the account it was spawned under"
+        );
+
+        host.poll_transcript_limits();
+        let ul = session.usage_limit().expect("the profiled rollout's telemetry was read");
+        assert!(ul.hit, "100% used is a hit: {ul:?}");
+        assert_eq!(ul.reset_at_unix, Some(4102444800), "auto-continue's wake target");
+
+        session.terminate();
+        let _ = std::fs::remove_dir_all(&acct);
+    }
+
+    fn tmp_account(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "kod-host-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 2026-09-14 BUG: a ⛔ on a session that was only TALKING about limits. The
+    /// terminal shows Claude's banner words — quoted, pasted, discussed — while
+    /// the transcript holds nothing but ordinary conversation. No limit, ever:
+    /// the screen is not a source.
+    #[test]
+    fn banner_words_on_screen_are_never_a_limit() {
+        let acct = tmp_account("claude-screen");
+        let cli = "5c3e0000-0000-4000-8000-00000000c1a0";
+        let proj = acct.join("projects/-fixture");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join(format!("{cli}.jsonl")),
+            concat!(
+                r#"{"type":"user","timestamp":"2026-09-14T21:00:00.000Z","message":{"role":"user","content":"is this right? You've hit your session limit · resets 7:30pm (America/Los_Angeles)"}}"#, "\n",
+                r#"{"type":"assistant","timestamp":"2026-09-14T21:00:05.000Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"That banner reads /upgrade or /usage-credits to finish what you're working on."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let host = SessionHost::new();
+        let mut spec = SpawnSpec::program("printf", std::env::temp_dir()).arg(
+            "You've hit your session limit · resets 7:30pm (America/Los_Angeles)\n/upgrade or /usage-credits to finish what you're working on.\n",
+        );
+        spec.env.push(("CLAUDE_CONFIG_DIR".into(), acct.to_string_lossy().into_owned()));
+        let id = host.spawn("proj", CliKind::Claude, spec).unwrap();
+        host.set_cli_session_id(id, cli.to_string());
+        let session = host.get(id).unwrap();
+        assert!(
+            wait_until(
+                || session.snapshot().rows.iter().any(|r| r.iter().map(|run| run.text.as_str()).collect::<String>().contains("usage-credits")),
+                2000
+            ),
+            "the banner words must actually be on the grid, or this proves nothing"
+        );
+
+        host.reconcile_pending();
+        host.poll_transcript_limits();
+        assert_eq!(session.usage_limit(), None, "banner words on screen are not a limit");
+        let _ = std::fs::remove_dir_all(&acct);
+    }
+
+    /// A refusal from long ago — the newest record of a session nobody has
+    /// touched since — must neither show nor write a note stamped today.
+    /// Measured on a real live session: a model cap from July 12, nothing after.
+    #[test]
+    fn a_long_dead_refusal_is_not_reported_as_a_new_block() {
+        let acct = tmp_account("claude-stale");
+        let cli = "5c3e0000-0000-4000-8000-0000000057a1";
+        let proj = acct.join("projects/-fixture");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join(format!("{cli}.jsonl")),
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-07-12T18:41:00.000Z","isApiErrorMessage":true,"error":"rate_limit","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"You've reached your Fable 5 limit. Run /usage-credits to continue."}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let host = SessionHost::new();
+        let mut spec = SpawnSpec::program("cat", std::env::temp_dir());
+        spec.env.push(("CLAUDE_CONFIG_DIR".into(), acct.to_string_lossy().into_owned()));
+        let id = host.spawn("proj", CliKind::Claude, spec).unwrap();
+        host.set_cli_session_id(id, cli.to_string());
+        let session = host.get(id).unwrap();
+
+        host.poll_transcript_limits();
+        assert_eq!(session.usage_limit(), None, "aged out in the view");
+        assert!(
+            session
+                .events_since(0)
+                .iter()
+                .all(|e| !matches!(&e.kind, crate::events::SessionEventKind::Notice { text } if text.starts_with("usage limit hit"))),
+            "no note for a block that ended months ago"
+        );
+        session.terminate();
+        let _ = std::fs::remove_dir_all(&acct);
+    }
+
+    /// The real thing, through the real poller: Claude's structured refusal in a
+    /// PROFILED account blocks with its exact reset, is recorded once, and a
+    /// real response afterwards clears it.
+    #[test]
+    fn a_claude_refusal_blocks_until_a_real_response_clears_it() {
+        let acct = tmp_account("claude-refusal");
+        let cli = "5c3e0000-0000-4000-8000-00000000beef";
+        let proj = acct.join("projects/-fixture");
+        std::fs::create_dir_all(&proj).unwrap();
+        let transcript = proj.join(format!("{cli}.jsonl"));
+        // resets far in the future so the view accessor cannot expire it.
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-09-14T20:01:26.059Z","isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"quotaLimits":{"status":"rejected","resetsAt":4102444800,"rateLimitType":"five_hour"},"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit · resets 2pm (America/Los_Angeles)"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let host = SessionHost::new();
+        let mut spec = SpawnSpec::program("cat", std::env::temp_dir());
+        spec.env.push(("CLAUDE_CONFIG_DIR".into(), acct.to_string_lossy().into_owned()));
+        let id = host.spawn("proj", CliKind::Claude, spec).unwrap();
+        host.set_cli_session_id(id, cli.to_string());
+        let session = host.get(id).unwrap();
+
+        host.poll_transcript_limits();
+        let ul = session.usage_limit().expect("the refusal record is a limit");
+        assert!(ul.hit);
+        assert_eq!(ul.reset_at_unix, Some(4102444800), "auto-continue's wake target");
+        let notes = |s: &HostedSession| {
+            s.events_since(0)
+                .into_iter()
+                .filter(|e| matches!(&e.kind, crate::events::SessionEventKind::Notice { text } if text.starts_with("usage limit hit")))
+                .count()
+        };
+        assert_eq!(notes(&session), 1, "the block is recorded");
+
+        // re-read next poll: the same block, not a second record.
+        host.last_limit_poll_ms.store(0, Ordering::Relaxed);
+        host.poll_transcript_limits();
+        assert_eq!(notes(&session), 1, "one record per block, not per poll");
+
+        // a real response arrives — the block is over.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(f, "{}", r#"{"type":"assistant","timestamp":"2026-09-15T02:10:04.000Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Resuming."}]}}"#).unwrap();
+        host.last_limit_poll_ms.store(0, Ordering::Relaxed);
+        host.poll_transcript_limits();
+        assert_eq!(session.usage_limit(), None, "a real response clears it");
+
+        session.terminate();
+        let _ = std::fs::remove_dir_all(&acct);
     }
 
     // ── argv construction (pure; the spawn legs themselves need a real CLI) ──

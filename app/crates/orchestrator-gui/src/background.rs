@@ -271,7 +271,8 @@ impl Orchestrator {
             for r in &rows {
                 for f in extract::files_touched(
                     std::path::Path::new(&r.src_path),
-                    r.src_path.contains("/.codex/"),
+                    orchestrator_core::CliKind::of_transcript(std::path::Path::new(&r.src_path))
+                        == orchestrator_core::CliKind::Codex,
                     20,
                 ) {
                     if !files.contains(&f) {

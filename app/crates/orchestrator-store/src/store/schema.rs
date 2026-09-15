@@ -371,6 +371,10 @@ impl Store {
         // index-aligned with ops_json (true = the cartographer's quote failed
         // verification). NULL on old rows → all-false (a canned/legacy op).
         self.add_column_if_missing("pending_diff", "flagged_json", "TEXT")?;
+        // `EventKind` ('turn' | 'notice'). NULL on old rows → a turn
+        // (`EVENT_IS_TURN`), which is what every reader took them to be, so no
+        // existing count moves. Additive: an older binary's INSERT omits it.
+        self.add_column_if_missing("session_event", "kind", "TEXT")?;
         // ONE-TIME frame migration (docs/011 slice 2): child pins were placed
         // in the project-root frame; the two-generation canvas reinterprets
         // map_x/map_y as position-on-the-parent's-canvas, so old child pins

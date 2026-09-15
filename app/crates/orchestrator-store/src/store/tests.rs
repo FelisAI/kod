@@ -2238,16 +2238,155 @@
         );
     }
 
+    /// 2026-09-14: a rebind must carry the session's history, or the Standup
+    /// keeps reporting it under the project it was written in.
+    #[test]
+    fn rebind_session_moves_the_sessions_history_with_it() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_session("A", "path:/x/alpha", "claude", "/x/alpha", None).unwrap();
+        s.record_event("A", "path:/x/alpha", 1000, EventKind::Turn, "did a").unwrap();
+        s.record_summary("A", "path:/x/alpha", 2000, 1000, 1, "/t", "g", "h", "n", "[]")
+            .unwrap();
+        // a decoy under the same key must NOT move — only session A is rebound.
+        s.record_session("B", "path:/x/alpha", "claude", "/x/alpha", None).unwrap();
+        s.record_event("B", "path:/x/alpha", 1500, EventKind::Turn, "did b").unwrap();
+
+        s.rebind_session("A", "github:acme/alpha").unwrap();
+
+        let keys = |sess: &str| -> Vec<String> {
+            let mut st = s
+                .conn
+                .prepare("SELECT project_key FROM session_event WHERE sess=?1 UNION ALL SELECT project_key FROM session_summary WHERE sess=?1")
+                .unwrap();
+            st.query_map([sess], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(keys("A"), vec!["github:acme/alpha", "github:acme/alpha"]);
+        assert_eq!(keys("B"), vec!["path:/x/alpha"]);
+        assert_eq!(
+            s.hosted_session_of("A").map(|(k, _, _, _)| k).as_deref(),
+            Some("github:acme/alpha")
+        );
+    }
+
+    /// The reconcile pass repairs rows misfiled BEFORE rebinds moved history —
+    /// and only toward keys the rail has, so a closed session still carrying
+    /// a stale twin cannot drag good rows onto a phantom.
+    #[test]
+    fn reconcile_session_history_follows_only_current_keys() {
+        let s = Store::open_in_memory().unwrap();
+        // A: bound to a current key, but its history was written under teams.
+        s.record_session("A", "github:acme/kod", "claude", "/x/teams", None).unwrap();
+        s.record_event("A", "path:/x/teams", 1000, EventKind::Turn, "did").unwrap();
+        s.record_summary("A", "path:/x/teams", 2000, 1000, 1, "/t", "g", "h", "n", "[]")
+            .unwrap();
+        // C: bound to a STALE key nobody has, with history under the good key.
+        s.record_session("C", "path:/x/hyatt", "codex", "/x/hyatt", None).unwrap();
+        s.record_event("C", "github:acme/hyatt", 3000, EventKind::Turn, "did").unwrap();
+
+        let moved = s
+            .reconcile_session_history(&["github:acme/kod".to_string(), "github:acme/hyatt".to_string()])
+            .unwrap();
+        assert_eq!(moved, 2, "A's event + summary; nothing of C's");
+
+        let key_of = |table: &str, sess: &str| -> String {
+            s.conn
+                .query_row(
+                    &format!("SELECT project_key FROM {table} WHERE sess=?1"),
+                    [sess],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(key_of("session_event", "A"), "github:acme/kod");
+        assert_eq!(key_of("session_summary", "A"), "github:acme/kod");
+        assert_eq!(key_of("session_event", "C"), "github:acme/hyatt", "C's good rows stay put");
+        // idempotent: a second pass moves nothing.
+        assert_eq!(s.reconcile_session_history(&["github:acme/kod".to_string()]).unwrap(), 0);
+        // and no keys → nothing (never an `IN ()` syntax error).
+        assert_eq!(s.reconcile_session_history(&[]).unwrap(), 0);
+    }
+
+    /// 2026-09-14: the Standup must not go dark when summarising fails. A
+    /// session's turns that no summary covers are reported as Activity — the
+    /// notices are not — and a summary covering them replaces them.
+    #[test]
+    fn timeline_falls_back_to_uncovered_turns_and_a_summary_supersedes_them() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_event("A", "orch", 1_000, EventKind::Turn, "Shipped the rail fix.").unwrap();
+        s.record_event("A", "orch", 1_500, EventKind::Notice, "Claude is waiting for your input")
+            .unwrap();
+        s.record_event("A", "orch", 2_000, EventKind::Turn, "## Done\nc07 landed at 21:35.").unwrap();
+
+        let activity = |s: &Store| -> Vec<(u64, String)> {
+            s.timeline(50)
+                .into_iter()
+                .filter(|e| e.kind == TimelineKind::Activity)
+                .map(|e| (e.ts_ms, e.text))
+                .collect()
+        };
+        // no summary at all (failing, or switched off): both turns, cleaned,
+        // newest first — and never the notice.
+        let a = activity(&s);
+        assert_eq!(a.iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![2_000, 1_000]);
+        assert_eq!(a[0].1, "c07 landed at 21:35.", "the recap line, not the markdown header");
+        assert!(a.iter().all(|(_, t)| !t.contains("waiting for your input")));
+
+        // a summary covering the first turn supersedes exactly that one.
+        s.record_summary("A", "orch", 1_800, 1_000, 10, "/t", "g", "Rail fixed", "n", "[]")
+            .unwrap();
+        assert_eq!(activity(&s).iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![2_000]);
+        // …and one covering everything leaves nothing behind.
+        s.record_summary("A", "orch", 2_100, 2_000, 20, "/t", "g", "c07 landed", "n", "[]")
+            .unwrap();
+        assert!(activity(&s).is_empty());
+        assert!(s.timeline(50).iter().any(|e| e.kind == TimelineKind::Summary));
+    }
+
+    /// Untagged rows predate the `kind` column and may be notices: never shown
+    /// as news, but still counted as turns by the freshness readers — which is
+    /// what those readers assumed when the rows were written.
+    #[test]
+    fn legacy_untagged_events_count_as_turns_but_are_not_shown_as_activity() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO session_event(sess,project_key,at_ms,summary) VALUES('L','orch',5000,'old')",
+                [],
+            )
+            .unwrap();
+        assert!(s.timeline(50).iter().all(|e| e.kind != TimelineKind::Activity));
+        assert_eq!(s.count_events_since_sess("L", 0), 1);
+        assert_eq!(s.latest_event_by_sess().unwrap(), vec![("L".to_string(), 5000)]);
+    }
+
+    /// A notice is not new content: it must not make a covering summary look
+    /// stale, nor advance the every-N-turns re-summary trigger.
+    #[test]
+    fn notices_do_not_move_the_summary_freshness_clocks() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_event("A", "orch", 1_000, EventKind::Turn, "did it").unwrap();
+        s.record_event("A", "orch", 2_000, EventKind::Notice, "usage limit hit — resets 7:10pm")
+            .unwrap();
+        s.record_event("A", "orch", 3_000, EventKind::Notice, "Claude is waiting for your input")
+            .unwrap();
+        assert_eq!(s.latest_event_by_sess().unwrap(), vec![("A".to_string(), 1_000)]);
+        assert_eq!(s.count_events_since_sess("A", 0), 1);
+        assert_eq!(s.count_events_since("orch", 0), 1);
+        assert_eq!(s.latest_event_ms("orch"), 1_000);
+        assert_eq!(s.events_since(0).unwrap().len(), 1);
+        assert_eq!(s.project_session_freshness("orch"), vec![(1_000, None)]);
+    }
+
     /// docs/019 slice 3 review finding 5: per-session freshness so one session's
     /// fresh summary can't mask another session that's behind.
     #[test]
     fn project_freshness_is_per_session() {
         let s = Store::open_in_memory().unwrap();
         // session A: event then a later summary → current. session B: event, no summary.
-        s.record_event("A", "k", 1000, "x").unwrap();
+        s.record_event("A", "k", 1000, EventKind::Turn, "x").unwrap();
         s.record_summary("A", "k", 2000, 1000, 10, "/t", "g", "h", "n", "[]")
             .unwrap();
-        s.record_event("B", "k", 3000, "y").unwrap();
+        s.record_event("B", "k", 3000, EventKind::Turn, "y").unwrap();
         let f = s.project_session_freshness("k");
         let a = f.iter().find(|_| true); // just assert shape + that B is behind
         assert!(a.is_some());
@@ -2747,7 +2886,7 @@
             .unwrap();
         assert_eq!(n, 3);
         // durable freshness anchor
-        s.record_event("s1", "orch", 2_500, "another turn").unwrap();
+        s.record_event("s1", "orch", 2_500, EventKind::Turn, "another turn").unwrap();
         let ev = s.latest_event_by_sess().unwrap();
         assert_eq!(ev.iter().find(|(k, _)| k == "s1").unwrap().1, 2_500);
     }
@@ -2755,14 +2894,14 @@
     #[test]
     fn session_events_persist_dedup_and_window() {
         let s = Store::open_in_memory().unwrap();
-        s.record_event("sess-1", "orch", 1_000_000, "shipped char-selection")
+        s.record_event("sess-1", "orch", 1_000_000, EventKind::Turn, "shipped char-selection")
             .unwrap();
-        s.record_event("sess-1", "orch", 2_000_000, "perf audit — 2 fixes")
+        s.record_event("sess-1", "orch", 2_000_000, EventKind::Turn, "perf audit — 2 fixes")
             .unwrap();
-        s.record_event("sess-2", "web", 1_500_000, "migrate-db 0007")
+        s.record_event("sess-2", "web", 1_500_000, EventKind::Turn, "migrate-db 0007")
             .unwrap();
         // re-observing the SAME turn (resume/backfill: same sess + at_ms) must NOT dup.
-        s.record_event("sess-1", "orch", 1_000_000, "shipped char-selection")
+        s.record_event("sess-1", "orch", 1_000_000, EventKind::Turn, "shipped char-selection")
             .unwrap();
         let all = s.events_since(0).unwrap();
         assert_eq!(all.len(), 3, "dedup on (sess, at_ms)");
@@ -2778,11 +2917,11 @@
         // docs/019 slice 3: the counts + edges that feed the truth meter
         // (project upstream vs downstream) and the Delta turn trigger (per sess).
         let s = Store::open_in_memory().unwrap();
-        s.record_event("s1", "orch", 1_000, "t1").unwrap();
-        s.record_event("s1", "orch", 2_000, "t2").unwrap();
-        s.record_event("s1", "orch", 3_000, "t3").unwrap();
-        s.record_event("s2", "orch", 2_500, "t4").unwrap();
-        s.record_event("s9", "web", 5_000, "other-project").unwrap();
+        s.record_event("s1", "orch", 1_000, EventKind::Turn, "t1").unwrap();
+        s.record_event("s1", "orch", 2_000, EventKind::Turn, "t2").unwrap();
+        s.record_event("s1", "orch", 3_000, EventKind::Turn, "t3").unwrap();
+        s.record_event("s2", "orch", 2_500, EventKind::Turn, "t4").unwrap();
+        s.record_event("s9", "web", 5_000, EventKind::Turn, "other-project").unwrap();
         // per-session Delta count: events STRICTLY after the last summary ts.
         assert_eq!(s.count_events_since_sess("s1", 0), 3);
         assert_eq!(

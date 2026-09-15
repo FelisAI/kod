@@ -16,8 +16,11 @@
 //! Two halves. `translate_stale_key` maps a dead key to what its directory
 //! resolves to TODAY, so restores and user overrides land on the live row.
 //! `rehome_orphaned_sessions` walks every live session after each scan and
-//! rebinds the ones nobody can reach. Nothing here merges projects: a key is
-//! only ever translated to a slug the rail already has.
+//! rebinds the ones nobody can reach, then does the same for closed rows and
+//! pulls each session's HISTORY (summaries, events — what ▲ WHAT HAPPENED
+//! groups by) onto its current binding, since those rows carry the slug they
+//! were written under. Nothing here merges projects: a key is only ever
+//! translated to a slug the rail already has.
 
 use std::path::Path;
 
@@ -76,14 +79,19 @@ impl Orchestrator {
 
     /// After every scan: rebind the live sessions the rail can no longer reach.
     /// Walks `host.infos()` — every session, not per-slug — the one enumeration
-    /// that cannot miss an orphan. Returns how many moved.
+    /// that cannot miss an orphan. Then closed rows, then history. Returns how
+    /// many sessions moved.
     pub(crate) fn rehome_orphaned_sessions(&mut self) -> usize {
         let mut moved = 0;
+        let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
         for info in self.host.infos() {
             if !info.alive {
                 continue;
             }
             let cli = info.cli_session_id.clone();
+            if let Some(c) = &cli {
+                handled.insert(c.clone());
+            }
             let ov = cli.as_ref().and_then(|c| self.overrides.get(c)).cloned();
             let dest = desired_home(
                 &info.project_slug,
@@ -122,6 +130,46 @@ impl Orchestrator {
                 }
             }
             moved += 1;
+        }
+        // Closed rows: a crashed or finished session bound to a twin key would
+        // be restored under it (and its history filed there) next launch. Only
+        // TRANSLATE here — never mint a project for a session that is not
+        // running, or every dead twin would come back as a rail row.
+        let rows = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| s.hosted_session_keys().ok())
+            .unwrap_or_default();
+        for (cli, key) in rows {
+            if handled.contains(&cli) {
+                continue;
+            }
+            let ov = self.overrides.get(&cli).cloned();
+            let Some(dest) = desired_home(
+                &key,
+                ov.as_deref(),
+                |k| self.is_rail_slug(k),
+                |k| self.current_home_key(k),
+            ) else {
+                continue;
+            };
+            if let Ok(store) = self.store.lock() {
+                let _ = store.rebind_session(&cli, &dest);
+                if ov.as_deref().is_some_and(|o| o != dest) {
+                    let _ = store.set_override(&cli, &dest);
+                }
+            }
+            if ov.is_some() {
+                self.overrides.insert(cli, dest);
+            }
+            moved += 1;
+        }
+        // History written before a rebind carried it: pull every session's
+        // rows onto its current key — guarded to keys the rail has.
+        let slugs: Vec<String> = self.projects.iter().map(|p| p.slug.clone()).collect();
+        if let Ok(store) = self.store.lock() {
+            let _ = store.reconcile_session_history(&slugs);
         }
         moved
     }

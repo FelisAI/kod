@@ -111,13 +111,63 @@ impl Store {
         Ok(rows)
     }
 
-    /// Re-home a session's crash record (#10 move-session).
+    /// Re-home a session (#10 move-session): its crash record AND its history.
+    /// A session belongs to one project, so the summaries and events it
+    /// produced follow it — the Standup's ▲ WHAT HAPPENED groups those rows by
+    /// their own `project_key`, and until 2026-09-14 a rebind left them where
+    /// they were written, so a moved (or re-homed) session kept reporting
+    /// under its old project and "Open" on that block had nowhere to go.
+    /// One transaction: a half-move is impossible.
     pub fn rebind_session(&self, cli_session_id: &str, project_key: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        for sql in [
             "UPDATE hosted_session SET project_key=?2 WHERE cli_session_id=?1",
-            params![cli_session_id, project_key],
-        )?;
-        Ok(())
+            "UPDATE session_event SET project_key=?2 WHERE sess=?1 AND project_key<>?2",
+            "UPDATE session_summary SET project_key=?2 WHERE sess=?1 AND project_key<>?2",
+        ] {
+            tx.execute(sql, params![cli_session_id, project_key])?;
+        }
+        tx.commit()
+    }
+
+    /// Every hosted session's binding — (cli id, project key), alive or not —
+    /// for the re-home pass, which must also catch closed rows whose key is a
+    /// twin the rail no longer has.
+    pub fn hosted_session_keys(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT cli_session_id, project_key FROM hosted_session")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Pull each session's history rows onto the session's CURRENT binding —
+    /// but only for sessions bound to one of `current_keys` (the rail's slugs).
+    /// The guard is the point: a closed session may still carry a stale twin
+    /// key, and pulling good rows onto a phantom would be the very bug this
+    /// repairs. Returns how many rows moved. Set-based; safe to run per scan.
+    pub fn reconcile_session_history(&self, current_keys: &[String]) -> rusqlite::Result<usize> {
+        if current_keys.is_empty() {
+            return Ok(0);
+        }
+        let marks = std::iter::repeat("?")
+            .take(current_keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut moved = 0;
+        for table in ["session_event", "session_summary"] {
+            let sql = format!(
+                "UPDATE {table} SET project_key = (
+                     SELECT h.project_key FROM hosted_session h WHERE h.cli_session_id = {table}.sess)
+                 WHERE sess IN (SELECT cli_session_id FROM hosted_session WHERE project_key IN ({marks}))
+                   AND project_key <> (
+                     SELECT h.project_key FROM hosted_session h WHERE h.cli_session_id = {table}.sess)"
+            );
+            moved += self
+                .conn
+                .execute(&sql, rusqlite::params_from_iter(current_keys.iter()))?;
+        }
+        Ok(moved)
     }
 
     /// Dismiss a tombstone from the ENDED strip — NEVER a DELETE: the row keeps
@@ -428,6 +478,41 @@ impl Store {
                 // rather than in the Standup because every reader of `timeline`
                 // wants the same thing, and the Standup is not the only one.
                 out.extend(rows.flatten().filter(|e| !is_no_change_headline(&e.text)));
+            }
+        }
+        // ☁ fallback: a session's own TURNS that no summary covers yet. Without
+        // this the Standup silently froze whenever summarising failed — the
+        // session kept working and reported nothing. Strictly tagged turns:
+        // an untagged legacy row may be a notice ("Claude is waiting for your
+        // input"), and a notice is not news. Superseded row-by-row as a
+        // summary's `thru_at_ms` passes it, so a working summariser leaves
+        // nothing here but the turns it has not reached.
+        if let Ok(mut st) = self.conn.prepare(
+            "SELECT e.at_ms, e.project_key, e.sess, e.summary
+             FROM session_event e
+             LEFT JOIN (SELECT sess, MAX(thru_at_ms) thru FROM session_summary GROUP BY sess) s
+               ON s.sess = e.sess
+             WHERE e.kind = 'turn' AND e.at_ms > COALESCE(s.thru, 0)
+             ORDER BY e.at_ms DESC LIMIT ?1",
+        ) {
+            let rows = st.query_map(params![cap as i64], |r| {
+                let raw: String = r.get(3)?;
+                Ok(TimelineEvent {
+                    ts_ms: r.get(0)?,
+                    project_key: r.get(1)?,
+                    kind: TimelineKind::Activity,
+                    sess: r.get(2)?,
+                    node: None,
+                    // the agent's last words, cleaned to the one substantive
+                    // line the rest of the app shows for a session's recap.
+                    text: orchestrator_core::recap::recap_line(&raw),
+                    next: String::new(),
+                    detail_json: String::new(),
+                    count: 1,
+                })
+            });
+            if let Ok(rows) = rows {
+                out.extend(rows.flatten());
             }
         }
         // ▶/■ dispatch trail + ◆ user decisions (node-attributed part_notes).

@@ -146,7 +146,41 @@ pub enum TimelineKind {
     Trail,
     Decision,
     Map,
+    /// A session's own end-of-turn words that no summary covers YET — the
+    /// fallback that keeps the Standup current when summarising fails (network,
+    /// quota, a model that answers in prose) or is switched off. Superseded the
+    /// moment a summary's `thru_at_ms` reaches it. Measured before this existed:
+    /// 20 dead summary jobs in a day, and one session's Standup frozen at 15:08
+    /// while it kept working until 21:45.
+    Activity,
 }
+
+/// What a `session_event` row records. The table was TurnEnd-only until the
+/// daemon's notices ("Claude is waiting for your input", limit and
+/// auto-continue notes) began landing in it too, with no way to tell them
+/// apart — so every reader that means "work happened" (the summary freshness
+/// gate, the every-12-turns trigger, the Standup) counted a notice as a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// The agent finished a turn; the text is its own last words.
+    Turn,
+    /// Something happened TO the session (idle prompt, limit, auto-continue).
+    Notice,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Turn => "turn",
+            EventKind::Notice => "notice",
+        }
+    }
+}
+
+/// SQL predicate: this `session_event` row is a turn. A row written before the
+/// `kind` column existed (NULL) counts as one — which is exactly what every
+/// reader assumed then — so the migration changes no existing count.
+pub(crate) const EVENT_IS_TURN: &str = "COALESCE(kind,'turn')='turn'";
 
 /// One Standup-timeline entry (docs/012). `node` = (part_id, name) for
 /// node-attributed kinds; `count` = batched op count for Map entries.

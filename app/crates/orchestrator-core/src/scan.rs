@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cli::{CliHome, CliKind};
 use crate::registry::{GitFacts, ScanSnapshot, ScanSource, SourceKind};
 
 const GIT: &str = "/usr/bin/git";
@@ -272,39 +273,10 @@ fn probe_git(dir: &Path) -> Option<GitFacts> {
     })
 }
 
-/// Find a codex session's rollout transcript by its rollout id (#9 §4). Codex
-/// stores them date-foldered under `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`,
-/// so we search by the id embedded in the filename.
-pub fn codex_rollout_path(rollout_id: &str) -> Option<PathBuf> {
-    codex_rollout_path_in(rollout_id, &[])
-}
-
-/// As [`codex_rollout_path`], searching PROFILED codex roots as well as the
-/// ambient one. Same blind spot, same reason: a profiled session's rollout is
-/// under its own `CODEX_HOME` and this lookup decides whether a row is even
-/// treated as a codex session.
-pub fn codex_rollout_path_in(rollout_id: &str, extra_codex_roots: &[PathBuf]) -> Option<PathBuf> {
-    if rollout_id.is_empty() {
-        return None;
-    }
-    let ambient = PathBuf::from(std::env::var("HOME").ok()?).join(".codex/sessions");
-    std::iter::once(&ambient)
-        .chain(extra_codex_roots.iter())
-        .find_map(|root| find_transcript(root, rollout_id, 5))
-}
-
-/// Find a claude session's transcript by its session id (#9 §4). Claude stores
-/// `~/.claude/projects/<cwd-encoded>/<session-id>.jsonl`; searching by the id in
-/// the filename avoids guessing the cwd-encoding scheme.
-pub fn claude_transcript_path(session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty() {
-        return None;
-    }
-    let root = PathBuf::from(std::env::var("HOME").ok()?).join(".claude/projects");
-    find_transcript(&root, session_id, 3)
-}
-
-fn find_transcript(dir: &std::path::Path, needle: &str, depth: usize) -> Option<PathBuf> {
+/// Find a transcript by the id embedded in its filename (#9 §4), searching
+/// `depth` levels under `dir` — shallow levels first. The per-CLI layout (which
+/// dir, how deep) is `CliHome::transcript_path`'s; this is only the walk.
+pub(crate) fn find_transcript(dir: &std::path::Path, needle: &str, depth: usize) -> Option<PathBuf> {
     let mut subdirs = Vec::new();
     for entry in fs::read_dir(dir).ok()?.flatten() {
         let p = entry.path();
@@ -438,26 +410,18 @@ fn is_internal_p_call(text: &str) -> bool {
 /// `within_days`), then we read + parse just the newest `limit` VALID ones — so
 /// the read cost is ~`limit` no matter how far back we look. cwd is filtered to
 /// under `~/local` (skip tmp/home noise); the GUI groups them by project.
-pub fn recoverable_sessions(within_days: u64, limit: usize) -> Vec<RecoverableSession> {
-    recoverable_sessions_in(within_days, limit, &[])
-}
-
-/// As [`recoverable_sessions`], plus the codex roots of PROFILED accounts.
 ///
-/// A codex session started under a profile writes its rollouts to that
-/// profile's `CODEX_HOME`, not to `~/.codex` — so a scan of the ambient root
-/// alone cannot see it, and Recover offered a row it could never restore.
-/// Measured on a real machine: three sessions under one profile, all three
-/// rollouts present under `<CODEX_HOME>/sessions`, none under `~/.codex`.
-///
-/// The roots are passed IN rather than discovered here: they live in the
-/// profile table, and this crate has no store.
-pub fn recoverable_sessions_in(
+/// Searches every account in `homes` (see `cli::cli_homes`) — ambient AND
+/// profiled, claude AND codex. A session under a profile writes to that
+/// profile's own root, so a scan of `~/.claude` + `~/.codex` alone offered rows
+/// it could never restore (measured: three profiled codex sessions, all three
+/// rollouts under `<CODEX_HOME>/sessions`, none under `~/.codex`), and until
+/// 2026-09-14 no profiled CLAUDE session was offered at all.
+pub fn recoverable_sessions(
     within_days: u64,
     limit: usize,
-    extra_codex_roots: &[PathBuf],
+    homes: &[CliHome],
 ) -> Vec<RecoverableSession> {
-    let home = home();
     // EVERY project root, not just the configured one (crate::project_roots):
     // retargeting the projects folder must not empty Recover of every session
     // ever run under ~/local.
@@ -473,7 +437,10 @@ pub fn recoverable_sessions_in(
     // (path, mtime, is_codex) by stat only. The age `cutoff` just bounds this
     // stat list — it is no longer what limits how many we actually read.
     let mut cands: Vec<(PathBuf, u64, bool)> = Vec::new();
-    if let Ok(dirs) = fs::read_dir(home.join(".claude/projects")) {
+    for h in homes.iter().filter(|h| h.kind() == CliKind::Claude) {
+        let Ok(dirs) = fs::read_dir(h.transcripts_dir()) else {
+            continue;
+        };
         for dir in dirs.flatten() {
             if !dir.path().is_dir() {
                 continue;
@@ -492,12 +459,8 @@ pub fn recoverable_sessions_in(
             }
         }
     }
-    let mut codex_roots = vec![home.join(".codex/sessions")];
-    codex_roots.extend(extra_codex_roots.iter().cloned());
-    codex_roots.sort();
-    codex_roots.dedup();
-    for root in &codex_roots {
-        for rollout in walk_jsonl(root) {
+    for h in homes.iter().filter(|h| h.kind() == CliKind::Codex) {
+        for rollout in walk_jsonl(&h.transcripts_dir()) {
             let mt = mtime_secs(&rollout);
             if mt >= cutoff {
                 cands.push((rollout, mt, true));
@@ -602,19 +565,10 @@ fn codex_id_text(text: &str) -> Option<String> {
 /// fresh codex — so the post-spawn discovery can pick the genuinely-new rollout
 /// (the one whose id is NOT in this set) rather than a sibling session in the
 /// same cwd. Also excludes a resumed-in-place rollout (its id pre-exists).
-/// The codex rollout root for a session: `<CODEX_HOME>/sessions` for a profiled
-/// account, else the ambient `~/.codex/sessions`. A profiled codex session writes
-/// its rollouts under its profile's CODEX_HOME, so birth-discovery + recovery must
-/// look there, not only in HOME.
-pub fn codex_sessions_root(codex_home: Option<&Path>) -> PathBuf {
-    match codex_home {
-        Some(h) if !h.as_os_str().is_empty() => h.join("sessions"),
-        _ => home().join(".codex/sessions"),
-    }
-}
-
-pub fn codex_ids_for_cwd(cwd: &Path, codex_home: Option<&Path>) -> Vec<String> {
-    codex_ids_in(&codex_sessions_root(codex_home), cwd)
+/// `home` is the account the new session will run under — its rollouts go
+/// there, so birth-discovery must look there.
+pub fn codex_ids_for_cwd(cwd: &Path, home: &CliHome) -> Vec<String> {
+    codex_ids_in(&home.transcripts_dir(), cwd)
 }
 
 fn codex_ids_in(base: &Path, cwd: &Path) -> Vec<String> {
@@ -636,9 +590,9 @@ pub fn newest_codex_id_for_cwd(
     cwd: &Path,
     since_secs: u64,
     exclude: &std::collections::HashSet<String>,
-    codex_home: Option<&Path>,
+    home: &CliHome,
 ) -> Option<String> {
-    newest_codex_id_in(&codex_sessions_root(codex_home), cwd, since_secs, exclude)
+    newest_codex_id_in(&home.transcripts_dir(), cwd, since_secs, exclude)
 }
 
 /// Testable core of [`newest_codex_id_for_cwd`] over an explicit sessions dir.
@@ -673,8 +627,9 @@ fn newest_codex_id_in(
 }
 
 /// Build the live snapshot. Blocking + I/O-heavy (run off the UI thread).
-pub fn build_snapshot() -> ScanSnapshot {
-    let home = home();
+/// Discovers projects from EVERY account in `homes` — a project worked on only
+/// under a profile is still a project.
+pub fn build_snapshot(homes: &[CliHome]) -> ScanSnapshot {
     // the user's projects folder (Settings → Projects folder, #29) — the one
     // root the resolver trusts for tier-3 path rows AND where a new project's
     // own directory is created. Defaults to ~/local.
@@ -682,9 +637,15 @@ pub fn build_snapshot() -> ScanSnapshot {
     let mut git = GitCache::new();
     let mut sources: Vec<ScanSource> = Vec::new();
 
-    // 1) Claude session dirs
-    let claude_base = home.join(".claude/projects");
-    if let Ok(entries) = fs::read_dir(&claude_base) {
+    // 1) Claude session dirs, in every claude account
+    for claude_base in homes
+        .iter()
+        .filter(|h| h.kind() == CliKind::Claude)
+        .map(CliHome::transcripts_dir)
+    {
+        let Ok(entries) = fs::read_dir(&claude_base) else {
+            continue;
+        };
         for e in entries.flatten() {
             let dir = e.path();
             if !dir.is_dir() {
@@ -740,8 +701,12 @@ pub fn build_snapshot() -> ScanSnapshot {
         }
     }
 
-    // 2) Codex rollouts (one read for cwd + last message)
-    for rollout in walk_jsonl(&home.join(".codex/sessions")) {
+    // 2) Codex rollouts (one read for cwd + last message), in every codex account
+    let codex_rollouts = homes
+        .iter()
+        .filter(|h| h.kind() == CliKind::Codex)
+        .flat_map(|h| walk_jsonl(&h.transcripts_dir()));
+    for rollout in codex_rollouts {
         let (cwd, last_msg) = scan_codex_rollout(&rollout);
         let cwd = cwd.map(canonicalize_tmp);
         let g = cwd.as_deref().and_then(|p| git.facts(p));
@@ -786,7 +751,7 @@ pub fn build_snapshot() -> ScanSnapshot {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-        home,
+        home: home(),
         // ADDITIVE (see crate::project_roots): the configured folder AND ~/local.
         // A single root here would mean that retargeting the projects folder
         // silently dropped every non-git project under the old one from the rail.
@@ -860,6 +825,68 @@ fn canonicalize_tmp(p: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
 
+    /// 2026-09-14: Recover sees EVERY account, both CLIs. Before `CliHome`, a
+    /// profiled claude session was never offered at all (only codex had an
+    /// "extra roots" patch). One scan over a claude profile and a codex profile,
+    /// neither under ~/.claude or ~/.codex.
+    #[test]
+    fn recover_offers_profiled_sessions_of_both_clis() {
+        use crate::cli::{CliHome, CliKind};
+        let base = std::env::temp_dir().join(format!(
+            "kod-recover-accts-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        // a cwd under the projects root (a prefix check — it need not exist).
+        let cwd = crate::default_projects_root().join("kod-profile-fixture");
+        let cwd_s = cwd.to_string_lossy();
+
+        let claude_acct = base.join("claude-work");
+        let claude_id = "7c1a0000-0000-4000-8000-00000000c1a0";
+        let proj = claude_acct.join("projects/-fixture");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join(format!("{claude_id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{cwd_s}\",\"timestamp\":\"2026-09-14T17:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let codex_acct = base.join("codex-team");
+        let codex_id = "01a0c0de-0000-7000-8000-0000000c0de0";
+        let day = codex_acct.join("sessions/2026/09/14");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join(format!("rollout-2026-09-14T10-00-00-{codex_id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-09-14T17:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{codex_id}\",\"cwd\":\"{cwd_s}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let homes = vec![
+            CliHome::for_config_dir(CliKind::Claude, claude_acct.to_str()).unwrap(),
+            CliHome::for_config_dir(CliKind::Codex, codex_acct.to_str()).unwrap(),
+        ];
+        let found = recoverable_sessions(1, 1000, &homes);
+        let claude = found.iter().find(|r| r.id == claude_id).expect("profiled claude offered");
+        assert!(!claude.is_codex);
+        let codex = found.iter().find(|r| r.id == codex_id).expect("profiled codex offered");
+        assert!(codex.is_codex);
+
+        // accounts are searched BY KIND: a claude account is not walked for rollouts.
+        let swapped = vec![
+            CliHome::for_config_dir(CliKind::Codex, claude_acct.to_str()).unwrap(),
+            CliHome::for_config_dir(CliKind::Claude, codex_acct.to_str()).unwrap(),
+        ];
+        assert!(recoverable_sessions(1, 1000, &swapped)
+            .iter()
+            .all(|r| r.id != claude_id && r.id != codex_id));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// A PROFILED codex account's rollouts live under its own CODEX_HOME, and
     /// the ambient-only lookup cannot see them.
     ///
@@ -877,16 +904,23 @@ mod tests {
         let roll = day.join(format!("rollout-2026-09-09T10-00-00-{id}.jsonl"));
         std::fs::write(&roll, "{}\n").unwrap();
 
-        let root = codex_sessions_root(Some(&tmp));
-        assert_eq!(root, tmp.join("sessions"), "CODEX_HOME/sessions is the root");
+        let acct = crate::cli::CliHome::for_config_dir(crate::cli::CliKind::Codex, tmp.to_str())
+            .unwrap();
+        assert_eq!(acct.transcripts_dir(), tmp.join("sessions"), "CODEX_HOME/sessions is the root");
 
-        // the ambient-only search must NOT find it (that is the bug)
+        // the ambient account alone must NOT find it (that is the bug)
+        let ambient: Vec<_> = crate::cli::CliHome::ambient(crate::cli::CliKind::Codex)
+            .into_iter()
+            .collect();
         assert!(
-            codex_rollout_path(id).is_none(),
+            crate::cli::transcript_path(crate::cli::CliKind::Codex, id, &ambient).is_none(),
             "a temp-dir rollout cannot be under ~/.codex — if this fails the fixture leaked"
         );
-        // …and naming the root finds it
-        assert_eq!(codex_rollout_path_in(id, &[root]).as_deref(), Some(roll.as_path()));
+        // …and including the profile's account finds it
+        assert_eq!(
+            crate::cli::transcript_path(crate::cli::CliKind::Codex, id, &[acct]).as_deref(),
+            Some(roll.as_path())
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

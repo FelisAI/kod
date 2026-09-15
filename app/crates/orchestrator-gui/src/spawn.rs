@@ -24,12 +24,9 @@ pub(crate) fn apply_profile(spec: &mut SpawnSpec, kind: CliKind, profile: &Profi
 pub(crate) fn profile_env(kind: CliKind, profile: &ProfileRow) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if let Some(dir) = profile.config_dir.as_deref().filter(|d| !d.is_empty()) {
-        let var = match kind {
-            CliKind::Claude => Some("CLAUDE_CONFIG_DIR"),
-            CliKind::Codex => Some("CODEX_HOME"),
-            _ => None,
-        };
-        if let Some(var) = var {
+        // the ONE kind→variable mapping — the daemon reads the same one back
+        // (`CliHome::from_env`) to find this session's files.
+        if let Some(var) = kind.home_env_var() {
             env.push((var.to_string(), dir.to_string()));
         }
     }
@@ -267,22 +264,17 @@ impl Orchestrator {
             CliKind::Codex => {
                 // snapshot the cwd's existing codex ids BEFORE spawn so discovery
                 // picks the genuinely-new rollout (not a sibling in the same cwd).
-                // a profiled codex writes its rollout under the profile's CODEX_HOME,
-                // so birth-discovery must scan there (not just ~/.codex) or the new
-                // session is never recorded and can never be resumed.
-                // read off the row resolved above, not a second store lookup —
-                // that one keyed off the CALLER's id, so a defaulted spawn would
-                // have scanned ~/.codex while the session wrote under the
-                // profile's CODEX_HOME (#56).
-                let codex_home = profile
+                // discovery must look in the account this session will run under.
+                // Read off the SPEC, after the profile is applied — the same
+                // derivation the daemon makes (`CliHome::from_env`), so the two
+                // can never pick different accounts (#56 was exactly that).
+                let codex_home = orchestrator_core::CliHome::from_env(kind, &spec.env);
+                let pre: std::collections::HashSet<String> = codex_home
                     .as_ref()
-                    .and_then(|p| p.config_dir.clone())
-                    .filter(|d| !d.is_empty())
-                    .map(std::path::PathBuf::from);
-                let pre: std::collections::HashSet<String> =
-                    orchestrator_core::scan::codex_ids_for_cwd(&cwd, codex_home.as_deref())
-                        .into_iter()
-                        .collect();
+                    .map(|h| orchestrator_core::scan::codex_ids_for_cwd(&cwd, h))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 match self.host.spawn(slug.clone(), kind, spec) {
                     Ok(id) => {
                         self.term_error = None;
@@ -612,7 +604,7 @@ impl Orchestrator {
         cwd: std::path::PathBuf,
         pre: std::collections::HashSet<String>,
         profile_id: Option<i64>,
-        codex_home: Option<std::path::PathBuf>,
+        codex_home: Option<orchestrator_core::CliHome>,
     ) {
         Self::record_fresh_agent_session(
             id,
@@ -623,12 +615,9 @@ impl Orchestrator {
             self.store.clone(),
             self.host.clone(),
             move |cwd, since, exclude| {
-                orchestrator_core::scan::newest_codex_id_for_cwd(
-                    cwd,
-                    since,
-                    exclude,
-                    codex_home.as_deref(),
-                )
+                codex_home.as_ref().and_then(|h| {
+                    orchestrator_core::scan::newest_codex_id_for_cwd(cwd, since, exclude, h)
+                })
             },
             profile_id,
         );

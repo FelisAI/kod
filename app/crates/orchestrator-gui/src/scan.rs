@@ -35,7 +35,7 @@ impl Orchestrator {
         //
         // This is the half that makes deleting a project work at all. The rail is
         // not built from the store — `live_projects_with_store` MERGES the store's
-        // rows with a live scan of ~/.claude/projects and the codex rollouts — so
+        // rows with a live scan of every account's claude projects and codex rollouts — so
         // erasing a project's rows and nothing else deletes its history and leaves
         // the project itself sitting right there, rediscovered and blank, on the
         // next scan. Filtering happens after the resolve because the scan has no
@@ -47,8 +47,10 @@ impl Orchestrator {
             .ok()
             .map(|s| s.forgotten_projects())
             .unwrap_or_default();
+        // every account — a project worked on only under a profile is a project.
+        let homes = self.cli_homes();
         std::thread::spawn(move || {
-            let mut projects = orchestrator_core::live_projects_with_store(&rows);
+            let mut projects = orchestrator_core::live_projects_with_store(&rows, &homes);
             projects.retain(|p| !forgotten.iter().any(|k| k == &p.slug));
             *slot.lock().unwrap() = Some(projects);
         });

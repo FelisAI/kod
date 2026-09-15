@@ -1,9 +1,10 @@
 //! Prints the REAL resolved registry from this machine (eyeball the gates).
 use orchestrator_core::registry::resolve;
 use orchestrator_core::scan::build_snapshot;
+use orchestrator_core::cli::cli_homes;
 fn main() {
     let t = std::time::Instant::now();
-    let snap = build_snapshot();
+    let snap = build_snapshot(&cli_homes([]));
     let reg = resolve(&snap);
     eprintln!("scan: {} sources in {:?}", snap.sources.len(), t.elapsed());
     println!("{} project rows, {} candidates:\n", reg.rows.len(), reg.candidates.len());
