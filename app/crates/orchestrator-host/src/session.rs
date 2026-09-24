@@ -73,7 +73,7 @@ struct Inner {
     awaiting: bool,
     /// The outstanding approval was raised by codex's OSC-0 "Action Required"
     /// TITLE (its only approval signal in interactive TUI mode — it emits no
-    /// OSC 9 there). Records provenance so (a) the ~2Hz `[ ! ]`↔`[ . ]` blink
+    /// OSC 9 there). Records provenance so (a) the `[ ! ]`↔`[ . ]` blink (~2Hz in 0.132, 1Hz in 0.155)
     /// only raises ONCE per block and (b) only a resolving title clears the
     /// codex latch — a claude/hook-backed `pending` is never touched by the
     /// title path.
@@ -719,25 +719,12 @@ impl HostedSession {
         // writes straight back on the reader thread — zero latency, no pump
         // thread, no construction-order cycle.
         let pty = PtyProcess::spawn(&spec, move |bytes| {
-            let mut replies: Vec<u8> = Vec::new();
             let mut g = inner_r.lock().unwrap();
-            // OSC tap runs on the raw stream first (the fork drops 9/9;4/777).
-            let sigs = g.osc.scan(bytes);
-            for s in sigs {
-                // `kind` is Copy — the move-closure copies it in, leaving the
-                // outer binding for the HostedSession ctor below.
-                if apply_osc(&mut g, kind, s) {
-                    pending_set_ms_r.store(now_ms(), Ordering::Relaxed);
-                }
-            }
-            // then the emulator; collect query replies + titles.
-            for e in g.emu.advance(bytes) {
-                match e {
-                    EmuEvent::PtyReply(b) => replies.extend_from_slice(&b),
-                    EmuEvent::Title(t) => g.title = t,
-                    EmuEvent::ResetTitle => g.title.clear(),
-                    EmuEvent::Bell => {}
-                }
+            // `kind` is Copy — the move-closure copies it in, leaving the outer
+            // binding for the HostedSession ctor below.
+            let (replies, raised) = ingest(&mut g, kind, bytes);
+            if raised {
+                pending_set_ms_r.store(now_ms(), Ordering::Relaxed);
             }
             // output is arriving, so the session is alive + working by
             // definition — stamp any phase edge this output caused (OSC busy/
@@ -1271,7 +1258,7 @@ impl HostedSession {
         // decision by the previous one's stamp (adversarial review).
         let young =
             now_ms().saturating_sub(self.pending_set_ms.load(Ordering::Relaxed)) < PAINT_GRACE_MS;
-        if g.pending.is_some() && (dead || (!young && !grid_has_dialog(&g.emu.snapshot()))) {
+        if card_is_stale(&g, dead, young) {
             g.pending = None;
             // if this was a codex title-raised latch, tear down awaiting + the
             // title marker too (review F1) so it can't zombie as a card-less
@@ -1399,6 +1386,57 @@ fn grid_has_dialog(snap: &GridSnapshot) -> bool {
         && (has("❯") || has("Esc to cancel") || has("esc to"))
 }
 
+/// PTY bytes → the OSC tap, then the emulator: everything one output chunk does
+/// to `Inner`. The reader callback's body, factored out so a recorded stream can
+/// be replayed through the real path without a PTY (RULE ZERO). Returns the
+/// terminal-query replies to write back, and whether a pending decision was raised.
+fn ingest(g: &mut Inner, kind: CliKind, bytes: &[u8]) -> (Vec<u8>, bool) {
+    let mut replies: Vec<u8> = Vec::new();
+    let mut raised = false;
+    // OSC tap runs on the raw stream first (the fork drops 9/9;4/777).
+    for s in g.osc.scan(bytes) {
+        raised |= apply_osc(g, kind, s);
+    }
+    // then the emulator; collect query replies + titles.
+    for e in g.emu.advance(bytes) {
+        match e {
+            EmuEvent::PtyReply(b) => replies.extend_from_slice(&b),
+            EmuEvent::Title(t) => g.title = t,
+            EmuEvent::ResetTitle => g.title.clear(),
+            EmuEvent::Bell => {}
+        }
+    }
+    (replies, raised)
+}
+
+/// Should reconcile clear the outstanding card? `dead` = the session died at it
+/// (no Stop hook or resolving title will ever come); `young` = still inside the
+/// paint grace, where "no dialog on the grid" means nothing yet.
+///
+/// A codex card raised by the "Action Required" title belongs to that title:
+/// codex re-sends it every second while the ask is open and replaces it the
+/// moment the ask resolves, which `apply_osc` already clears on. The grid is no
+/// witness for it. Codex 0.155's async question (`request_user_input_async`) is
+/// not a dialog at all — a "? 1 question · ⌥ + ↑ to answer" line under the
+/// composer while the agent keeps working — so the grid walk cleared the card two
+/// seconds after every raise, and the next blink raised it again: a card that
+/// flickered for as long as the question was open.
+fn card_is_stale(g: &Inner, dead: bool, young: bool) -> bool {
+    if g.pending.is_none() {
+        return false;
+    }
+    if dead {
+        return true;
+    }
+    if young {
+        return false;
+    }
+    if g.awaiting_from_title && g.title.contains("Action Required") {
+        return false;
+    }
+    !grid_has_dialog(&g.emu.snapshot())
+}
+
 fn apply_osc(inner: &mut Inner, kind: CliKind, sig: OscSignal) -> bool {
     // NOTE (docs/013 §1 "semantics first"): real decision detection is the M3
     // job (hooks / app-server). Here OSC only drives the calm busy/idle state.
@@ -1461,7 +1499,7 @@ fn apply_osc(inner: &mut Inner, kind: CliKind, sig: OscSignal) -> bool {
             let action_required = kind == CliKind::Codex && t.contains("Action Required");
             inner.title = t;
             if action_required {
-                // Raise ONCE per block. The title blinks ~2Hz and both frames
+                // Raise ONCE per block. The title blinks (1–2Hz) and both frames
                 // match, so re-stamping the phase / re-pushing the event every
                 // frame would reset the card age and spam the timeline ring.
                 // `awaiting_from_title` gates the blink to a single raise and
@@ -1760,6 +1798,61 @@ mod tests {
         assert!(!inner.awaiting_from_title);
         assert!(inner.pending.is_none());
         assert_eq!(compute_phase(&inner, true, false), Phase::Idle);
+    }
+
+    fn fixture(rel: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/../../fixtures/{rel}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// Codex 0.155.1 asking a question WITHOUT blocking its turn
+    /// (`request_user_input_async`), recorded live at 40×120. The title says
+    /// "Action Required" the whole time, but nothing on the grid looks like a
+    /// dialog — so the card was judged stale 2s after every raise and raised again
+    /// by the next blink (measured live: ~2s on / ~1s off, for as long as the
+    /// question stayed open).
+    #[test]
+    fn a_codex_async_question_keeps_its_card_while_the_title_asks() {
+        let bytes = fixture("codex/0.155.1/pty/codex_async_question.log");
+        let mut g = test_inner();
+        g.emu = Emulator::new(40, 120);
+        let mut raised = false;
+        // odd-sized chunks, so sequences split across reads the way PTY reads do
+        for c in bytes.chunks(3001) {
+            raised |= ingest(&mut g, CliKind::Codex, c).1;
+        }
+        assert!(raised, "the Action Required title must raise the card");
+        assert!(g.pending.is_some() && g.awaiting_from_title);
+        assert!(g.title.contains("Action Required"), "{:?}", g.title);
+        let snap = g.emu.snapshot();
+        assert!(
+            snap.plain_lines().iter().any(|l| l.contains("1 question")),
+            "the ask is on screen"
+        );
+        assert!(!grid_has_dialog(&snap), "precondition: the ask is no dialog");
+        // past the paint grace, alive, title still asking: NOT stale. This
+        // returning true was the flicker.
+        assert!(!card_is_stale(&g, false, false));
+        // a session that died at the ask still drops it.
+        assert!(card_is_stale(&g, true, false));
+        // codex replacing the title is what resolves it.
+        apply_osc(&mut g, CliKind::Codex, OscSignal::Title("⠋ probe2".into()));
+        assert!(g.pending.is_none() && !g.awaiting_from_title);
+    }
+
+    /// The title only vouches for the card it raised. A hook-raised card (claude)
+    /// still needs its dialog on the grid, and so does a codex card whose title no
+    /// longer says Action Required.
+    #[test]
+    fn a_card_without_a_live_title_still_needs_its_dialog_on_the_grid() {
+        let mut g = test_inner();
+        g.pending = Some(codex_pending_from_title());
+        assert!(card_is_stale(&g, false, false), "hook-style card, blank grid → stale");
+        assert!(!card_is_stale(&g, false, true), "inside the paint grace → not yet");
+        g.awaiting_from_title = true;
+        g.title = "[ ! ] Action Required | proj".into();
+        assert!(!card_is_stale(&g, false, false));
+        g.title.clear(); // an OSC title reset that apply_osc never saw
+        assert!(card_is_stale(&g, false, false));
     }
 
     #[test]

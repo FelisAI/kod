@@ -21,5 +21,12 @@ claude/2.1.172/
 codex/0.132.0/
   pty/          codex TUI byte stream incl. the exec-approval modal render
   notify/       notify program payload (agent-turn-complete JSON)
+codex/0.155.1/
+  pty/          codex_async_question.log — recorded 2026-09-23 at 40×120: a
+                request_user_input_async ask (a "? 1 question · ⌥ + ↑ to answer" line
+                under the composer while the agent keeps working — NO dialog) under
+                the blinking "Action Required" title. Trimmed to ~5s of the ask; the
+                username and session id are replaced with same-length stand-ins so
+                every cursor position in the stream stays valid.
 reports/        full S1/S2 live-verification + control-surfaces research outputs (verbatim
                 evidence archive; the wire frames for app-server dual-attach live here)
