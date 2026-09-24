@@ -46,6 +46,12 @@ pub struct UsageLimit {
     /// wall-clock ms the banner was FIRST observed — the GUI ticks the age
     /// locally (timestamps over prose, design critique #4).
     pub since_ms: u64,
+    /// wall-clock ms a LIVE source last confirmed this limit — codex's account
+    /// read ([`crate::codex_account`]), which re-asks the backend and retracts a
+    /// limit that has ended. 0 = a transcript source, which never retracts one;
+    /// only those need the clock rules in [`Self::is_expired`].
+    #[serde(default)]
+    pub confirmed_ms: u64,
 }
 
 /// How far PAST its reset instant a limit is still shown. Absorbs clock skew and
@@ -66,6 +72,11 @@ const LIMIT_UNDATED_MAX_AGE_MS: u64 = AC_GIVEUP_MS as u64;
 /// out. It is the one signal that separates a re-parse of the STALE banner from a
 /// genuinely NEW block wearing the same words (both resolve the identical instant).
 const LIMIT_ROLLED_FORWARD_MS: i64 = 12 * 3600 * 1000;
+
+/// How long a live confirmation keeps a limit believed, whatever the clock says:
+/// three of codex's quiet-account reads. Past it the source has gone silent
+/// (offline, logged out) and the clock rules take over again.
+const LIMIT_CONFIRM_FRESH_MS: u64 = 3 * crate::codex_account::READ_IDLE_EVERY_MS;
 
 impl UsageLimit {
     /// Same underlying banner — the same TEXT (ignoring a ticking percent), NOT the
@@ -130,6 +141,13 @@ impl UsageLimit {
     /// `resets_in_seconds` then resolves against the EPOCH — expiring a LIVE limit
     /// instantly. An unknown first-observation time is never aged out.
     pub(crate) fn is_expired(&self, now_ms: u64) -> bool {
+        // A live source re-asserted it recently: it is still true, whatever the
+        // clock says. The rules below exist because the transcript sources never
+        // retract a limit; this one does. (A credit block has no reset instant, so
+        // the undated 6h age-out would otherwise hide it while it still blocks.)
+        if self.confirmed_ms != 0 && now_ms.saturating_sub(self.confirmed_ms) < LIMIT_CONFIRM_FRESH_MS {
+            return false;
+        }
         if self.since_ms == 0 {
             return false;
         }
@@ -262,6 +280,7 @@ pub fn parse_usage_limit(text: &str, now_ms: u64) -> Option<UsageLimit> {
         reset_tz,
         reset_at_unix,
         since_ms: now_ms,
+        confirmed_ms: 0,
     })
 }
 
@@ -600,7 +619,51 @@ impl crate::transcript::CodexRateLimits {
             reset_tz: String::new(),
             reset_at_unix,
             since_ms: self.observed_ms,
+            confirmed_ms: 0,
         })
+    }
+}
+
+impl crate::codex_account::AccountLimits {
+    /// Map codex's ACCOUNT-wide read onto the same [`UsageLimit`] the transcripts
+    /// fill, so the chip, the ⛔ BLOCKED tier and auto-continue treat it alike.
+    /// `hit` is the verdict the caller settled with [`Self::is_blocked`].
+    ///
+    /// The reset is the FULL window's when blocked: out of credits with the
+    /// weekly window used up lifts when that window resets (the backend's own
+    /// upsell carries that very `reset_at`). Blocked with no full window — out of
+    /// credits mid-week — has no reset: you top up, you don't wait, so
+    /// auto-continue never arms on it. Not blocked: the soonest reset, for the gauge.
+    pub fn to_usage_limit(&self, hit: bool, local_off_secs: i64) -> UsageLimit {
+        let percent = self
+            .windows
+            .iter()
+            .map(|w| w.used_percent)
+            .fold(0.0_f64, f64::max)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let reset_at_unix = if hit {
+            self.windows
+                .iter()
+                .filter(|w| w.used_percent >= 100.0)
+                .filter_map(|w| w.resets_at)
+                .max()
+        } else {
+            self.windows.iter().filter_map(|w| w.resets_at).min()
+        };
+        let reset_clock = reset_at_unix
+            .map(|secs| fmt_reset_clock(secs, self.observed_ms, local_off_secs))
+            .unwrap_or_default();
+        UsageLimit {
+            hit,
+            percent: Some(percent),
+            reset_clock,
+            reset_date: String::new(),
+            reset_tz: String::new(),
+            reset_at_unix,
+            since_ms: self.observed_ms,
+            confirmed_ms: self.observed_ms,
+        }
     }
 }
 
@@ -642,6 +705,7 @@ impl crate::transcript::ClaudeLimitRecord {
             reset_tz,
             reset_at_unix,
             since_ms: *observed_ms,
+            confirmed_ms: 0,
         })
     }
 }
@@ -863,6 +927,7 @@ mod tests {
             reset_date: date.into(),
             reset_at_unix: reset_at,
             since_ms: 0,
+            confirmed_ms: 0,
         };
         let now_ms = 1_000_000u64; // now = 1000s
         let now_s = 1_000i64;
@@ -1028,6 +1093,7 @@ mod tests {
             reset_tz: "America/Los_Angeles".into(),
             reset_at_unix,
             since_ms,
+            confirmed_ms: 0,
         }
     }
 
@@ -1198,5 +1264,68 @@ mod tests {
         );
         // …while a truly date-less hit still ages out (the 100%-forever rollout).
         assert!(limit(true, SEEN_MS, None).is_expired(SEEN_MS + LIMIT_UNDATED_MAX_AGE_MS));
+    }
+
+    fn account(name: &str) -> crate::codex_account::AccountLimits {
+        let path = format!(
+            "{}/../../fixtures/codex/0.155.1/app-server/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let reply: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        crate::codex_account::parse_account_limits(&reply["result"], 1_790_000_000_000).unwrap()
+    }
+
+    #[test]
+    fn an_allowed_account_is_a_gauge_with_its_reset() {
+        let a = account("rate_limits_member_allowed");
+        let ul = a.to_usage_limit(a.is_blocked(false), 0);
+        assert!(!ul.hit);
+        assert_eq!(ul.percent, Some(99));
+        assert_eq!(ul.reset_at_unix, Some(1_790_737_070));
+        assert_eq!(ul.confirmed_ms, a.observed_ms, "a live read confirms what it says");
+    }
+
+    /// Out of credits with the weekly window used up: blocked, and it lifts when
+    /// that window resets — the backend's own upsell carries that `reset_at`.
+    #[test]
+    fn an_owner_out_of_credits_waits_for_the_full_window() {
+        let a = account("rate_limits_owner_credits_depleted");
+        let ul = a.to_usage_limit(a.is_blocked(false), 0);
+        assert!(ul.hit);
+        assert_eq!(ul.percent, Some(100));
+        assert_eq!(ul.reset_at_unix, Some(1_790_719_458));
+        assert!(!ul.reset_clock.is_empty());
+    }
+
+    /// Out of credits mid-week, window not full: nothing to wait for — you top
+    /// up — so no reset instant, and auto-continue never arms on it.
+    #[test]
+    fn out_of_credits_mid_week_has_no_reset_to_wait_on() {
+        let mut a = account("rate_limits_owner_credits_depleted");
+        a.windows[0].used_percent = 40.0;
+        let ul = a.to_usage_limit(a.is_blocked(false), 0);
+        assert!(ul.hit, "the backend said blocked");
+        assert_eq!(ul.reset_at_unix, None);
+    }
+
+    /// A credit block has no reset instant, so the undated age-out used to hide it
+    /// after 6h — while the backend was still saying blocked on every read.
+    #[test]
+    fn a_live_confirmation_outranks_the_clock() {
+        const SEEN_MS: u64 = 1_790_000_000_000;
+        let mut undated = limit(true, SEEN_MS, None);
+        let late = SEEN_MS + LIMIT_UNDATED_MAX_AGE_MS + 60_000;
+        assert!(undated.is_expired(late), "precondition: the transcript rule ages it out");
+        undated.confirmed_ms = late - 60_000;
+        assert!(!undated.is_expired(late), "confirmed a minute ago: still true");
+        // a source gone silent hands back to the clock.
+        assert!(undated.is_expired(undated.confirmed_ms + LIMIT_CONFIRM_FRESH_MS));
+        // a passed reset the backend still reports as blocking stays too.
+        let mut dated = limit(true, SEEN_MS, Some((SEEN_MS / 1000) as i64 + 60));
+        let past = SEEN_MS + 3_600_000;
+        assert!(dated.is_expired(past));
+        dated.confirmed_ms = past - 1_000;
+        assert!(!dated.is_expired(past));
     }
 }

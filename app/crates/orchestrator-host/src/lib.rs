@@ -20,6 +20,7 @@ pub mod osc;
 pub mod protocol;
 pub mod pty;
 pub mod session;
+pub mod codex_account;
 pub mod transcript;
 pub mod usage_limit;
 mod util;
@@ -53,6 +54,10 @@ mod api_hygiene {
         assert_plain::<crate::events::SessionEvent>();
         assert_plain::<crate::events::SessionEventKind>();
         assert_plain::<crate::protocol::BridgeStatus>();
+        assert_plain::<crate::session::UsageLimit>();
+        assert_plain::<crate::codex_account::AccountLimits>();
+        assert_plain::<crate::codex_account::LimitWindow>();
+        assert_plain::<crate::codex_account::ReadError>();
     }
 }
 

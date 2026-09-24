@@ -1011,6 +1011,7 @@ mod tests {
             reset_date: date.into(),
             reset_at_unix: Some(1_700_003_600),
             since_ms: 1_700_000_000_000,
+            confirmed_ms: 0,
         }
     }
 

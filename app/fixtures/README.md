@@ -28,5 +28,9 @@ codex/0.155.1/
                 the blinking "Action Required" title. Trimmed to ~5s of the ask; the
                 username and session id are replaced with same-length stand-ins so
                 every cursor position in the stream stays valid.
+  app-server/   account/rateLimits/read replies, recorded 2026-09-24 from two seats of one
+                workspace: rate_limits_member_allowed.json (99% of the weekly window,
+                ordinaryUsageAllowed) and rate_limits_owner_credits_depleted.json (100%,
+                workspace_owner_credits_depleted, blocked). accountId zeroed.
 reports/        full S1/S2 live-verification + control-surfaces research outputs (verbatim
                 evidence archive; the wire frames for app-server dual-attach live here)

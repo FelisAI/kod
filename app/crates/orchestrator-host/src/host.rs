@@ -6,8 +6,8 @@
 //! wrapped by a socket server and the GUI swaps in a remote client with the
 //! same surface (docs/013 §1 extraction rule).
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -72,6 +72,28 @@ pub struct SessionHost {
     /// rather than the (unreachable-when-idle) banner-cleared edge. Pushed with
     /// the master flag; read by the sweep in `auto_continue_step`.
     ac_fire_on_reset: AtomicBool,
+    /// codex limits per ACCOUNT (`crate::codex_account`), keyed by config root.
+    codex_accounts: Arc<Mutex<HashMap<PathBuf, CodexAccount>>>,
+    /// the codex that answers account reads — the one sessions run. In this
+    /// crate's own tests it is a path that cannot exist, so no test reaches the
+    /// real codex (RULE ZERO) unless it plugs in a stand-in.
+    codex_program: Mutex<String>,
+}
+
+/// One codex account's limit reads (docs/019), keyed by its config root — not
+/// the backend's `accountId`: a workspace owner and a member seat share one
+/// accountId and hold different limits (measured 2026-09-24).
+#[derive(Default)]
+struct CodexAccount {
+    in_flight: bool,
+    last_read_ms: u64,
+    /// the account's total rollout bytes when the last read was started. It grows
+    /// only when one of its sessions runs a turn — the doorbell.
+    doorbell: u64,
+    /// the last good read's verdict, applied to every session on the account.
+    limit: Option<crate::session::UsageLimit>,
+    /// this codex can't answer the read — its rollouts stay the source.
+    unsupported: bool,
 }
 
 /// The argv for a claude spawn (`--session-id <new>`) or resume (`--resume
@@ -166,6 +188,10 @@ impl SessionHost {
             last_limit_poll_ms: AtomicU64::new(0),
             auto_continue: AtomicBool::new(false),
             ac_fire_on_reset: AtomicBool::new(false),
+            codex_accounts: Arc::new(Mutex::new(HashMap::new())),
+            codex_program: Mutex::new(
+                if cfg!(test) { "/nonexistent/codex-under-test" } else { "codex" }.to_string(),
+            ),
         });
         *host.self_ref.lock().unwrap() = Arc::downgrade(&host);
         host
@@ -573,6 +599,10 @@ impl SessionHost {
     /// telemetry. Found through the session's account (`transcript_path`), so a
     /// profiled session is read in its own config dir.
     ///
+    /// Codex is the exception: its limit belongs to the ACCOUNT, so it is read
+    /// from the account ([`Self::poll_codex_accounts`]) and a session's rollout is
+    /// the source only for an account that has never answered (an older codex).
+    ///
     /// Runs HOST-SIDE so the daemon's detached sweep surfaces limits with no
     /// client attached. SELF-THROTTLED to ~10s: both records change per turn,
     /// and polling every 1s tick would just thrash disk.
@@ -584,7 +614,12 @@ impl SessionHost {
         }
         self.last_limit_poll_ms.store(now, Ordering::Relaxed);
         let local_off = local_off_secs();
+        let answered = self.poll_codex_accounts(now, local_off);
         for s in self.sessions() {
+            // the account answered for this codex session — its rollout is not asked.
+            if s.kind == CliKind::Codex && s.home().is_some_and(|h| answered.contains(h.root())) {
+                continue;
+            }
             // a shell has no transcript; a fresh codex has no id yet.
             let Some(path) = s.transcript_path() else {
                 continue;
@@ -610,6 +645,106 @@ impl SessionHost {
                     }
                 }
                 CliKind::Shell => {}
+            }
+        }
+    }
+
+    /// Codex limits per ACCOUNT ([`crate::codex_account`]): group the codex
+    /// sessions by config root, re-apply each account's last verdict to every one
+    /// of them (a session that joined since the last read gets it too), and start
+    /// a read where one is due. Returns the roots the backend has answered for.
+    fn poll_codex_accounts(&self, now: u64, local_off: i64) -> HashSet<PathBuf> {
+        let mut groups: HashMap<PathBuf, (u64, Vec<Arc<HostedSession>>)> = HashMap::new();
+        for s in self.sessions() {
+            if s.kind != CliKind::Codex {
+                continue;
+            }
+            let Some(home) = s.home() else { continue };
+            let bytes = s
+                .transcript_path()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let g = groups.entry(home.root().to_path_buf()).or_default();
+            g.0 += bytes;
+            g.1.push(s);
+        }
+        let mut answered = HashSet::new();
+        let mut start = Vec::new();
+        {
+            let mut accounts = self.codex_accounts.lock().unwrap();
+            for (root, (doorbell, sessions)) in groups {
+                let a = accounts.entry(root.clone()).or_default();
+                if let Some(ul) = &a.limit {
+                    for s in &sessions {
+                        s.set_usage_limit(Some(ul.clone()));
+                    }
+                    answered.insert(root.clone());
+                }
+                let blocked = a.limit.as_ref().is_some_and(|u| u.hit);
+                let rang = doorbell != a.doorbell;
+                if crate::codex_account::read_due(a.last_read_ms, a.in_flight, a.unsupported, rang, blocked, now) {
+                    a.in_flight = true;
+                    a.doorbell = doorbell;
+                    start.push(root);
+                }
+            }
+        }
+        for root in start {
+            self.start_account_read(root, local_off);
+        }
+        answered
+    }
+
+    /// One account read, OFF the sweep thread (it waits on a process). The
+    /// verdict is applied the moment it lands rather than on the next sweep.
+    fn start_account_read(&self, root: PathBuf, local_off: i64) {
+        use crate::codex_account::{parse_account_limits, read_account_limits, ReadError};
+        let accounts = self.codex_accounts.clone();
+        let host = self.self_ref.lock().unwrap().clone();
+        let program = self.codex_program.lock().unwrap().clone();
+        let r = root.clone();
+        let spawned = std::thread::Builder::new()
+            .name("codex-limits".into())
+            .spawn(move || {
+                let got = read_account_limits(&program, &r, std::time::Duration::from_secs(15));
+                let now = crate::events::now_ms();
+                let limit = {
+                    let mut accounts = accounts.lock().unwrap();
+                    let a = accounts.entry(r.clone()).or_default();
+                    a.in_flight = false;
+                    a.last_read_ms = now;
+                    match got {
+                        Ok(result) => {
+                            // a result that says nothing leaves the verdict we had.
+                            if let Some(read) = parse_account_limits(&result, now) {
+                                let was = a.limit.as_ref().is_some_and(|u| u.hit);
+                                a.limit = Some(read.to_usage_limit(read.is_blocked(was), local_off));
+                            }
+                        }
+                        Err(ReadError::Unsupported(why)) => {
+                            eprintln!("[kod] codex at {} can't read account limits ({why}) — using its rollouts", r.display());
+                            a.unsupported = true;
+                        }
+                        Err(ReadError::Failed(why)) => {
+                            eprintln!("[kod] codex account limits for {}: {why}", r.display());
+                        }
+                    }
+                    a.limit.clone()
+                };
+                let (Some(ul), Some(host)) = (limit, host.upgrade()) else {
+                    return;
+                };
+                for s in host.sessions() {
+                    if s.kind == CliKind::Codex && s.home().is_some_and(|h| h.root() == r) {
+                        s.set_usage_limit(Some(ul.clone()));
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // no thread, no read: don't leave the account marked in flight forever.
+            if let Some(a) = self.codex_accounts.lock().unwrap().get_mut(&root) {
+                a.in_flight = false;
             }
         }
     }
@@ -958,6 +1093,66 @@ mod tests {
 
         session.terminate();
         let _ = std::fs::remove_dir_all(&acct);
+    }
+
+    /// Codex limits are read from the ACCOUNT and land on every session on it,
+    /// through a stand-in app-server (never the real codex) that answers with the
+    /// recorded "owner out of credits" read — the block no session's rollout
+    /// carried. The stand-in answers only for its own CODEX_HOME, so a session on
+    /// another account gets nothing from it.
+    #[test]
+    fn a_codex_account_read_lands_on_every_session_on_that_account() {
+        let acct = tmp_account("codex-acct");
+        let other = tmp_account("codex-other");
+        let recorded = std::fs::read_to_string(format!(
+            "{}/../../fixtures/codex/0.155.1/app-server/rate_limits_owner_credits_depleted.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let one_line =
+            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&recorded).unwrap()).unwrap();
+        let fake = acct.join("fake-codex");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 3\n[ \"$CODEX_HOME\" = \"{}\" ] || exit 4\n\
+                 read l\necho '{{\"id\":1,\"result\":{{}}}}'\nread l\nread l\ncat <<'JSON'\n{one_line}\nJSON\nread l\n",
+                acct.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let host = SessionHost::new();
+        *host.codex_program.lock().unwrap() = fake.to_string_lossy().into_owned();
+        let spawn_on = |root: &std::path::Path| {
+            let mut spec = SpawnSpec::program("cat", std::env::temp_dir());
+            spec.env.push(("CODEX_HOME".to_string(), root.to_string_lossy().into_owned()));
+            host.spawn("proj", CliKind::Codex, spec).unwrap()
+        };
+        let (a1, a2, b) = (spawn_on(&acct), spawn_on(&acct), spawn_on(&other));
+
+        host.poll_transcript_limits();
+        // the read runs off the sweep; its verdict lands the moment it returns.
+        let t0 = std::time::Instant::now();
+        let hit = |id| host.get(id).unwrap().usage_limit().is_some_and(|u| u.hit);
+        while !(hit(a1) && hit(a2)) && t0.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for id in [a1, a2] {
+            let ul = host.get(id).unwrap().usage_limit().expect("the account's verdict");
+            assert!(ul.hit, "out of credits is blocked: {ul:?}");
+            assert_eq!(ul.percent, Some(100));
+            assert_eq!(ul.reset_at_unix, Some(1_790_719_458), "lifts with the weekly window");
+        }
+        assert_eq!(host.get(b).unwrap().usage_limit(), None, "another account's read is its own");
+
+        for id in [a1, a2, b] {
+            host.get(id).unwrap().terminate();
+        }
+        let _ = std::fs::remove_dir_all(&acct);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     fn tmp_account(tag: &str) -> std::path::PathBuf {

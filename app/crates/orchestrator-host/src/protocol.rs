@@ -23,7 +23,7 @@ use crate::session::{CliKind, SessionId};
 /// Bumped by hand whenever any wire type below changes shape. The client sends
 /// it in `Hello`; the daemon rejects a mismatch so a freshly-rebuilt GUI never
 /// talks to an incompatible older daemon (docs/018 §13).
-pub const WIRE_VERSION: u32 = 27; // 27: ServerMsg::Refused + AttachRefusal (why an attach was turned away); 26: PhoneKey widened to 20 keys (^C/^D/arrows/Home/End) for phone shell work; …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS)
+pub const WIRE_VERSION: u32 = 28; // 28: UsageLimit.confirmed_ms (a live source re-asserted it); 27: ServerMsg::Refused + AttachRefusal (why an attach was turned away); 26: PhoneKey widened to 20 keys (^C/^D/arrows/Home/End) for phone shell work; …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS)
 
 /// Reject absurd frame lengths (a corrupt/foreign peer) before allocating.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -648,6 +648,7 @@ mod tests {
             reset_tz: "America/Los_Angeles".into(),
             reset_at_unix: Some(1_700_000_000),
             since_ms: 9000,
+            confirmed_ms: 9500,
         });
         i
     }
@@ -1077,7 +1078,7 @@ mod tests {
 
     #[test]
     fn protocol_hash_is_stable() {
-        const PROTOCOL_HASH: u64 = 0x7dfc26d4c770374e; // WIRE_VERSION 27
+        const PROTOCOL_HASH: u64 = 0x54f9e24782a34945; // WIRE_VERSION 28
         let got = fnv1a(&protocol_corpus());
         assert_eq!(
             got, PROTOCOL_HASH,

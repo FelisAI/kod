@@ -151,9 +151,12 @@ pub fn codex_rollout_events(text: &str) -> Vec<TimelineItem> {
     text.lines().flat_map(codex_line_events).collect()
 }
 
-/// One rate-limit window from codex's `token_count` telemetry. Codex reports two:
-/// `primary` (the rolling ~5h window, `window_minutes:300`) and `secondary` (the
-/// weekly window, `window_minutes:10080`). `used_percent` reaches 100.0 on a
+/// One rate-limit window from codex's `token_count` telemetry. Codex reports up
+/// to two, `primary` and `secondary` — which is which depends on the plan: the
+/// ~5h window (`window_minutes:300`) and the weekly one (`10080`), or, on 0.155's
+/// team plans, the weekly window alone as `primary`. This telemetry is now only
+/// the fallback for a codex that can't answer the account read
+/// ([`crate::codex_account`]). `used_percent` reaches 100.0 on a
 /// limit; the reset instant is either an explicit `resets_at` unix epoch OR
 /// `resets_in_seconds` measured from the observation time.
 #[derive(Debug, Clone, PartialEq)]

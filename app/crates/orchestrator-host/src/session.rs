@@ -285,7 +285,7 @@ pub struct AcInputs {
     pub hit: bool,
     /// the resolved reset instant (unix seconds), when the banner carried one.
     pub reset_at: Option<i64>,
-    /// the banner is now GONE (`usage_limit.is_none()`) — the genuine reset
+    /// the block has ENDED (`limit_cleared`: nothing stored, or no longer a hit) — the genuine reset
     /// edge we FIRE on (distinct from merely reaching the estimated clock).
     pub cleared: bool,
     /// the CLI is actively working (OSC progress or an outstanding decision).
@@ -434,6 +434,16 @@ pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
     }
     // 7. Armed but the reset instant / clear / quiet conditions aren't all met.
     AcDecision::Skip
+}
+
+/// Has the block ENDED — on evidence, never on the clock? Nothing stored is
+/// cleared (claude's record came back answered). So is a stored reading that is
+/// no longer a hit: codex's account read says the backend lets the account run
+/// again, or a newer rollout reading came in under 100%. Before codex limits were
+/// read from the account, a codex limit stayed stored as the last `token_count`
+/// said it — a hit until the next turn — so this edge never came for codex.
+fn limit_cleared(ul: Option<&UsageLimit>) -> bool {
+    ul.is_none_or(|u| !u.hit)
 }
 
 /// Whether a freshly-scanned limit deserves a line on the timeline, and what it
@@ -994,7 +1004,7 @@ impl HostedSession {
         // bad estimate. Keep this raw.
         let ul = g.usage_limit.as_ref();
         let hit = ul.map(|u| u.hit).unwrap_or(false);
-        let cleared = ul.is_none();
+        let cleared = limit_cleared(ul);
         let reset_at = ul.and_then(|u| u.reset_at_unix);
         // A session AWAITING a decision (claude hook card / codex approval) must
         // NEVER be fired into even when grid_has_dialog can't corroborate it — fold
@@ -1800,6 +1810,18 @@ mod tests {
         assert_eq!(compute_phase(&inner, true, false), Phase::Idle);
     }
 
+    /// Auto-continue fires on EVIDENCE the block ended. Codex's account read
+    /// stores a not-hit reading when the backend lets the account run again —
+    /// that is the evidence; a stored hit is not.
+    #[test]
+    fn a_limit_is_cleared_when_nothing_is_stored_or_it_is_no_longer_a_hit() {
+        let mut u = ul(true, 1, "4:30pm", "");
+        assert!(!limit_cleared(Some(&u)));
+        u.hit = false;
+        assert!(limit_cleared(Some(&u)));
+        assert!(limit_cleared(None));
+    }
+
     fn fixture(rel: &str) -> Vec<u8> {
         std::fs::read(format!("{}/../../fixtures/{rel}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
@@ -1889,6 +1911,7 @@ mod tests {
             reset_date: String::new(),
             reset_at_unix: None,
             since_ms,
+            confirmed_ms: 0,
         }
     }
 

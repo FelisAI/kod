@@ -1292,6 +1292,7 @@ mod tests {
             reset_date: String::new(),
             reset_at_unix: None,
             since_ms: 0,
+            confirmed_ms: 0,
         }
     }
 
