@@ -713,6 +713,17 @@ pub trait SessionBackend: Send + Sync {
     /// Backfill a session's timeline from its on-disk transcript (#9 §4).
     fn backfill_transcript(&self, id: SessionId, path: &std::path::Path);
     fn reconcile_pending(&self);
+    /// The process hosting the sessions is gone (a daemon that exited or
+    /// crashed): every session it held died with it, and none of them was
+    /// watched exiting. In-process hosting can't outlive itself, so `false`.
+    fn daemon_lost(&self) -> bool {
+        false
+    }
+    /// Attached to a daemon running an OLDER build than the one on disk — it
+    /// held live sessions, so it accepted instead of retiring.
+    fn daemon_build_stale(&self) -> bool {
+        false
+    }
     // commands
     fn spawn_claude(
         &self,

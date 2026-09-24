@@ -1160,6 +1160,10 @@ fn attach_split(socket: &Path) -> Result<(UnixStream, UnixStream, ServerMsg), At
             ours: WIRE_VERSION,
             daemon: daemon_version,
         }),
+        ServerMsg::Refused { daemon_version, reason } => Err(AttachError::Refused {
+            daemon: daemon_version,
+            reason,
+        }),
         other => Err(AttachError::Unexpected(format!("{other:?}"))),
     }
 }

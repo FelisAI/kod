@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -15,11 +15,11 @@ use orchestrator_host::decision::PendingDecision;
 use orchestrator_host::emulator::GridSnapshot;
 use orchestrator_host::input::KeyInput;
 use orchestrator_host::protocol::{ClientRole, 
-    read_frame, write_frame, BridgeStatus, ClientMsg, Command, CommandReply, EventKind,
-    ServerEvent, ServerMsg, WIRE_VERSION,
+    read_frame, write_frame, AttachRefusal, BridgeStatus, ClientMsg, Command, CommandReply,
+    EventKind, ServerEvent, ServerMsg, WIRE_VERSION,
 };
 use orchestrator_host::pty::SpawnSpec;
-use orchestrator_host::session::{CliKind, SessionId};
+use orchestrator_host::session::{CliKind, Phase, SessionId};
 use orchestrator_host::{SessionBackend, SessionEvent, SessionInfo};
 
 /// The local mirror of daemon state, updated by the reader thread.
@@ -44,8 +44,49 @@ pub struct RemoteHost {
     /// their replies are simply dropped by the reader.
     pending: Arc<(Mutex<HashMap<u64, Option<CommandReply>>>, Condvar)>,
     /// set true when the reader thread exits (daemon gone) — so an in-flight or
-    /// future `request()` fails FAST instead of waiting 20s (review #9).
-    dead: Arc<std::sync::atomic::AtomicBool>,
+    /// future `request()` fails FAST instead of waiting 20s (review #9), and the
+    /// GUI can say the daemon is gone instead of showing its last frame forever.
+    dead: Arc<AtomicBool>,
+    /// the Welcome's `stale_build`: attached to an older build than the one on disk.
+    stale_build: bool,
+}
+
+/// An attach the daemon turned away. Rides inside an `io::Error` of kind
+/// `Unsupported` — what discover-or-spawn already reads as "a version problem" —
+/// so `connect_or_let_retire` can tell a retiring daemon, worth waiting on, from
+/// one that will never take this client.
+#[derive(Debug, Clone, Copy)]
+pub struct Refusal {
+    pub daemon_version: u32,
+    /// `None` = a daemon older than `Refused` (wire < 27) sent the bare
+    /// `VersionMismatch`, which carries no cause.
+    pub reason: Option<AttachRefusal>,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            Some(r) => f.write_str(&r.describe(self.daemon_version)),
+            None => write!(
+                f,
+                "the daemon speaks wire {}, this client speaks {WIRE_VERSION}",
+                self.daemon_version
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+impl Refusal {
+    /// The refusal inside an attach error, if that is what it is.
+    pub fn of(e: &io::Error) -> Option<Refusal> {
+        e.get_ref().and_then(|x| x.downcast_ref::<Refusal>()).copied()
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::Unsupported, self)
+    }
 }
 
 impl RemoteHost {
@@ -73,20 +114,22 @@ impl RemoteHost {
         // GUI startup forever (review #10); cleared before the live reader thread.
         let _ = reader.set_read_timeout(Some(Duration::from_secs(5)));
 
-        // handshake: Welcome (or VersionMismatch), then replay until ReplayDone.
+        // handshake: Welcome (or a refusal), then replay until ReplayDone.
+        let mut stale_build = false;
         loop {
             match read_frame::<_, ServerMsg>(&mut reader)? {
-                ServerMsg::Welcome { infos, .. } => {
+                ServerMsg::Welcome { infos, stale_build: stale, .. } => {
+                    stale_build = stale;
                     let mut c = cache.lock().unwrap();
                     for i in infos {
                         c.infos.insert(i.id, i);
                     }
                 }
                 ServerMsg::VersionMismatch { daemon_version } => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("daemon wire {daemon_version} != {WIRE_VERSION}"),
-                    ));
+                    return Err(Refusal { daemon_version, reason: None }.into_io());
+                }
+                ServerMsg::Refused { daemon_version, reason } => {
+                    return Err(Refusal { daemon_version, reason: Some(reason) }.into_io());
                 }
                 ServerMsg::Event(ev) => apply_event(&cache, ev),
                 ServerMsg::ReplayDone => break,
@@ -97,13 +140,14 @@ impl RemoteHost {
         // live events block indefinitely — clear the handshake timeout.
         let _ = reader.set_read_timeout(None);
 
-        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
         let host = Arc::new(RemoteHost {
             writer: Mutex::new(stream),
             cache: cache.clone(),
             next_id: AtomicU64::new(1),
             pending: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
             dead: dead.clone(),
+            stale_build,
         });
 
         // reader thread: apply live events to the cache, route replies to waiters.
@@ -122,7 +166,7 @@ impl RemoteHost {
                                 cv.notify_all();
                             } // else: a fire-and-forget reply — drop it.
                         }
-                        Ok(_) => {} // stray Welcome/VersionMismatch/ReplayDone post-handshake
+                        Ok(_) => {} // stray Welcome/refusal/ReplayDone post-handshake
                         Err(_) => break, // daemon gone / socket closed
                     }
                 }
@@ -140,6 +184,10 @@ impl RemoteHost {
                     }
                 }
                 cv.notify_all();
+                drop(g);
+                // AFTER `dead` is set, so anything that sees a session go dead
+                // also sees `daemon_lost()` and can tell this from a watched exit.
+                mark_all_dead(&cache);
             })
             .expect("spawn daemon-reader");
 
@@ -268,6 +316,23 @@ fn apply_event(cache: &Arc<Mutex<Cache>>, ev: ServerEvent) {
     }
 }
 
+/// The daemon is gone, and its PTYs closed with it: every session it held is
+/// dead. Left alone, the cache would keep serving each one's last frame as a live
+/// session forever — the GUI stayed responsive while every session was frozen
+/// (2026-09-23). No `Closed` will ever come for them, so mark them here.
+fn mark_all_dead(cache: &Arc<Mutex<Cache>>) {
+    let mut c = cache.lock().unwrap();
+    let ids: Vec<SessionId> = c.infos.keys().copied().collect();
+    for id in ids {
+        if let Some(i) = c.infos.get_mut(&id) {
+            i.alive = false;
+            i.phase = Phase::Dead;
+            i.pending = None;
+        }
+        bump_dirty(&mut c, id);
+    }
+}
+
 /// Bump the cached session's `dirty` to a local MONOTONIC repaint counter so the
 /// existing 16ms `drive_repaints` poll (which folds `infos().dirty`) notices
 /// EVERY event (even a phase-only change at the same daemon dirty) and repaints —
@@ -316,6 +381,12 @@ impl SessionBackend for RemoteHost {
     }
     fn reconcile_pending(&self) {
         // the daemon runs reconcile_pending on its coalescer tick (docs/018 §6).
+    }
+    fn daemon_lost(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+    fn daemon_build_stale(&self) -> bool {
+        self.stale_build
     }
     fn spawn_claude(
         &self,
@@ -442,6 +513,49 @@ impl SessionBackend for RemoteHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When the daemon goes away, every session it held died with it. The
+    /// cache must say so — before, it kept serving each session's last state as
+    /// live, and the GUI looked responsive while every session was frozen.
+    #[test]
+    fn a_lost_daemon_marks_every_cached_session_dead() {
+        use orchestrator_host::SessionHost;
+        let path = std::env::temp_dir().join(format!("kod-lost-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let host = SessionHost::new();
+        host.spawn(
+            "p",
+            CliKind::Shell,
+            SpawnSpec::program("cat", std::env::temp_dir()),
+        )
+        .unwrap();
+        // serve ONE client; a Quit returns and closes the socket — to the client,
+        // exactly what a daemon exiting looks like.
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            crate::serve_client(s, host).unwrap()
+        });
+        let remote = RemoteHost::connect(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!remote.daemon_lost());
+        assert!(remote.infos().iter().all(|i| i.alive), "precondition: attached live");
+
+        let _ = remote.request(Command::Quit);
+        assert!(server.join().unwrap(), "the fake daemon quit");
+        let t0 = std::time::Instant::now();
+        while !remote.daemon_lost() && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // the reader marks the cache right after setting `dead`.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(remote.daemon_lost(), "the loss must be observable");
+        let infos = remote.infos();
+        assert_eq!(infos.len(), 1, "sessions stay listed — marked, not vanished");
+        for i in &infos {
+            assert!(!i.alive && i.phase == Phase::Dead && i.pending.is_none(), "{i:?}");
+        }
+    }
 
     /// A daemon that died, timed out, or answered nonsense must NOT leave the
     /// settings pane drawing the last "running" it saw — `request` reports all

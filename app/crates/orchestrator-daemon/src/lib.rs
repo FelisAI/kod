@@ -15,8 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 use orchestrator_host::protocol::{ClientRole, PhoneKey as WirePhoneKey,
-    read_frame, write_frame, ClientMsg, Command, CommandReply, EventKind, ServerEvent, ServerMsg,
-    WIRE_VERSION,
+    read_frame, write_frame, AttachRefusal, ClientMsg, Command, CommandReply, EventKind,
+    ServerEvent, ServerMsg, REFUSED_SINCE_WIRE, WIRE_VERSION,
 };
 use orchestrator_host::input::KeyInput;
 use orchestrator_host::session::SessionId;
@@ -24,7 +24,7 @@ use orchestrator_host::{SessionBackend, SessionHost};
 
 pub mod bridge;
 mod remote;
-pub use remote::RemoteHost;
+pub use remote::{Refusal, RemoteHost};
 
 // ---- client side: discover-or-spawn (docs/018 §9, §13) ----
 
@@ -40,6 +40,10 @@ pub enum HostMode {
     /// in-process because the daemon could NOT be reached — sessions will be
     /// LOST on restart; warn loudly.
     InProcessFallback,
+    /// in-process because the running daemon is an OLDER wire and holds `live`
+    /// sessions it won't kill to make way. They keep running there, out of this
+    /// app's reach, until they end or that daemon is restarted.
+    InProcessDaemonBusy { live: u32 },
 }
 
 /// Get a session backend for the GUI: attach to a running daemon, spawn one if
@@ -86,23 +90,55 @@ fn binary_was_rebuilt() -> bool {
     matches!((LAUNCH_MTIME.get().copied().flatten(), exe_mtime()), (Some(launch), Some(now)) if now > launch)
 }
 
-/// What to do with an attaching client: fold the wire-version gate together with
-/// "our binary was rebuilt". A rebuilt binary retires exactly like an outdated
-/// wire — the attaching GUI then respawns a fresh daemon from the new build.
+/// What to do with an attaching client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachGate {
     Accept,
-    Retire,
-    Reject,
+    /// exit so the client can spawn a fresh daemon from its build.
+    Retire { rebuilt: bool },
+    /// turn the client away and keep serving.
+    Reject(AttachRefusal),
 }
 
-fn attach_gate(client_wire: u32, daemon_wire: u32, rebuilt: bool) -> AttachGate {
+/// Fold the wire-version gate together with "our binary was rebuilt", WHO is
+/// attaching, and how many sessions are alive.
+///
+/// Retiring is `process::exit`, which closes every PTY master and kills every
+/// session this daemon holds. So a daemon retires ONLY when nothing is alive to
+/// kill. It used to retire on `rebuilt` alone — true for the whole life of any
+/// dev daemon after the first `cargo build` — so any full-role attach, even a
+/// read-only probe, took every live session down with it (2026-09-23).
+///
+/// - Same wire is the same protocol, so a rebuilt binary with live sessions is
+///   simply ACCEPTED: the client talks to the older build, which retires on a
+///   later attach once its sessions are gone. The Welcome says so (`stale_build`).
+/// - A newer wire cannot be accepted; with live sessions it is refused instead.
+/// - A phone never retires the daemon: the daemon launches the bridge itself, so
+///   a phone that could retire would make turning the bridge on a way to kill
+///   every session.
+fn attach_gate(
+    client_wire: u32,
+    daemon_wire: u32,
+    rebuilt: bool,
+    role: ClientRole,
+    live: usize,
+) -> AttachGate {
+    let desktop = role == ClientRole::Full;
     match wire_gate(client_wire, daemon_wire) {
-        WireGate::Accept if rebuilt => AttachGate::Retire,
+        WireGate::RejectStale => AttachGate::Reject(AttachRefusal::ClientOutdated),
+        WireGate::Accept if rebuilt && desktop && live == 0 => AttachGate::Retire { rebuilt: true },
         WireGate::Accept => AttachGate::Accept,
-        WireGate::RetireOutdated => AttachGate::Retire,
-        WireGate::RejectStale => AttachGate::Reject,
+        WireGate::RetireOutdated if !desktop => AttachGate::Reject(AttachRefusal::PhoneOnNewerWire),
+        WireGate::RetireOutdated if live > 0 => {
+            AttachGate::Reject(AttachRefusal::LiveSessions { live: live as u32 })
+        }
+        WireGate::RetireOutdated => AttachGate::Retire { rebuilt: false },
     }
+}
+
+/// Sessions whose process is still running — what a retire would kill.
+fn live_sessions(host: &SessionHost) -> usize {
+    host.sessions().iter().filter(|s| s.is_alive()).count()
 }
 
 pub fn connect_or_spawn() -> (Arc<dyn SessionBackend>, HostMode) {
@@ -117,9 +153,20 @@ pub fn connect_or_spawn() -> (Arc<dyn SessionBackend>, HostMode) {
         }
         Err(e) => {
             eprintln!("[orchestrator] daemon unavailable ({e}) — running in-process (sessions WON'T survive restart)");
-            (SessionHost::new(), HostMode::InProcessFallback)
+            let mode = match Refusal::of(&e).and_then(|r| r.reason) {
+                Some(AttachRefusal::LiveSessions { live }) => HostMode::InProcessDaemonBusy { live },
+                _ => HostMode::InProcessFallback,
+            };
+            (SessionHost::new(), mode)
         }
     }
+}
+
+/// A refusal no amount of waiting turns into an attach: the daemon said why, and
+/// it isn't retiring. (A bare `VersionMismatch` from a pre-27 daemon says
+/// nothing, so it keeps the old wait-and-see.)
+fn refusal_is_final(e: &io::Error) -> bool {
+    Refusal::of(e).and_then(|r| r.reason).is_some_and(|r| !r.is_retiring())
 }
 
 /// Connect, accommodating a wire-mismatched daemon. `Ok(Some)` = attached;
@@ -131,15 +178,19 @@ pub fn connect_or_spawn() -> (Arc<dyn SessionBackend>, HostMode) {
 fn connect_or_let_retire(path: &Path) -> io::Result<Option<Arc<dyn SessionBackend>>> {
     match RemoteHost::connect(path) {
         Ok(r) => return Ok(Some(r)),
-        Err(e) if e.kind() == io::ErrorKind::Unsupported => {} // mismatch — handled below
+        Err(e) if refusal_is_final(&e) => return Err(e), // it said why, and it's staying
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {} // retiring — handled below
         Err(_) => return Ok(None),                             // refused / not-found → no daemon
     }
     // A NEWER daemon stays up (we're stale → give up to in-process); an OUTDATED
     // one self-retires → poll until the socket frees, then return None to spawn.
+    // A retire can also be called off (a session spawned meanwhile) — then the
+    // retry attaches, or comes back refused with the live count.
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
         match RemoteHost::connect(path) {
             Ok(r) => return Ok(Some(r)),
+            Err(e) if refusal_is_final(&e) => return Err(e),
             Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
             Err(_) => return Ok(None), // retired → socket free → spawn fresh
         }
@@ -356,37 +407,29 @@ pub fn serve_client(stream: UnixStream, host: Arc<SessionHost>) -> io::Result<bo
         // never be a path to full capability.
         _ => (0, ClientRole::Phone),
     };
-    // A PHONE connection must never be able to retire this daemon.
-    //
-    // Retiring exists so a NEWER desktop app can replace an outdated daemon and
-    // respawn it. The mobile bridge is not that: it is a child this daemon starts,
-    // pointed at this daemon's own socket. Leave the general rule in place and the
-    // daemon kills itself the moment it launches its own bridge, because
-    // `binary_was_rebuilt()` is true for the whole life of any daemon whose binary
-    // was rebuilt under it — which in development is most of them. Every live PTY
-    // dies with it, caused by nothing but turning the feature on.
-    //
-    // A mismatched phone is refused instead: it gets VersionMismatch, its socket
-    // closes, and the daemon keeps serving. Downgrade, not bypass — the version
-    // check still runs, only the CONSEQUENCE changes.
-    let gate = match attach_gate(client_wire, WIRE_VERSION, binary_was_rebuilt()) {
-        AttachGate::Retire if role == ClientRole::Phone => AttachGate::Reject,
-        g => g,
+    let rebuilt = binary_was_rebuilt();
+    let gate = attach_gate(client_wire, WIRE_VERSION, rebuilt, role, live_sessions(&host));
+    let reason = match gate {
+        AttachGate::Accept => None,
+        AttachGate::Retire { rebuilt } => Some(AttachRefusal::Retiring { rebuilt }),
+        AttachGate::Reject(r) => Some(r),
     };
-    match gate {
-        AttachGate::Accept => {}
-        gate => {
-            let _ = tx.send(ServerMsg::VersionMismatch {
-                daemon_version: WIRE_VERSION,
-            });
-            drop(tx);
-            let _ = writer.join();
-            // Retire → a NEWER client appeared OR our binary was rebuilt under us, so
-            // we exit (Ok(true) → run() process::exits, freeing the socket for the
-            // client to respawn a fresh daemon). Reject → an OLDER client; keep
-            // serving the host (Ok(false), just drop this thread).
-            return Ok(gate == AttachGate::Retire);
-        }
+    if let Some(reason) = reason {
+        // Say WHY to a client that can decode it; an older one only knows the
+        // bare mismatch.
+        let _ = tx.send(if client_wire >= REFUSED_SINCE_WIRE {
+            ServerMsg::Refused { daemon_version: WIRE_VERSION, reason }
+        } else {
+            ServerMsg::VersionMismatch { daemon_version: WIRE_VERSION }
+        });
+        drop(tx);
+        let _ = writer.join();
+        // Retire → exit (Ok(true) → run() process::exits, freeing the socket for
+        // the client to respawn a fresh daemon). Re-count first: a session another
+        // client spawned since the gate ran must not die for this one's upgrade —
+        // stay up, and the client's retry attaches or is refused with the count.
+        // Reject → keep serving the host (Ok(false), just drop this thread).
+        return Ok(reason.is_retiring() && live_sessions(&host) == 0);
     }
 
     // snapshot-replay (§7): Welcome carries the session infos; then one Grid per
@@ -397,6 +440,9 @@ pub fn serve_client(stream: UnixStream, host: Arc<SessionHost>) -> io::Result<bo
     let _ = tx.send(ServerMsg::Welcome {
         wire_version: WIRE_VERSION,
         infos: seed.clone(),
+        // accepted on a rebuilt binary because sessions are alive: the client is
+        // talking to an older build than the one on disk.
+        stale_build: rebuilt,
     });
     for info in &seed {
         if let Some(g) = host.snapshot(info.id) {
@@ -970,22 +1016,49 @@ mod tests {
     }
 
     #[test]
-    fn attach_gate_retires_on_rebuilt_binary() {
+    fn attach_gate_retires_only_with_nothing_alive() {
+        use AttachRefusal::*;
+        const FULL: ClientRole = ClientRole::Full;
         // same wire, binary NOT rebuilt → attach (a plain GUI restart keeps sessions).
-        assert_eq!(attach_gate(7, 7, false), AttachGate::Accept);
-        // same wire but our binary was rebuilt under us → retire (dev: no pkill needed).
-        assert_eq!(attach_gate(7, 7, true), AttachGate::Retire);
-        // a newer client still retires regardless of the binary check.
-        assert_eq!(attach_gate(8, 7, false), AttachGate::Retire);
+        assert_eq!(attach_gate(7, 7, false, FULL, 0), AttachGate::Accept);
+        assert_eq!(attach_gate(7, 7, false, FULL, 3), AttachGate::Accept);
+        // same wire, rebuilt under us, nothing alive → retire (dev: no pkill needed).
+        assert_eq!(attach_gate(7, 7, true, FULL, 0), AttachGate::Retire { rebuilt: true });
+        // ...but with live sessions the SAME protocol is accepted, never retired:
+        // this is the case that killed every session on 2026-09-23.
+        assert_eq!(attach_gate(7, 7, true, FULL, 1), AttachGate::Accept);
+        // a newer client retires an idle daemon, and is refused by a busy one.
+        assert_eq!(attach_gate(8, 7, false, FULL, 0), AttachGate::Retire { rebuilt: false });
+        assert_eq!(attach_gate(8, 7, true, FULL, 0), AttachGate::Retire { rebuilt: false });
+        assert_eq!(attach_gate(8, 7, false, FULL, 2), AttachGate::Reject(LiveSessions { live: 2 }));
         // an older client is rejected — never kill a good daemon for a stale binary.
-        assert_eq!(attach_gate(6, 7, false), AttachGate::Reject);
-        assert_eq!(attach_gate(6, 7, true), AttachGate::Reject);
+        assert_eq!(attach_gate(6, 7, false, FULL, 0), AttachGate::Reject(ClientOutdated));
+        assert_eq!(attach_gate(6, 7, true, FULL, 0), AttachGate::Reject(ClientOutdated));
+    }
+
+    /// No input combination retires a daemon that holds a live session.
+    #[test]
+    fn no_attach_ever_retires_a_daemon_with_a_live_session() {
+        for client in [6, 7, 8] {
+            for rebuilt in [false, true] {
+                for role in [ClientRole::Full, ClientRole::Phone] {
+                    for live in [1, 5] {
+                        let g = attach_gate(client, 7, rebuilt, role, live);
+                        assert!(
+                            !matches!(g, AttachGate::Retire { .. }),
+                            "wire {client} rebuilt={rebuilt} {role:?} live={live} → {g:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn newer_client_retires_the_daemon() {
-        // a NEWER GUI attaching means we're the outdated binary → reply mismatch
-        // AND signal shutdown (Ok(true)) so it can respawn a fresh same-wire daemon.
+    fn newer_client_retires_an_idle_daemon_and_is_told_why() {
+        // a NEWER GUI attaching to a daemon with NO live session means we're the
+        // outdated binary → say we're retiring AND signal shutdown (Ok(true)) so
+        // it can respawn a fresh same-wire daemon.
         let (client, server) = UnixStream::pair().unwrap();
         let host = SessionHost::new();
         let st = thread::spawn(move || serve_client(server, host).unwrap());
@@ -999,12 +1072,115 @@ mod tests {
         )
         .unwrap();
         let mut rc = c.try_clone().unwrap();
-        let got = drain_until(&mut rc, |m| matches!(m, ServerMsg::VersionMismatch { .. }));
+        let got = drain_until(&mut rc, |m| matches!(m, ServerMsg::Refused { .. }));
+        assert!(matches!(
+            got.first(),
+            Some(ServerMsg::Refused { daemon_version, reason: AttachRefusal::Retiring { rebuilt: false } })
+                if *daemon_version == WIRE_VERSION
+        ));
+        drop(c);
+        assert!(st.join().unwrap(), "a newer client must retire an idle daemon");
+    }
+
+    #[test]
+    fn newer_client_is_refused_by_a_daemon_with_live_sessions_which_survive() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let host = SessionHost::new();
+        let id = host
+            .spawn("p", CliKind::Shell, SpawnSpec::program("cat", std::env::temp_dir()))
+            .unwrap();
+        let h = host.clone();
+        let st = thread::spawn(move || serve_client(server, h).unwrap());
+        let mut c = client;
+        write_frame(
+            &mut c,
+            &ClientMsg::Hello {
+                wire_version: WIRE_VERSION + 1,
+                role: ClientRole::Full,
+            },
+        )
+        .unwrap();
+        let mut rc = c.try_clone().unwrap();
+        let got = drain_until(&mut rc, |m| matches!(m, ServerMsg::Refused { .. }));
         assert!(
-            matches!(got.first(), Some(ServerMsg::VersionMismatch { daemon_version }) if *daemon_version == WIRE_VERSION)
+            matches!(
+                got.first(),
+                Some(ServerMsg::Refused { reason: AttachRefusal::LiveSessions { live: 1 }, .. })
+            ),
+            "{got:?}"
+        );
+        drop(rc);
+        drop(c);
+        assert!(!st.join().unwrap(), "a daemon holding a live session must NOT retire");
+        assert!(
+            host.sessions().iter().any(|s| s.id == id && s.is_alive()),
+            "the live session must survive the refused attach"
+        );
+    }
+
+    /// A client from before `Refused` existed must still get the one refusal it
+    /// can decode — `Refused` would be an unknown variant to it.
+    #[test]
+    fn a_pre_refused_client_gets_the_bare_mismatch() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let st = thread::spawn(move || serve_client(server, SessionHost::new()).unwrap());
+        let mut c = client;
+        write_frame(
+            &mut c,
+            &ClientMsg::Hello {
+                wire_version: REFUSED_SINCE_WIRE - 1,
+                role: ClientRole::Full,
+            },
+        )
+        .unwrap();
+        let mut rc = c.try_clone().unwrap();
+        let got = drain_until(&mut rc, |m| {
+            matches!(m, ServerMsg::VersionMismatch { .. } | ServerMsg::Refused { .. })
+        });
+        assert!(
+            matches!(got.first(), Some(ServerMsg::VersionMismatch { daemon_version }) if *daemon_version == WIRE_VERSION),
+            "{got:?}"
         );
         drop(c);
-        assert!(st.join().unwrap(), "a newer client must retire the daemon");
+        assert!(!st.join().unwrap());
+    }
+
+    /// A fake daemon that answers Hello with `reply`, then hangs up.
+    fn refusing_daemon(reply: ServerMsg) -> (PathBuf, thread::JoinHandle<()>) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kod-refuse-{}-{}.sock",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let t = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _: ClientMsg = read_frame(&mut s).unwrap();
+            write_frame(&mut s, &reply).unwrap();
+        });
+        (path, t)
+    }
+
+    #[test]
+    fn a_client_reads_the_refusal_cause_and_does_not_wait_on_a_final_one() {
+        let (path, t) = refusing_daemon(ServerMsg::Refused {
+            daemon_version: WIRE_VERSION - 1,
+            reason: AttachRefusal::LiveSessions { live: 4 },
+        });
+        let started = std::time::Instant::now();
+        let e = connect_or_let_retire(&path).err().expect("a live-sessions refusal is an error");
+        t.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "a final refusal must not sit through the 2s retire poll"
+        );
+        let r = Refusal::of(&e).expect("the cause rides inside the io::Error");
+        assert_eq!(r.reason, Some(AttachRefusal::LiveSessions { live: 4 }));
+        assert!(e.to_string().contains("4 live session"), "{e}");
+        assert!(!e.to_string().contains("!="), "{e}");
     }
 
     #[test]
@@ -1023,10 +1199,15 @@ mod tests {
         )
         .unwrap();
         let mut rc = c.try_clone().unwrap();
-        let got = drain_until(&mut rc, |m| matches!(m, ServerMsg::VersionMismatch { .. }));
+        // bare mismatch or `Refused { ClientOutdated }`, depending on whether
+        // WIRE_VERSION - 1 predates `Refused` — either way, turned away.
+        let got = drain_until(&mut rc, |m| {
+            matches!(m, ServerMsg::VersionMismatch { .. } | ServerMsg::Refused { .. })
+        });
         assert!(matches!(
             got.first(),
             Some(ServerMsg::VersionMismatch { .. })
+                | Some(ServerMsg::Refused { reason: AttachRefusal::ClientOutdated, .. })
         ));
         drop(c);
         assert!(
@@ -1195,18 +1376,20 @@ mod phone_never_retires_tests {
     /// rebuilt under a running daemon constantly, it would do so every time.
     #[test]
     fn a_rebuilt_binary_retires_for_the_desktop_but_not_for_a_phone() {
-        // Same inputs, same version, same rebuilt flag: only the role differs.
-        let raw = attach_gate(WIRE_VERSION, WIRE_VERSION, true);
-        assert_eq!(raw, AttachGate::Retire, "precondition: this case DOES retire");
-
-        let for_phone = match raw {
-            AttachGate::Retire => AttachGate::Reject,
-            g => g,
-        };
+        // Same inputs, same version, same rebuilt flag, nothing alive: only the
+        // role differs.
+        let desktop = attach_gate(WIRE_VERSION, WIRE_VERSION, true, ClientRole::Full, 0);
+        assert_eq!(desktop, AttachGate::Retire { rebuilt: true }, "precondition: this case DOES retire");
+        // Same wire is the same protocol, so the phone is simply served.
         assert_eq!(
-            for_phone,
-            AttachGate::Reject,
-            "a phone must be turned away, never allowed to take the daemon down with it"
+            attach_gate(WIRE_VERSION, WIRE_VERSION, true, ClientRole::Phone, 0),
+            AttachGate::Accept,
+            "a phone must never be allowed to take the daemon down with it"
+        );
+        // A phone on a newer wire can't be served — and still doesn't retire.
+        assert_eq!(
+            attach_gate(WIRE_VERSION + 1, WIRE_VERSION, false, ClientRole::Phone, 0),
+            AttachGate::Reject(AttachRefusal::PhoneOnNewerWire)
         );
     }
 
@@ -1214,11 +1397,13 @@ mod phone_never_retires_tests {
     /// still gets refused, it just does not take the daemon with it.
     #[test]
     fn a_mismatched_phone_is_still_refused() {
-        assert_ne!(
-            attach_gate(WIRE_VERSION - 1, WIRE_VERSION, false),
-            AttachGate::Accept,
-            "an outdated client of any role must not be accepted"
-        );
+        for role in [ClientRole::Full, ClientRole::Phone] {
+            assert_eq!(
+                attach_gate(WIRE_VERSION - 1, WIRE_VERSION, false, role, 0),
+                AttachGate::Reject(AttachRefusal::ClientOutdated),
+                "an outdated client of any role must not be accepted"
+            );
+        }
     }
 }
 

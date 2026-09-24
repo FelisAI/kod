@@ -382,9 +382,24 @@ impl Orchestrator {
                 )
         };
         match self.host_mode {
+            // The daemon exited under us: every session it held is dead, and
+            // nothing works until a relaunch spawns a fresh one — whose launch
+            // offers each of them for restore.
+            HostMode::Daemon if self.host.daemon_lost() => pill(
+                0xE06C6C,
+                0xE8A0A0,
+                0x2A1818,
+                "daemon exited — relaunch Kod to restore sessions".into(),
+            ),
             HostMode::Daemon => {
-                let n = self.host.infos().len();
-                pill(GREEN, MUTED, CARD, format!("daemon · {n} live"))
+                let n = self.host.infos().iter().filter(|i| i.alive).count();
+                if self.host.daemon_build_stale() {
+                    // Kept alive for its sessions instead of retiring: it runs
+                    // the build from before the last one, until they end.
+                    pill(0xE6A23C, MUTED, CARD, format!("daemon · {n} live · older build"))
+                } else {
+                    pill(GREEN, MUTED, CARD, format!("daemon · {n} live"))
+                }
             }
             HostMode::InProcessByChoice => pill(MUTED, MUTED2, CARD, "in-process".into()),
             HostMode::InProcessFallback => pill(
@@ -392,6 +407,12 @@ impl Orchestrator {
                 0xE6C07A,
                 0x2A2418,
                 "in-process — won't survive restart".into(),
+            ),
+            HostMode::InProcessDaemonBusy { live } => pill(
+                0xE6A23C,
+                0xE6C07A,
+                0x2A2418,
+                format!("in-process — an older daemon still runs {live} session(s)"),
             ),
         }
     }

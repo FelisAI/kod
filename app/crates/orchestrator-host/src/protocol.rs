@@ -23,7 +23,7 @@ use crate::session::{CliKind, SessionId};
 /// Bumped by hand whenever any wire type below changes shape. The client sends
 /// it in `Hello`; the daemon rejects a mismatch so a freshly-rebuilt GUI never
 /// talks to an incompatible older daemon (docs/018 §13).
-pub const WIRE_VERSION: u32 = 26; // 26: PhoneKey widened to 20 keys (^C/^D/arrows/Home/End) for phone shell work; …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS)
+pub const WIRE_VERSION: u32 = 27; // 27: ServerMsg::Refused + AttachRefusal (why an attach was turned away); 26: PhoneKey widened to 20 keys (^C/^D/arrows/Home/End) for phone shell work; …18: UsageLimit.reset_date + reset_at_unix; 19: Command::SetAutoContinue; 20: Command::Answer removed; 21: legacy agent CLI removed; 22: SetAutoContinue.fire_on_reset; 23: Command::SetBridge/BridgeStatus + CommandReply::Bridge; 24: ClientMsg::Hello.role + Command::PhoneInput/PhoneKey; 25: BridgeStatus.fingerprint (TLS)
 
 /// Reject absurd frame lengths (a corrupt/foreign peer) before allocating.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -393,6 +393,10 @@ pub enum ServerMsg {
     Welcome {
         wire_version: u32,
         infos: Vec<SessionInfo>,
+        /// the daemon's binary was rebuilt since it launched, but it holds live
+        /// sessions, so it accepted instead of retiring: the client is talking to
+        /// an OLDER build than the one on disk until those sessions end.
+        stale_build: bool,
     },
     /// version mismatch — the client decides (restart daemon vs run in-process).
     VersionMismatch { daemon_version: u32 },
@@ -405,6 +409,64 @@ pub enum ServerMsg {
         request_id: u64,
         reply: CommandReply,
     },
+    /// the attach was turned away, and WHY. Sent only to a client whose Hello
+    /// announced at least [`REFUSED_SINCE_WIRE`]; an older client gets the bare
+    /// `VersionMismatch` above, the one refusal it can decode. Appended LAST so
+    /// every earlier variant keeps its bincode index.
+    Refused {
+        daemon_version: u32,
+        reason: AttachRefusal,
+    },
+}
+
+/// The first wire version whose clients understand [`ServerMsg::Refused`].
+pub const REFUSED_SINCE_WIRE: u32 = 27;
+
+/// Why a daemon did not accept an attach. The bare `VersionMismatch` could only
+/// say "daemon wire 26 != 26" when a rebuilt binary retired — true of neither
+/// the versions nor what had happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachRefusal {
+    /// The daemon is exiting to make way for this client: its binary was
+    /// rebuilt since it launched (`rebuilt`), or the client speaks a newer wire.
+    /// It holds no live session. Wait for the socket to free, then spawn.
+    Retiring { rebuilt: bool },
+    /// The client speaks a newer wire, but the daemon holds `live` running
+    /// sessions and will not kill them to make way. Retrying cannot help.
+    LiveSessions { live: u32 },
+    /// The client speaks an older wire than the daemon.
+    ClientOutdated,
+    /// A phone-role client on a newer wire. A phone never retires a daemon.
+    PhoneOnNewerWire,
+}
+
+impl AttachRefusal {
+    /// Whether waiting can turn this refusal into an attach: only a retiring
+    /// daemon frees its socket for a fresh spawn.
+    pub fn is_retiring(self) -> bool {
+        matches!(self, AttachRefusal::Retiring { .. })
+    }
+
+    /// One line for logs and the GUI, naming the cause rather than a version pair.
+    pub fn describe(self, daemon_version: u32) -> String {
+        match self {
+            AttachRefusal::Retiring { rebuilt: true } => format!(
+                "the daemon is retiring: its binary was rebuilt since it launched (wire {daemon_version}) and it holds no live session"
+            ),
+            AttachRefusal::Retiring { rebuilt: false } => format!(
+                "the daemon is retiring: it speaks wire {daemon_version}, older than this client's {WIRE_VERSION}, and holds no live session"
+            ),
+            AttachRefusal::LiveSessions { live } => format!(
+                "the daemon speaks wire {daemon_version}, older than this client's {WIRE_VERSION}, and will not exit while it holds {live} live session(s)"
+            ),
+            AttachRefusal::ClientOutdated => format!(
+                "this client speaks wire {WIRE_VERSION}, older than the daemon's {daemon_version} — rebuild it from the same tree"
+            ),
+            AttachRefusal::PhoneOnNewerWire => format!(
+                "this phone client speaks wire {WIRE_VERSION}, newer than the daemon's {daemon_version}, and a phone never retires the daemon"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +706,7 @@ mod tests {
             ServerMsg::Welcome {
                 wire_version: WIRE_VERSION,
                 infos: vec![sample_info()],
+                stale_build: true,
             },
             ServerMsg::VersionMismatch { daemon_version: 99 },
             ServerMsg::ReplayDone,
@@ -903,7 +966,65 @@ mod tests {
         for k in all_phone_keys() {
             bytes.extend(bincode::serialize(&k).unwrap());
         }
+        // Every refusal, for the same reason as every PhoneKey.
+        for reason in all_refusals() {
+            bytes.extend(
+                bincode::serialize(&ServerMsg::Refused { daemon_version: 26, reason }).unwrap(),
+            );
+        }
         bytes
+    }
+
+    /// Every [`AttachRefusal`], by exhaustive match (see `all_phone_keys`).
+    fn all_refusals() -> Vec<AttachRefusal> {
+        use AttachRefusal::*;
+        let all = vec![
+            Retiring { rebuilt: true },
+            Retiring { rebuilt: false },
+            LiveSessions { live: 3 },
+            ClientOutdated,
+            PhoneOnNewerWire,
+        ];
+        for r in &all {
+            match r {
+                Retiring { .. } | LiveSessions { .. } | ClientOutdated | PhoneOnNewerWire => {}
+            }
+        }
+        all
+    }
+
+    /// The refusal a client reads must name the cause. The retire that killed
+    /// every live session on 2026-09-23 reached the client as "daemon wire 26 !=
+    /// 26" — two equal numbers presented as a mismatch.
+    #[test]
+    fn every_refusal_names_its_cause_in_one_line() {
+        for r in all_refusals() {
+            let s = r.describe(WIRE_VERSION - 1);
+            assert!(!s.contains('\n') && !s.contains("  "), "{s:?}");
+            assert!(!s.contains("!="), "a refusal must say why, not print a version pair: {s:?}");
+        }
+        assert!(AttachRefusal::Retiring { rebuilt: true }.describe(WIRE_VERSION).contains("rebuilt"));
+        assert!(AttachRefusal::LiveSessions { live: 4 }.describe(26).contains("4 live session"));
+        // only a retiring daemon is worth waiting on.
+        assert!(AttachRefusal::Retiring { rebuilt: false }.is_retiring());
+        assert!(!AttachRefusal::LiveSessions { live: 1 }.is_retiring());
+        assert!(!AttachRefusal::ClientOutdated.is_retiring());
+        assert!(!AttachRefusal::PhoneOnNewerWire.is_retiring());
+    }
+
+    /// `Refused` must not move any existing variant: an OLDER client decodes the
+    /// bare `VersionMismatch` by its index, so that index is part of the
+    /// compatibility contract across wire versions.
+    #[test]
+    fn version_mismatch_keeps_its_bincode_index() {
+        let b = bincode::serialize(&ServerMsg::VersionMismatch { daemon_version: 7 }).unwrap();
+        assert_eq!(&b[..4], &1u32.to_le_bytes(), "VersionMismatch must stay variant 1");
+        let r = bincode::serialize(&ServerMsg::Refused {
+            daemon_version: 7,
+            reason: AttachRefusal::ClientOutdated,
+        })
+        .unwrap();
+        assert_eq!(&r[..4], &5u32.to_le_bytes(), "Refused is appended after Reply");
     }
 
     /// Every [`PhoneKey`], by exhaustive match.
@@ -956,7 +1077,7 @@ mod tests {
 
     #[test]
     fn protocol_hash_is_stable() {
-        const PROTOCOL_HASH: u64 = 0x3a52a2a51aae7ca8; // WIRE_VERSION 26
+        const PROTOCOL_HASH: u64 = 0x7dfc26d4c770374e; // WIRE_VERSION 27
         let got = fnv1a(&protocol_corpus());
         assert_eq!(
             got, PROTOCOL_HASH,
@@ -974,6 +1095,7 @@ mod tests {
         let welcome = ServerMsg::Welcome {
             wire_version: WIRE_VERSION,
             infos: vec![sample_info()],
+            stale_build: false,
         };
         write_frame(&mut buf, &hello).unwrap();
         write_frame(&mut buf, &welcome).unwrap();

@@ -79,7 +79,7 @@ impl Mirror {
             },
             // A reply belongs to whoever asked; the mirror holds no request state.
             ServerMsg::Reply { .. } => None,
-            ServerMsg::VersionMismatch { .. } => None,
+            ServerMsg::VersionMismatch { .. } | ServerMsg::Refused { .. } => None,
         }
     }
 

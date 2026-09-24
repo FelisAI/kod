@@ -2,16 +2,21 @@
 //!
 //! ## The retire hazard — and what does NOT protect you from it
 //!
-//! `attach_gate` is:
+//! Until wire 27, `attach_gate` was:
 //!
 //! ```text
 //! WireGate::Accept if rebuilt => AttachGate::Retire
 //! ```
 //!
-//! and the daemon's own test pins it: `attach_gate(7, 7, true) == Retire`.
-//! **A MATCHING wire version still retires the daemon if its binary was rebuilt
-//! since it launched** — and retiring means exit, taking every live agent
-//! session with it.
+//! **A MATCHING wire version retired the daemon if its binary was rebuilt since
+//! it launched** — and retiring means exit, taking every live agent session with
+//! it. That is how a read-only probe killed every session on 2026-09-23.
+//!
+//! A wire-27 daemon retires only when it holds NO live session, and never for a
+//! phone (`no_attach_ever_retires_a_daemon_with_a_live_session` pins it). The
+//! defences below stay: a daemon built before that change still behaves the old
+//! way, and nothing on this side can tell which one it is talking to until it
+//! has already attached.
 //!
 //! So linking `orchestrator_host::protocol::WIRE_VERSION` (which this crate does,
 //! and should) buys protection against a *different*, lesser hazard: announcing a
@@ -41,7 +46,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use orchestrator_host::protocol::{ClientRole, 
-    read_frame, write_frame, ClientMsg, Command, ServerMsg, WIRE_VERSION,
+    read_frame, write_frame, AttachRefusal, ClientMsg, Command, ServerMsg, WIRE_VERSION,
 };
 
 /// A live attachment to a daemon.
@@ -58,6 +63,9 @@ pub enum AttachError {
     /// The daemon speaks a different wire. Retrying cannot help, and hammering
     /// it is how you turn one bad attach into a retire loop.
     VersionMismatch { ours: u32, daemon: u32 },
+    /// The daemon turned the attach away and said why (wire ≥ 27). Never
+    /// retried, for the same reason as a mismatch.
+    Refused { daemon: u32, reason: AttachRefusal },
     /// The daemon's first frame was not `Welcome`.
     Unexpected(String),
 }
@@ -71,6 +79,7 @@ impl std::fmt::Display for AttachError {
                 "wire mismatch: bridge speaks {ours}, daemon speaks {daemon} — \
                  rebuild both from the same tree"
             ),
+            Self::Refused { daemon, reason } => f.write_str(&reason.describe(*daemon)),
             Self::Unexpected(s) => write!(f, "unexpected first frame: {s}"),
         }
     }
@@ -116,6 +125,10 @@ impl Client {
             ServerMsg::VersionMismatch { daemon_version } => Err(AttachError::VersionMismatch {
                 ours: WIRE_VERSION,
                 daemon: daemon_version,
+            }),
+            ServerMsg::Refused { daemon_version, reason } => Err(AttachError::Refused {
+                daemon: daemon_version,
+                reason,
             }),
             other => Err(AttachError::Unexpected(format!("{other:?}"))),
         }

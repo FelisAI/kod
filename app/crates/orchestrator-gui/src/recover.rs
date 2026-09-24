@@ -213,6 +213,13 @@ impl Orchestrator {
     /// that is ALSO alive in the same snapshot is a resumed session's dead
     /// ghost — closing it would zero the LIVE row (adversarial review), skip.
     pub(crate) fn observe_clean_exits(&mut self, infos: &[SessionInfo]) {
+        // The daemon died under these sessions (its client marks them all dead
+        // at once). None was watched exiting, so none may be closed as a clean
+        // exit: the rows stay open and the next launch offers every one of them
+        // for restore, exactly as a crash does.
+        if self.host.daemon_lost() {
+            return;
+        }
         let now_alive: std::collections::HashSet<String> = infos
             .iter()
             .filter(|i| i.alive)
