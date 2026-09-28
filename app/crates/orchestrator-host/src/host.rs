@@ -915,6 +915,13 @@ pub trait SessionBackend: Send + Sync {
     /// over the wire; the in-process `SessionHost` caches it. The daemon is
     /// storage-free, so the GUI is the source of truth and re-pushes on attach.
     fn set_auto_continue(&self, _on: bool, _fire_on_reset: bool) {}
+    /// One auto-continue sweep (`SessionHost::auto_continue_tick`). DEFAULTED to a
+    /// no-op for the same reason as `poll_transcript_limits`: the daemon's 1s
+    /// sweep drives its own host, so only an in-process `SessionHost` needs the
+    /// GUI to drive it. Before this existed nothing did — a GUI that fell back to
+    /// hosting sessions itself (a stale daemon binary is enough) cached the flag
+    /// and never armed a single session (2026-09-26).
+    fn auto_continue_tick(&self) {}
     /// Configure the mobile bridge and report what it did (docs/020 mobile).
     /// DEFAULTED to `unavailable` — and `SessionHost` deliberately does NOT
     /// override it. The bridge is an ordinary daemon CLIENT: it already depends on
@@ -1025,6 +1032,9 @@ impl SessionBackend for SessionHost {
     }
     fn set_auto_continue(&self, on: bool, fire_on_reset: bool) {
         SessionHost::set_auto_continue(self, on, fire_on_reset)
+    }
+    fn auto_continue_tick(&self) {
+        SessionHost::auto_continue_tick(self)
     }
 }
 
@@ -1153,6 +1163,110 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&acct);
         let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// 2026-09-26, both halves of "the limit reset and nothing continued".
+    ///
+    /// The GUI was hosting its sessions IN-PROCESS (its daemon binary was
+    /// stale), and only the daemon's own sweep ever ran auto-continue — so not
+    /// one session armed. Here every call goes through `SessionBackend`, the way
+    /// the GUI reaches an in-process host.
+    ///
+    /// And codex reset the account days before the weekly reset the sessions
+    /// were armed on. The rollout says 100% until 2100; the account read — which
+    /// a stand-in app-server holds back until the session has armed — says the
+    /// account can run. That read IS the reset: it fires now, not in 2100.
+    #[test]
+    fn an_in_process_host_auto_continues_a_codex_session_the_moment_its_account_lifts() {
+        use crate::events::SessionEventKind;
+        let acct = tmp_account("codex-lift");
+        let day = acct.join("sessions/2026/09/26");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout_id = "01a0beef-0000-7000-8000-0000000011f7";
+        std::fs::write(
+            day.join(format!("rollout-2026-09-26T09-00-00-{rollout_id}.jsonl")),
+            concat!(
+                r#"{"timestamp":"2026-09-26T16:00:00.000Z","type":"event_msg","payload":{"type":"token_count","#,
+                r#""rate_limits":{"primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":4102444800}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let recorded = std::fs::read_to_string(format!(
+            "{}/../../fixtures/codex/0.155.1/app-server/rate_limits_member_allowed.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let one_line =
+            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&recorded).unwrap()).unwrap();
+        let go = acct.join("go");
+        let fake = acct.join("fake-codex");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 3\n\
+                 read l\necho '{{\"id\":1,\"result\":{{}}}}'\nread l\nread l\n\
+                 while [ ! -e '{}' ]; do sleep 0.02; done\ncat <<'JSON'\n{one_line}\nJSON\nread l\n",
+                go.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let host = SessionHost::new();
+        *host.codex_program.lock().unwrap() = fake.to_string_lossy().into_owned();
+        let backend: &dyn SessionBackend = &*host;
+        backend.set_auto_continue(true, true);
+        let mut spec = SpawnSpec::program("cat", std::env::temp_dir());
+        spec.env.push(("CODEX_HOME".to_string(), acct.to_string_lossy().into_owned()));
+        let id = host.spawn("proj", CliKind::Codex, spec).unwrap();
+        host.set_cli_session_id(id, rollout_id.to_string());
+        let session = host.get(id).unwrap();
+        let notices = || -> Vec<String> {
+            session
+                .events()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    SessionEventKind::Notice { text } => Some(text),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        backend.poll_transcript_limits();
+        assert!(session.usage_limit().is_some_and(|u| u.hit), "the rollout's 100% is read first");
+        backend.auto_continue_tick();
+        assert!(
+            notices().iter().any(|t| t.starts_with("auto-continue: armed")),
+            "the in-process host must arm: {:?}",
+            notices()
+        );
+
+        std::fs::write(&go, "").unwrap();
+        assert!(
+            wait_until(|| session.usage_limit().is_some_and(|u| !u.hit), 5000),
+            "the account read lands: {:?}",
+            session.usage_limit()
+        );
+        backend.auto_continue_tick();
+        assert!(
+            notices().iter().any(|t| t == "auto-continued at reset — sent \"continue\""),
+            "a lifted account fires long before the armed reset: {:?}",
+            notices()
+        );
+        assert!(
+            wait_until(
+                || session.snapshot().rows.iter().any(|r| {
+                    r.iter().map(|run| run.text.as_str()).collect::<String>().contains("continue")
+                }),
+                2000
+            ),
+            "and it really typed into the session"
+        );
+
+        session.terminate();
+        let _ = std::fs::remove_dir_all(&acct);
     }
 
     fn tmp_account(tag: &str) -> std::path::PathBuf {

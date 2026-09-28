@@ -288,6 +288,14 @@ pub struct AcInputs {
     /// the block has ENDED (`limit_cleared`: nothing stored, or no longer a hit) — the genuine reset
     /// edge we FIRE on (distinct from merely reaching the estimated clock).
     pub cleared: bool,
+    /// a LIVE source said the block is over AFTER we armed: codex's account read
+    /// came back with the backend letting the account run again. The one clear
+    /// that needs no clock. A window can reset EARLY (2026-09-26: both codex
+    /// accounts went back to 0% three days before the weekly reset they were
+    /// armed on), and waiting for the armed instant would leave every session
+    /// sitting idle until then. Transcript sources never set this — they can't
+    /// retract a limit, so for them the clock stays the edge.
+    pub lifted: bool,
     /// the CLI is actively working (OSC progress or an outstanding decision).
     pub busy: bool,
     /// the session produced output within the working window (~2s).
@@ -421,10 +429,12 @@ pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
     // 6. FIRE: the reset instant has arrived AND either the banner actually
     //    CLEARED or the `fire_on_reset` config is on (default OFF — the cleared
     //    edge is unreachable for an idle blocked session, so the clock is the only
-    //    signal that ever fires); the session is quiet (not busy, not mid-output,
-    //    no open dialog); the composer is EMPTY (#1/#6 — never type over a half line).
-    if now >= reset_ms
-        && (i.cleared || i.fire_on_reset)
+    //    signal that ever fires) — OR a live source confirmed the block LIFTED,
+    //    which needs no clock (an early reset); the session is quiet (not busy,
+    //    not mid-output, no open dialog); the composer is EMPTY (#1/#6 — never
+    //    type over a half line).
+    let due = now >= reset_ms && (i.cleared || i.fire_on_reset);
+    if (due || i.lifted)
         && !i.busy
         && !i.recently_working
         && !i.has_dialog
@@ -1005,6 +1015,10 @@ impl HostedSession {
         let ul = g.usage_limit.as_ref();
         let hit = ul.map(|u| u.hit).unwrap_or(false);
         let cleared = limit_cleared(ul);
+        // Only a reading a live source CONFIRMED after the arm: the arm itself
+        // stood on a hit, so a clear stamped later is the backend changing its
+        // mind, not a stale reading from before the block.
+        let lifted = ul.is_some_and(|u| !u.hit && u.confirmed_ms > g.ac_armed_at_ms);
         let reset_at = ul.and_then(|u| u.reset_at_unix);
         // A session AWAITING a decision (claude hook card / codex approval) must
         // NEVER be fired into even when grid_has_dialog can't corroborate it — fold
@@ -1022,6 +1036,7 @@ impl HostedSession {
             hit,
             reset_at,
             cleared,
+            lifted,
             busy,
             recently_working: recently,
             has_dialog,
@@ -2023,6 +2038,7 @@ mod tests {
             hit: true,
             reset_at: Some(R),
             cleared: false,
+            lifted: false,
             busy: false,
             recently_working: false,
             has_dialog: false,
@@ -2097,6 +2113,38 @@ mod tests {
     fn gate_no_fire_before_reset_instant() {
         // Armed + cleared + quiet, but the reset clock hasn't arrived yet.
         assert_eq!(ac_decide(&armed_ready(), R_MS - 1000), AcDecision::Skip);
+    }
+
+    /// 2026-09-26: codex reset both accounts to 0% on Saturday; the sessions
+    /// were armed on Tuesday's weekly reset. The account read saying so is the
+    /// reset — waiting three days for the clock would miss the whole point.
+    #[test]
+    fn gate_fires_before_the_reset_instant_when_a_live_read_says_it_lifted() {
+        let mut i = armed_ready();
+        i.lifted = true;
+        let three_days_early = R_MS - 3 * 24 * 3600 * 1000;
+        assert_eq!(ac_decide(&i, three_days_early), AcDecision::Fire);
+    }
+
+    #[test]
+    fn gate_an_early_lift_still_waits_for_a_quiet_session() {
+        // The lift skips only the CLOCK. Every reason not to type stands.
+        for block in [
+            |i: &mut AcInputs| i.busy = true,
+            |i: &mut AcInputs| i.recently_working = true,
+            |i: &mut AcInputs| i.has_dialog = true,
+            |i: &mut AcInputs| i.draft_settled = false,
+        ] {
+            let mut i = armed_ready();
+            i.lifted = true;
+            block(&mut i);
+            assert_eq!(ac_decide(&i, R_MS - 1000), AcDecision::Skip, "{i:?}");
+        }
+        // …and the user resuming by hand still disarms first.
+        let mut i = armed_ready();
+        i.lifted = true;
+        i.last_submit_ms = Some(i.armed_at_ms + 1);
+        assert_eq!(ac_decide(&i, R_MS - 1000), AcDecision::Disarm);
     }
 
     #[test]

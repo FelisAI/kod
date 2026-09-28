@@ -353,6 +353,10 @@ impl Orchestrator {
         // SessionHost polls in its 1s sweep) and the REAL poll in local/in-process
         // mode. Either way codex limits surface with no GUI-side driver.
         self.host.poll_transcript_limits();
+        // auto-continue — the same split, and it ran in NEITHER place in local
+        // mode: only the daemon's sweep called it, so a GUI hosting sessions
+        // itself never armed one (2026-09-26). A no-op through `RemoteHost`.
+        self.host.auto_continue_tick();
     }
 
     /// Follow a session whose CLI handle ROTATED, so the store keeps naming the
