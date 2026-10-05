@@ -552,6 +552,14 @@ pub(crate) fn run() {
                         palette: palette::PaletteState::default(),
                         palette_focus: cx.focus_handle(),
                         move_menu_open: false,
+                        handoff: None,
+                        // absent → ON (docs/028 §5), unlike the opt-in flags above.
+                        handoff_confirm: store
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.get_setting(handoff::CONFIRM_KEY))
+                            .is_none_or(|v| setting_flag(Some(v))),
+                        handoff_lineage: Default::default(),
                         rail_new: None,
                         rail_new_kind: RailNewKind::Project,
                         rail_new_err: None,
@@ -680,6 +688,27 @@ pub(crate) fn run() {
             .entity(cx)
             .expect("root view")
             .downgrade();
+        // ORCH_DEMO=handoff opens the "Continue in…" picker (docs/028) over a
+        // fresh session; ORCH_DEMO=handoff-run also picks its first codex row,
+        // driving the whole flow through the real code path. SANDBOX ONLY
+        // (scripts/dev-sandbox.sh): there codex has no login and the source is
+        // given no prompt, so nothing reaches a model.
+        // Retried on a timer: the window takes its slot, and the scan gives the
+        // projects their folders, a beat after boot.
+        if let Ok(demo) = std::env::var("ORCH_DEMO") {
+            if demo == "handoff" || demo == "handoff-run" {
+                let run = demo == "handoff-run";
+                cx.spawn(async move |cx| {
+                    for _ in 0..50 {
+                        Timer::after(std::time::Duration::from_millis(200)).await;
+                        if main_window.update(cx, |o, window, cx| o.demo_handoff(run, window, cx)).unwrap_or(false) {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
         // ORCH_DEMO=settings opens the Settings window at boot. It is the one
         // surface with no other headless route in: it lives in its own OS window
         // opened by ⌘, or a menu item, so screenshotting or eyeballing it

@@ -36,6 +36,7 @@ mod command_bar;
 mod context_menu;
 mod extract;
 mod features;
+mod handoff;
 mod ime;
 mod kickoff;
 #[cfg(target_os = "macos")]
@@ -462,6 +463,15 @@ struct Orchestrator {
     palette_focus: FocusHandle,
     /// the session move-to-project picker is open (stage subhead ⇄, #10).
     move_menu_open: bool,
+    /// the "Continue in…" picker (docs/028), while open.
+    handoff: Option<handoff::Picker>,
+    /// "Ask me before it continues": the handoff's receiver restates the work and
+    /// waits for a go-ahead (docs/028 §5). Cached from the `handoff_confirm`
+    /// setting; absent = on.
+    handoff_confirm: bool,
+    /// Where each handed-off session came from — its subhead's "↩ from" line —
+    /// keyed by the target's CLI id. Refreshed on the tick, like `sess_profiles`.
+    handoff_lineage: std::collections::HashMap<String, handoff::Lineage>,
     /// the rail's inline "name…" input (Some = typing), and WHICH of the two
     /// rows opened it (#29): a PROJECT gets its own directory under
     /// `projects_root` and is `path:`-keyed from birth; an IDEA stays path-less
@@ -1953,6 +1963,8 @@ impl Render for Orchestrator {
                         this.map_drop_deny.clear();
                         // (Esc-closes-Settings moved with the surface — the
                         // Settings window's own router owns it now, #54.)
+                    } else if this.handoff.is_some() {
+                        this.close_handoff(cx);
                     } else if this.spawn_menu_open {
                         this.spawn_menu_open = false;
                     } else if this.rail_new_menu_open {
@@ -2037,6 +2049,9 @@ impl Render for Orchestrator {
             .when_some(self.map_menu_layer(window.viewport_size(), cx), |c, m| {
                 c.child(m)
             })
+            // "Continue in…" (docs/028) — over any screen: it opens from a
+            // BLOCKED row on Standup and from a session's subhead.
+            .when_some(self.handoff_layer(cx), |c, l| c.child(l))
             .when(self.palette.open, |c| c.child(self.palette_layer(cx)))
     }
 }

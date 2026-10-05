@@ -32,6 +32,7 @@ use crate::memory_llm::parse_llm_memory_candidates;
 use crate::tree::{first_line, DiffOp, Kind, Lifecycle, Part, PartId, PartRef, StatusSource};
 
 mod brain;
+mod handoffs;
 mod memory_store;
 mod profiles;
 mod proposals;
@@ -278,6 +279,25 @@ pub struct ProfileRow {
     pub extra_args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
     pub color: Option<String>,
+}
+
+/// One session handoff (docs/028): source/target lineage plus the packet's
+/// on-disk directory. Read-side of the `handoff` table; `to_session` stays
+/// None until a codex target's minted id is discovered after spawn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandoffRow {
+    pub id: i64,
+    pub from_session: String,
+    pub from_kind: String,
+    pub from_profile_id: Option<i64>,
+    pub to_session: Option<String>,
+    pub to_kind: String,
+    pub to_profile_id: Option<i64>,
+    pub project_key: String,
+    pub cwd: String,
+    pub packet_dir: String,
+    pub reason: String,
+    pub created_secs: i64,
 }
 
 /// One session↔node link row (docs/019 slice 3): the whole session_part row the

@@ -286,6 +286,30 @@ impl Store {
             CREATE INDEX IF NOT EXISTS needs_you_proj ON needs_you(project_key);
             "#,
         )?;
+        self.conn.execute_batch(
+            r#"
+            -- docs/028: one row per session handoff ("Continue in…"). The source session is
+            -- closed by the handoff; the target is a fresh session whose first message points
+            -- at the packet in packet_dir. to_session stays NULL until a codex target's id is
+            -- discovered (codex mints it a few seconds after spawn).
+            CREATE TABLE IF NOT EXISTS handoff (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_session TEXT NOT NULL,        -- source cli_session_id
+                from_kind TEXT NOT NULL,           -- claude|codex
+                from_profile_id INTEGER,           -- NULL = the CLI's default account
+                to_session TEXT,
+                to_kind TEXT NOT NULL,
+                to_profile_id INTEGER,
+                project_key TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                packet_dir TEXT NOT NULL,
+                reason TEXT NOT NULL,              -- usage_limit|manual
+                created_secs INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS handoff_from ON handoff(from_session);
+            CREATE INDEX IF NOT EXISTS handoff_to ON handoff(to_session);
+            "#,
+        )?;
         // recall index (#10): one FTS5 table over nodes + notes + summaries,
         // rebuilt on demand (search_all) — trivial at this scale, zero triggers.
         self.conn.execute_batch(

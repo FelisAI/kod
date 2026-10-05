@@ -118,7 +118,51 @@ impl Orchestrator {
                             )
                         },
                     )
+                    // WHERE IT CAME FROM, for a session born of a handoff
+                    // (docs/028): the account it continued from, and a click
+                    // away from the packet it started on.
+                    .when_some(
+                        info.cli_session_id
+                            .as_deref()
+                            .and_then(|cid| self.handoff_lineage.get(cid))
+                            .cloned(),
+                        |row, lin| {
+                            let dir = lin.packet_dir.clone();
+                            row.child(
+                                div()
+                                    .id("sess-lineage")
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(MUTED2))
+                                    .hover(|h| h.text_color(rgb(ACCENT)))
+                                    .child(SharedString::from(format!("↩ from {}", lin.from)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                                        this.open_handoff_packet(&dir)
+                                    })),
+                            )
+                        },
+                    )
                     .child(div().flex_1())
+                    // ↪ continue this session's work under another account or
+                    // CLI (docs/028) — not only at a limit: a fresh context on
+                    // the same account is a handoff too.
+                    .when(matches!(info.kind, CliKind::Claude | CliKind::Codex), |row| {
+                        row.child(
+                            div()
+                                .id("sess-handoff")
+                                .px(px(8.))
+                                .py(px(3.))
+                                .rounded(px(7.))
+                                .cursor_pointer()
+                                .text_size(px(11.5))
+                                .text_color(rgb(MUTED2))
+                                .hover(|h| h.text_color(rgb(ACCENT)))
+                                .child("↪ continue in…")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.open_handoff(id, cx)
+                                })),
+                        )
+                    })
                     // ⇄ move this session to another project (dogfooding #10:
                     // work often outgrows the project it was spawned in).
                     .child({

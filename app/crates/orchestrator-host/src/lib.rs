@@ -12,6 +12,7 @@ pub mod decision;
 pub mod emulator;
 pub mod events;
 pub mod grid_view;
+pub mod handoff;
 pub mod hooks;
 pub mod host;
 pub mod ingress;
@@ -58,6 +59,10 @@ mod api_hygiene {
         assert_plain::<crate::codex_account::AccountLimits>();
         assert_plain::<crate::codex_account::LimitWindow>();
         assert_plain::<crate::codex_account::ReadError>();
+        assert_plain::<crate::handoff::PacketRequest>();
+        assert_plain::<crate::handoff::Packet>();
+        assert_plain::<crate::handoff::SessionLog>();
+        assert_plain::<crate::handoff::RepoSnapshot>();
     }
 }
 

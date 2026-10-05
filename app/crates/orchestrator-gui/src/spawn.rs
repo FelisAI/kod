@@ -280,7 +280,7 @@ impl Orchestrator {
                         self.term_error = None;
                         self.active_session.insert(slug.clone(), id);
                         self.term_focus.focus(window);
-                        self.record_codex_fresh(id, slug, cwd.clone(), pre, profile_id, codex_home);
+                        self.record_codex_fresh(id, slug, cwd.clone(), pre, profile_id, codex_home, None);
                     }
                     Err(e) => {
                         self.term_error = Some(format!("couldn't start {}: {e}", kind.label()))
@@ -596,8 +596,10 @@ impl Orchestrator {
 
     /// Codex mints its own uuidv7 id, so we can't pre-set it. Keep polling while
     /// the hosted process is alive, then do one final check on exit, so a rollout
-    /// that flushes after startup still gets a crash-recovery row.
-    fn record_codex_fresh(
+    /// that flushes after startup still gets a crash-recovery row. A session born
+    /// of a handoff (docs/028) also fills its lineage row's target once found.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_codex_fresh(
         &self,
         id: SessionId,
         slug: String,
@@ -605,6 +607,7 @@ impl Orchestrator {
         pre: std::collections::HashSet<String>,
         profile_id: Option<i64>,
         codex_home: Option<orchestrator_core::CliHome>,
+        handoff_id: Option<i64>,
     ) {
         Self::record_fresh_agent_session(
             id,
@@ -620,9 +623,11 @@ impl Orchestrator {
                 })
             },
             profile_id,
+            handoff_id,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_fresh_agent_session(
         id: SessionId,
         slug: String,
@@ -635,6 +640,7 @@ impl Orchestrator {
             + Send
             + 'static,
         profile_id: Option<i64>,
+        handoff_id: Option<i64>,
     ) {
         let since = orchestrator_core::registry::now_secs();
         std::thread::spawn(move || {
@@ -647,6 +653,9 @@ impl Orchestrator {
                     };
                     if let Ok(s) = store.lock() {
                         let _ = s.record_session(&cid, &slug, kind, &cwd.to_string_lossy(), profile_id);
+                        if let Some(h) = handoff_id {
+                            let _ = s.set_handoff_target(h, &cid);
+                        }
                     }
                     host.set_cli_session_id(id, cid);
                     true

@@ -670,6 +670,26 @@ impl Orchestrator {
                                         },
                                     )),
                                 )
+                                // …or don't wait at all: carry the work to an
+                                // account that can still run it (docs/028). A
+                                // credit cap never resets, so for it this is
+                                // the only way forward from this row.
+                                .child(
+                                    card_action(
+                                        SharedString::from(format!(
+                                            "blocked-handoff-{}",
+                                            info.id.0
+                                        )),
+                                        "Continue in…",
+                                        None,
+                                        false,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _, cx| {
+                                            this.open_handoff(jid, cx)
+                                        },
+                                    )),
+                                )
                                 .child(
                                 card_action(
                                     SharedString::from(format!("blocked-open-{}", info.id.0)),

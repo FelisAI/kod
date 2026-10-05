@@ -194,6 +194,15 @@ impl Orchestrator {
             if let Ok(ev) = store.latest_event_by_sess() {
                 self.latest_turn_at = ev.into_iter().collect();
             }
+            // docs/028: where each handed-off session came from, for its subhead.
+            self.handoff_lineage = store
+                .handoff_sources()
+                .into_iter()
+                .map(|(to, kind, label, packet_dir)| {
+                    let from = format!("{kind} · {}", label.unwrap_or_else(|| "default login".to_string()));
+                    (to, handoff::Lineage { from, packet_dir })
+                })
+                .collect();
         }
         // freshness gate: a summary is shown ONLY if it covers the session's
         // newest content. claude = durable TurnEnd clock; codex = rollout size
