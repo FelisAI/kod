@@ -61,11 +61,11 @@ struct ConnectionChip: View {
         } label: {
             HStack(spacing: 5) {
                 Circle()
-                    .fill(model.demoMode ? KodColor.accent : model.connection.tint)
+                    .fill(model.demoMode && !model.demoChromeHidden ? KodColor.accent : model.connection.tint)
                     .frame(width: 7, height: 7)
                 // Never "live" over sample data — that is the one word this chip
                 // must not say about something that is not your Mac.
-                Text(model.demoMode ? "sample" : model.connection.shortLabel)
+                Text(model.demoMode && !model.demoChromeHidden ? "sample" : model.connection.shortLabel)
                     .font(KodFont.pill)
                     .foregroundStyle(KodColor.muted)
             }

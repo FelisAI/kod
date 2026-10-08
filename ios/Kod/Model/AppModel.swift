@@ -256,6 +256,11 @@ final class AppModel {
     /// Internal, not fileprivate, because the views must say so on screen; a demo
     /// that does not announce itself is a lie.
     private(set) var demoMode = false
+    /// Hides the "sample data" banner and chip. Set ONLY by the DEBUG launch
+    /// argument `-kod-screenshots`, for App Store screenshots of the app as a
+    /// paired phone shows it; a shipped build never sets it, so the sample data a
+    /// user can reach always says what it is.
+    private(set) var demoChromeHidden = false
     /// The sample sessions' rev counter, so a demo session can change state
     /// through the same `SessionStore.apply` a bridge frame goes through.
     private var demoRev: UInt64 = 0
@@ -293,6 +298,7 @@ final class AppModel {
         let args = CommandLine.arguments
         guard args.contains("-kod-demo") else { return }
         enterDemo(args.contains("-kod-quiet") ? Fixtures.allQuiet : Fixtures.everyTier)
+        demoChromeHidden = args.contains("-kod-screenshots")
         if let i = args.firstIndex(of: "-kod-tab"), i + 1 < args.count {
             switch args[i + 1] {
             case "projects": tab = .projects

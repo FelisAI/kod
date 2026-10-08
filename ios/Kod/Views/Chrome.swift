@@ -33,7 +33,7 @@ struct DemoBanner: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        if model.demoMode {
+        if model.demoMode && !model.demoChromeHidden {
             HStack(spacing: 8) {
                 Image(systemName: "sparkles")
                     .font(.system(size: 11, weight: .semibold))
