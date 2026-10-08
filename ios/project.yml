@@ -51,7 +51,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         # Still required for a LAN address on iOS 14+, TLS or no TLS: this prompt
         # is about who the phone may TALK TO, not about how the bytes are wrapped.
-        NSLocalNetworkUsageDescription: Kod connects to the bridge running on your Mac.
+        NSLocalNetworkUsageDescription: Kod connects to Kod on your Mac over your Wi-Fi network, to show your sessions and send what you type.
         # Required, not optional: calling AVCaptureDevice.requestAccess without this
         # key does not fail — it kills the app on the spot.
         NSCameraUsageDescription: Kod uses the camera only to scan the pairing code shown on your Mac. Nothing is photographed, saved or sent anywhere.
