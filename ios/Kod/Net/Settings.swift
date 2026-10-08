@@ -85,11 +85,32 @@ struct BridgeSettings: Equatable {
 
     /// Whether an address is on this device. Loopback is the ONLY place plaintext
     /// is acceptable, because nothing leaves the machine.
+    ///
+    /// EXACT, not a prefix test. It used to accept anything starting "127.",
+    /// which waved through "127.0.0.1@192.168.1.20" — a URL whose host is the LAN
+    /// address, "127.0.0.1" being mere userinfo — and "127.example.com", which
+    /// resolves wherever its owner likes. Both would have been dialled in the
+    /// clear, bearer token and all. So: a well-formed 127/8 IPv4 literal, ::1, or
+    /// localhost, and nothing that merely starts like one.
     static func isLoopback(_ host: String) -> Bool {
         let h = host.trimmingCharacters(in: .whitespaces)
             .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
             .lowercased()
-        return h == "127.0.0.1" || h == "::1" || h == "localhost" || h.hasPrefix("127.")
+        if h == "::1" || h == "localhost" { return true }
+        let octets = h.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4,
+              octets.allSatisfy({ !$0.isEmpty && $0.count <= 3 && $0.allSatisfy(\.isASCII) && $0.allSatisfy(\.isNumber) }),
+              let first = UInt8(octets[0]), first == 127
+        else { return false }
+        return octets.allSatisfy { UInt8($0) != nil }
+    }
+
+    /// Whether `host` is an address and nothing more. A host carrying userinfo,
+    /// a path, a query or a fragment would put the connection somewhere other
+    /// than the address every check in this file inspected, so it is refused
+    /// outright rather than parsed around.
+    static func isBareHost(_ host: String) -> Bool {
+        !host.isEmpty && !host.contains { "@/?#\\ \t\r\n".contains($0) }
     }
 
     var isLoopback: Bool { BridgeSettings.isLoopback(host) }
@@ -140,6 +161,7 @@ struct BridgeSettings: Equatable {
     /// Configured enough to be worth dialling AND safe to dial.
     var isUsable: Bool {
         !allHosts.isEmpty
+            && allHosts.allSatisfy { url(for: $0) != nil }
             && port > 0 && port <= 65_535
             && !token.isEmpty
             && !insecureBeyondThisDevice
@@ -215,9 +237,11 @@ struct BridgeSettings: Equatable {
             h = String(h.dropFirst(prefix.count))
         }
         while h.hasSuffix("/") { h = String(h.dropLast()) }
+        // Anything but a bare address is refused here, at the one door every
+        // dial goes through — see `isBareHost`.
+        guard Self.isBareHost(h) else { return nil }
         // A bare IPv6 literal needs brackets before it can go in a URL.
         if h.filter({ $0 == ":" }).count > 1, !h.hasPrefix("[") { h = "[\(h)]" }
-        guard !h.isEmpty else { return nil }
         // The scheme follows the pin, not the host: the Mac refuses to bind
         // anything but loopback without TLS, so a pinned setting that dialled
         // ws:// would be talking to a listener that is not there.

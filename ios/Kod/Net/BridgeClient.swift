@@ -93,6 +93,8 @@ final class BridgeClient {
     /// True from `start` until the loop actually exits — NOT `loop != nil`, which
     /// stays true after the loop returns on a terminal unauthorized.
     private var running = false
+    /// Which `start` the current loop belongs to.
+    private var generation = 0
     private var socket: URLSessionWebSocketTask?
     /// True only between `hello_ok` and the end of that same connection. `socket`
     /// alone is not enough: it is set the instant the task is created, and a frame
@@ -158,9 +160,15 @@ final class BridgeClient {
         guard !s.insecureBeyondThisDevice else { onState(.insecure); return }
         guard s.isUsable else { onState(.unconfigured); return }
         running = true
+        generation += 1
+        let mine = generation
         loop = Task { [weak self] in
             await self?.run(s)
-            self?.running = false
+            // A loop replaced by a later `start` unwinds after its successor is
+            // already running; clearing the flag then would make the next
+            // foreground `startIfNeeded` re-dial a healthy link.
+            guard let self, generation == mine else { return }
+            running = false
         }
     }
 
@@ -213,13 +221,43 @@ final class BridgeClient {
 
     // MARK: - The loop
 
+    // Every callback below goes through one of these. A loop that has been
+    // cancelled — by `stop()`, or by a `start()` that replaced it — must fall
+    // silent at once. Its socket is cancelled under it, and that surfaces as an
+    // ordinary URL error rather than a CancellationError, so without this the
+    // dead loop went on to report "can't reach <the OLD address> — cancelled"
+    // over the new loop's state, and fired a disconnect that flushed whatever
+    // the screen had moved on to (the sample data, or the next connection's
+    // sessions). `Task.isCancelled` is the loop's own task: these are only ever
+    // called synchronously from inside it.
+
+    private func report(_ state: ConnectionState) {
+        guard !Task.isCancelled else { return }
+        onState(state)
+    }
+
+    private func deliver(_ msg: ServerMessage) {
+        guard !Task.isCancelled else { return }
+        onMessage(msg)
+    }
+
+    private func answer(_ result: InputResult) {
+        guard !Task.isCancelled else { return }
+        onInputResult(result)
+    }
+
+    private func dropped() {
+        guard !Task.isCancelled else { return }
+        onDisconnect()
+    }
+
     private func run(_ s: BridgeSettings) async {
         // One Mac, possibly several addresses (`BridgeSettings.altHosts`). They
         // are alternates, not peers: the same key is pinned for all of them, so
         // dialling one this phone is not on costs a failed connect and nothing
         // else.
         let hosts = s.allHosts
-        guard !hosts.isEmpty else { onState(.unconfigured); return }
+        guard !hosts.isEmpty else { report(.unconfigured); return }
 
         var attempt = 0
         var reason = "connection lost"
@@ -253,9 +291,12 @@ final class BridgeClient {
                     // and read the token, so the Mac WAS found. Nothing about
                     // retrying makes a bad token good, and trying the next
                     // address would only present the same bad credential twice.
-                    onState(.unauthorized(msg.isEmpty ? "token rejected" : msg))
+                    report(.unauthorized(msg.isEmpty ? "token rejected" : msg))
                     return
                 } catch {
+                    // Cancelled from outside: this error is the cancellation's
+                    // echo, not news about the Mac. See `report`.
+                    if Task.isCancelled { return }
                     // A refused pin arrives here as NSURLErrorCancelled — the
                     // challenge WAS cancelled, by us — which renders as
                     // "cancelled" and reads like the user backgrounded the app. A
@@ -263,7 +304,7 @@ final class BridgeClient {
                     // delegate's own words win over whatever URLSession called the
                     // resulting failure.
                     reason = pinning?.refusal ?? Self.describe(error, host: host)
-                    onState(.failed(endpoint: endpoint, reason: reason))
+                    report(.failed(endpoint: endpoint, reason: reason))
                 }
                 guard established else { continue }
                 // This address answered, so it is the one to start from next
@@ -273,7 +314,7 @@ final class BridgeClient {
                 // Only a link that EXISTED can drop. Firing this for a dial that
                 // was never answered flushed the cache and told the composer its
                 // text "may not have arrived" about a socket that never opened.
-                onDisconnect()
+                dropped()
                 // A connection that held for a while was healthy; the next drop
                 // should retry fast rather than inherit the long tail of an old
                 // outage.
@@ -285,7 +326,7 @@ final class BridgeClient {
             let wait = Self.backoff[min(attempt, Self.backoff.count - 1)]
             attempt += 1
             for remaining in stride(from: wait, through: 1, by: -1) {
-                onState(.reconnecting(seconds: remaining, reason: reason, endpoint: lastEndpoint))
+                report(.reconnecting(seconds: remaining, reason: reason, endpoint: lastEndpoint))
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
             }
@@ -302,22 +343,29 @@ final class BridgeClient {
         if let want = s.fingerprint, !want.isEmpty, KeyPin.decode(fingerprint: want) == nil {
             throw BridgeError.badPin
         }
-        onState(.connecting(endpoint))
+        report(.connecting(endpoint))
 
         let transport = session(for: s)
         // Clear any refusal left by the previous attempt, so the reason reported
         // for THIS failure is this attempt's.
         pinning?.arm()
         let ws = transport.webSocketTask(with: url)
-        // The cap is the contract's, and URLSession enforces it in the framing
-        // layer — before any of this code sees a byte.
-        ws.maximumMessageSize = kMaxFrameBytes
+        // Enforced by URLSession in the framing layer, before any of this code
+        // sees a byte. The RECEIVE cap — see `kMaxReceiveBytes` for why it is not
+        // the 64 KiB the bridge holds phones to.
+        ws.maximumMessageSize = kMaxReceiveBytes
         socket = ws
         ws.resume()
         defer {
             ws.cancel(with: .goingAway, reason: nil)
-            ready = false
-            if socket === ws { socket = nil }
+            // Only if the client still belongs to THIS socket. A loop that was
+            // replaced unwinds after its successor may already be up, and
+            // clearing `ready` unconditionally made the new, healthy link refuse
+            // every send with "not connected to your Mac".
+            if socket === ws {
+                socket = nil
+                ready = false
+            }
         }
 
         // UNDER A DEADLINE, like every read in this file. The header used to
@@ -333,11 +381,11 @@ final class BridgeClient {
 
         switch try Wire.parse(frame: try await receive(ws, timeout: Self.helloTimeout)) {
         case .helloOk(let proto, let epoch, let serverTime, let input, let grid):
-            onMessage(.helloOk(proto: proto, epoch: epoch, serverTime: serverTime,
-                               inputAllowed: input, gridAllowed: grid))
+            deliver(.helloOk(proto: proto, epoch: epoch, serverTime: serverTime,
+                             inputAllowed: input, gridAllowed: grid))
             ready = true
             established = true
-            onState(.connected(endpoint))
+            report(.connected(endpoint))
         case .helloErr(let code, let message):
             if code == "unauthorized" { throw BridgeError.unauthorized(message) }
             throw BridgeError.handshake(message.isEmpty ? code : "\(code): \(message)")
@@ -359,14 +407,14 @@ final class BridgeClient {
             let frame = try await receive(ws, timeout: Self.idleTimeout)
             // Checked before parsing, because this answer belongs to the sender
             // and not to the session cache.
-            if let answer = Wire.inputResult(frame: frame) {
-                onInputResult(answer)
+            if let result = Wire.inputResult(frame: frame) {
+                answer(result)
                 continue
             }
             do {
                 let msg = try Wire.parse(frame: frame)
                 if case .ignored = msg { continue }  // unknown "t": drop it, stay connected
-                onMessage(msg)
+                deliver(msg)
             } catch {
                 // A frame we cannot read is not a reason to tear down a link that is
                 // otherwise delivering. Oversize is the exception: it means the two
@@ -376,12 +424,28 @@ final class BridgeClient {
         }
     }
 
+    // THE DEADLINES CANCEL THE SOCKET, not just a task.
+    //
+    // `URLSessionWebSocketTask.send`/`receive` are bridged completion handlers:
+    // they do not listen for task cancellation. A task group cannot return until
+    // every child has, so when the timer won the race the group sat waiting on a
+    // receive that a half-open socket would never complete — the 45-second idle
+    // deadline this file is built around never fired, and the screen said "live"
+    // over a dead link until URLSession gave up on its own, minutes later. The
+    // cancellation handler below is what makes the losing socket call return.
+
     /// `send()` with a deadline — see the call site for why the WRITE needs one.
     private func sendWithDeadline(_ text: String,
                                   on ws: URLSessionWebSocketTask,
                                   timeout: TimeInterval) async throws {
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await ws.send(.string(text)) }
+            group.addTask {
+                try await withTaskCancellationHandler {
+                    try await ws.send(.string(text))
+                } onCancel: {
+                    ws.cancel(with: .goingAway, reason: nil)
+                }
+            }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 throw BridgeError.timeout
@@ -391,15 +455,20 @@ final class BridgeClient {
         }
     }
 
-    /// `receive()` with a deadline. The loser of the race is abandoned; the socket
-    /// is torn down by `connectOnce`'s defer either way, so no receive outlives it.
+    /// `receive()` with a deadline. If the timer wins, the group's cancellation
+    /// reaches the receive's handler, which cancels the socket so the receive
+    /// returns and the timeout can be reported.
     private func receive(_ ws: URLSessionWebSocketTask, timeout: TimeInterval) async throws -> String {
         try await withThrowingTaskGroup(of: String.self) { group in
             group.addTask {
-                switch try await ws.receive() {
-                case .string(let s): return s
-                case .data(let d): return String(decoding: d, as: UTF8.self)
-                @unknown default: return ""
+                try await withTaskCancellationHandler {
+                    switch try await ws.receive() {
+                    case .string(let s): return s
+                    case .data(let d): return String(decoding: d, as: UTF8.self)
+                    @unknown default: return ""
+                    }
+                } onCancel: {
+                    ws.cancel(with: .goingAway, reason: nil)
                 }
             }
             group.addTask {

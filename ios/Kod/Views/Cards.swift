@@ -55,7 +55,7 @@ struct AttentionCard: View {
                     }
 
                     if let trouble = session.trouble {
-                        Text(trouble)
+                        Text(TroubleLine.text(trouble))
                             .font(KodFont.meta)
                             .foregroundStyle(KodColor.red)
                             .lineLimit(2)
@@ -108,5 +108,23 @@ enum LimitLine {
         if let p = s.limitPercent { parts.append("\(p)%") }
         if let r = s.limitReset { parts.append("resets \(r)") }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// `trouble` as a sentence.
+///
+/// The bridge sends a SLUG (`trouble_slug` in wire.rs) — an identifier for the
+/// phone to word, not a word. It used to be printed as-is, so the one red line on
+/// a card read "rate_limit". The Mac only raises these while the session is still
+/// working, which is why each says the agent is retrying rather than stopped.
+enum TroubleLine {
+    static func text(_ slug: String) -> String {
+        switch slug {
+        case "rate_limit": return "hit a rate limit — retrying"
+        case "overloaded": return "the API is overloaded — retrying"
+        case "api_error": return "the API returned an error — retrying"
+        // A slug from a newer Mac: still legible, never an empty red line.
+        default: return slug.replacingOccurrences(of: "_", with: " ")
+        }
     }
 }

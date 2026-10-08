@@ -246,4 +246,32 @@ final class PlanTests: XCTestCase {
         let once = BridgeSettings(host: " h ", port: 1, token: " t ").normalized()
         XCTAssertEqual(once, once.normalized())
     }
+
+    // MARK: - Colour and words
+
+    /// The dot colours are the desktop's (`theme::phase_color`), and they agree
+    /// with this app's own project rows. They used to be green for working and
+    /// grey for idle: a card read "● 2" in orange for two working sessions, then
+    /// listed those same two sessions under green dots.
+    func testPhaseDotsUseTheMacsColours() {
+        XCTAssertEqual(KodColor.phase(.busy), KodColor.orange)
+        XCTAssertEqual(KodColor.phase(.idle), KodColor.green)
+        XCTAssertEqual(KodColor.phase(.awaiting), KodColor.amber)
+        XCTAssertEqual(KodColor.phase(.dead), KodColor.red)
+
+        let g = ProjectsPlan(sessions: [s(1, "p", phase: .busy), s(2, "p", phase: .idle)]).active.first!
+        XCTAssertEqual(g.liveMix.map(\.tint), [KodColor.phase(.idle), KodColor.phase(.busy)],
+                       "a project row and its session dots say the same thing")
+    }
+
+    /// `trouble` arrives as a slug; it used to be printed as one ("rate_limit").
+    func testTroubleIsWorded() {
+        for slug in ["rate_limit", "overloaded", "api_error"] {
+            let words = TroubleLine.text(slug)
+            XCTAssertFalse(words.contains("_"), words)
+            XCTAssertNotEqual(words, slug)
+        }
+        XCTAssertEqual(TroubleLine.text("token_expired"), "token expired",
+                       "a slug from a newer Mac is still legible")
+    }
 }

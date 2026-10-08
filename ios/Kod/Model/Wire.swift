@@ -14,8 +14,19 @@
 
 import Foundation
 
-/// Largest frame the phone will look at. Bigger than this is a desync, not a message.
+/// Largest frame the phone will SEND — the bridge's `MAX_FRAME`, which it
+/// enforces on what phones send it, before parsing.
 let kMaxFrameBytes = 65_536
+
+/// Largest frame the phone will RECEIVE. Much larger than `kMaxFrameBytes`, on
+/// purpose: the bridge's cap is on what phones send, and nothing caps what it
+/// sends back. A `sessions` snapshot carries every live session's whole
+/// `last_message` — claude's final message of a turn, uncapped — so a Mac
+/// running fifteen agents routinely passes 64 KiB. Holding inbound frames to the
+/// outbound cap made such a phone receive the snapshot, call it a desync, drop
+/// the link and redial into the same snapshot, forever. The cap still exists so a
+/// broken peer cannot hand the decoder an unbounded allocation.
+let kMaxReceiveBytes = 16 * 1_024 * 1_024
 
 /// Protocol version this client speaks. 2, not 1: a bridge that accepts typing
 /// turns a proto-1 phone away at hello rather than advertise a composer whose
@@ -74,6 +85,33 @@ enum PhoneKey: String, CaseIterable {
         case .ctrl_r: return "search"
         case .ctrl_l: return "clear"
         case .ctrl_u: return "clear line"
+        }
+    }
+
+    /// What VoiceOver says. The raw value ("ctrl_c") is a protocol spelling and
+    /// the label ("↑", "^D") is a glyph; neither is a name for a key.
+    var spoken: String {
+        switch self {
+        case .enter: return "Enter"
+        case .escape: return "Escape"
+        case .up: return "Up arrow"
+        case .down: return "Down arrow"
+        case .left: return "Left arrow"
+        case .right: return "Right arrow"
+        case .tab: return "Tab"
+        case .backtab: return "Shift-Tab"
+        case .home: return "Home"
+        case .end: return "End"
+        case .backspace: return "Backspace"
+        case .delete: return "Delete"
+        case .pageup: return "Page up"
+        case .pagedown: return "Page down"
+        case .ctrl_c: return "Stop, Control-C"
+        case .ctrl_d: return "Control-D"
+        case .ctrl_z: return "Control-Z"
+        case .ctrl_r: return "Search history, Control-R"
+        case .ctrl_l: return "Clear screen, Control-L"
+        case .ctrl_u: return "Clear line, Control-U"
         }
     }
 }
@@ -245,6 +283,15 @@ enum ClientMessage {
     /// Exactly one session at a time — a second watch replaces the first.
     case watch(sid: UInt64, on: Bool)
 
+    /// The session and request id of a message the Mac will answer with an
+    /// `input_result` — nil for the ones it never answers.
+    var request: (sid: UInt64, rid: UInt64)? {
+        switch self {
+        case .input(let sid, _, let rid), .key(let sid, _, let rid): return (sid, rid)
+        case .hello, .ping, .watch: return nil
+        }
+    }
+
     var json: String {
         switch self {
         case .hello(let token):
@@ -299,9 +346,9 @@ enum Wire {
     }
 
     static func parse(data: Data) throws -> ServerMessage {
-        // BEFORE parsing, per the contract: a 4 MB frame must not become a 4 MB
-        // allocation in the JSON decoder just to be rejected afterwards.
-        guard data.count <= kMaxFrameBytes else { throw WireError.frameTooLarge(data.count) }
+        // BEFORE parsing: an oversized frame must not become an equally
+        // oversized allocation in the JSON decoder just to be rejected afterwards.
+        guard data.count <= kMaxReceiveBytes else { throw WireError.frameTooLarge(data.count) }
         let d = JSONDecoder()
         guard let head = try? d.decode(TypeOnly.self, from: data) else { throw WireError.missingType }
 
@@ -360,7 +407,7 @@ enum Wire {
     /// as the desync it is, so this cannot become a way around the limit.
     static func inputResult(frame: String) -> InputResult? {
         let data = Data(frame.utf8)
-        guard data.count <= kMaxFrameBytes else { return nil }
+        guard data.count <= kMaxReceiveBytes else { return nil }
         let d = JSONDecoder()
         // The type is checked FIRST: `gone` also carries a `sid`, and would
         // otherwise decode cleanly into the shape below and be answered as if the

@@ -64,9 +64,9 @@ final class WireTests: XCTestCase {
 
     func testFrameLimitRejectedBeforeParsing() {
         // Valid JSON, one byte too big: it must fail on SIZE, not on content.
-        let filler = String(repeating: "x", count: kMaxFrameBytes)
+        let filler = String(repeating: "x", count: kMaxReceiveBytes)
         let frame = #"{"t":"err","code":"x","message":"\#(filler)"}"#
-        XCTAssertGreaterThan(frame.utf8.count, kMaxFrameBytes)
+        XCTAssertGreaterThan(frame.utf8.count, kMaxReceiveBytes)
         XCTAssertThrowsError(try Wire.parse(frame: frame)) { error in
             guard case WireError.frameTooLarge = error else {
                 return XCTFail("expected frameTooLarge, got \(error)")
@@ -76,10 +76,26 @@ final class WireTests: XCTestCase {
 
     func testFrameAtExactlyTheLimitIsAccepted() throws {
         let overhead = #"{"t":"err","code":"x","message":""}"#.utf8.count
-        let filler = String(repeating: "x", count: kMaxFrameBytes - overhead)
+        let filler = String(repeating: "x", count: kMaxReceiveBytes - overhead)
         let frame = #"{"t":"err","code":"x","message":"\#(filler)"}"#
-        XCTAssertEqual(frame.utf8.count, kMaxFrameBytes)
+        XCTAssertEqual(frame.utf8.count, kMaxReceiveBytes)
         XCTAssertEqual(try Wire.parse(frame: frame), .err(code: "x", message: filler))
+    }
+
+    /// THE REGRESSION: the 64 KiB cap is on what the phone SENDS. A busy Mac's
+    /// snapshot — fifteen sessions, each carrying claude's whole final message —
+    /// is bigger than that, and was treated as a desync: drop, redial, receive the
+    /// same snapshot, drop, forever.
+    func testASnapshotBiggerThanTheSendCapStillParses() throws {
+        let long = String(repeating: "All 48 tests pass. ", count: 300)   // ~5.7 KB each
+        let one = #"{"sid":%d,"cli":"claude","project":"p","title":"t","phase":"idle","phase_since":1,"alive":true,"last_message":"\#(long)","pending_headline":null,"trouble":null,"limit_hit":false}"#
+        let sessions = (1...20).map { String(format: one, $0) }.joined(separator: ",")
+        let frame = #"{"t":"sessions","epoch":"e1","sessions":[\#(sessions)]}"#
+        XCTAssertGreaterThan(frame.utf8.count, kMaxFrameBytes, "precondition: over the old cap")
+        guard case .sessions(_, let list) = try Wire.parse(frame: frame) else {
+            return XCTFail("expected sessions")
+        }
+        XCTAssertEqual(list.count, 20)
     }
 
     func testUnknownEnumValuesDegradeInsteadOfThrowing() throws {
@@ -497,11 +513,73 @@ final class ComposerTests: XCTestCase {
     }
 
     /// Every key needs a caption, or its button renders blank — and with twenty
-    /// of them, the one that is missing is the one nobody scrolled to.
+    /// of them, the one that is missing is the one nobody scrolled to. VoiceOver
+    /// needs a name too, and neither the wire spelling nor a glyph is one.
     func testEveryPhoneKeyHasALabel() {
         for k in PhoneKey.allCases {
             XCTAssertFalse(k.label.isEmpty, "\(k) has no label")
+            XCTAssertFalse(k.spoken.isEmpty, "\(k) has no spoken name")
+            XCTAssertNotEqual(k.spoken, k.rawValue, "\(k) would be read out as its protocol spelling")
         }
     }
 
+    // MARK: - line breaks
+
+    /// The daemon strips control characters from phone text, newlines included,
+    /// so a two-line answer used to arrive with the lines glued together:
+    /// "run the testsand then deploy". The phone flattens it first.
+    func testLineBreaksBecomeSpacesOnTheWire() throws {
+        var c = Composer()
+        c.edit("run the tests\nand then deploy")
+        let sent = try XCTUnwrap(c.send(to: 7))
+        let parsed = try JSONSerialization.jsonObject(with: Data(sent.json.utf8)) as? [String: Any]
+        XCTAssertEqual(parsed?["text"] as? String, "run the tests and then deploy")
+        XCTAssertEqual(Composer.oneLine("a\r\nb\rc\u{2028}d"), "a b c d", "every line separator, not just \\n")
+        XCTAssertEqual(Composer.oneLine("no breaks"), "no breaks")
+    }
+
+    /// The flattening is the WIRE's, not the box's: the ack compares against what
+    /// was typed, so it must still recognise — and clear — the user's own text.
+    func testAFlattenedSendStillClearsTheBoxItCameFrom() {
+        var c = Composer()
+        c.edit("one\ntwo")
+        _ = c.send(to: 7)
+        _ = c.settle(rid: c.inFlightRid, sid: 7, ok: true, message: "")
+        XCTAssertEqual(c.text, "")
+        XCTAssertEqual(c.delivered, "one\ntwo", "the echo shows what the user wrote")
+    }
+
+    /// When the paste was accepted and only the Enter is in doubt, the text is NOT
+    /// "still here" — the acceptance emptied the box — and retyping would paste
+    /// it twice. The failure has to point at the enter key instead.
+    func testALostSubmitSaysToPressEnterNotToRetype() {
+        var c = Composer()
+        c.edit("ship it")
+        _ = c.send(to: 7)
+        _ = c.settle(rid: c.inFlightRid, sid: 7, ok: true, message: "")
+        XCTAssertTrue(c.busy, "precondition: the Enter is on the wire")
+
+        c.fail("your Mac did not answer. Your text is still here — try again.")
+        XCTAssertEqual(c.text, "", "the box was emptied by the paste's acceptance")
+        XCTAssertTrue(c.failure?.contains("Tap enter") ?? false, c.failure ?? "nil")
+        XCTAssertTrue(c.failure?.contains("reached the session") ?? false, c.failure ?? "nil")
+
+        // A refused Enter says the same, with the Mac's own reason in it.
+        var r = Composer()
+        r.edit("ship it")
+        _ = r.send(to: 7)
+        _ = r.settle(rid: r.inFlightRid, sid: 7, ok: true, message: "")
+        _ = r.settle(rid: r.inFlightRid, sid: 7, ok: false, message: "that session has ended")
+        XCTAssertTrue(r.failure?.contains("that session has ended") ?? false, r.failure ?? "nil")
+        XCTAssertTrue(r.failure?.contains("Tap enter") ?? false, r.failure ?? "nil")
+    }
+
+    /// A dropped link takes its terminal with it, exactly as a new epoch does.
+    func testFlushDropsTheTerminalToo() {
+        var store = SessionStore()
+        store.apply(.grid(epoch: "e1", grid: TerminalGrid(sid: 7, cols: 80, rows: 24, lines: ["hi"],
+                                                          cursorRow: nil, cursorCol: nil)))
+        store.flush()
+        XCTAssertNil(store.grid, "a frame nothing will ever update again looks live")
+    }
 }

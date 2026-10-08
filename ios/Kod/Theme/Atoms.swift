@@ -55,6 +55,8 @@ struct PhaseDot: View {
         Circle()
             .fill(KodColor.phase(phase))
             .frame(width: size, height: size)
+            // Colour alone says nothing to VoiceOver.
+            .accessibilityLabel(phase.label)
     }
 }
 

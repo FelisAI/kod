@@ -123,6 +123,7 @@ struct ScannerView: View {
     let onPaired: (BridgeSettings) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var scanner = ScanSession()
     @State private var phase: ScannerPhase = .checking
     @State private var rejection: String?
@@ -144,15 +145,15 @@ struct ScannerView: View {
                            run: requestAccess)
                 case .denied:
                     notice(title: "Camera access is off",
-                           detail: "Turn Camera on for Kod in Settings, or close this and type the host, port and token by hand.",
+                           detail: "Turn Camera on for Kod in Settings — or close this, use Copy pairing link on your Mac, and paste it instead.",
                            action: "Open Settings",
                            run: openSettings)
                 case .restricted:
                     notice(title: "Camera access is restricted",
-                           detail: "Screen Time or a device-management profile is blocking the camera on this device. Close this and type the host, port and token by hand.")
+                           detail: "Screen Time or a device-management profile is blocking the camera on this device. Close this, use Copy pairing link on your Mac, and paste it instead.")
                 case .unavailable:
                     notice(title: "This device has no camera",
-                           detail: "The iOS Simulator never has one. Close this and type the host, port and token by hand.")
+                           detail: "Close this, use Copy pairing link on your Mac, and paste it instead.")
                 }
             }
             .navigationTitle("Scan pairing code")
@@ -167,6 +168,12 @@ struct ScannerView: View {
         }
         .presentationBackground(KodColor.bg)
         .onAppear(perform: begin)
+        // "Open Settings" leaves the app; switching Camera on there and coming
+        // back does not re-run onAppear, so without this the sheet went on saying
+        // "Camera access is off" about access that was now on.
+        .onChange(of: scenePhase) { _, scene in
+            if scene == .active, phase != .scanning, !paired { begin() }
+        }
         // Hand the camera back the moment this leaves the screen: a session left
         // running keeps the capture hardware (and the recording indicator) alive.
         .onDisappear { scanner.stop() }
@@ -198,9 +205,10 @@ struct ScannerView: View {
                         .font(KodFont.body)
                         .foregroundStyle(KodColor.text)
                 }
-                // Deliberately no menu path: the Mac side does not show a code yet,
-                // and naming a menu that does not exist is worse than naming none.
-                Text("Kod on your Mac shows one when you pair a phone.")
+                // The Mac's real path to the code (settings_mobile.rs, "Pair a
+                // phone"). This line once said the Mac did not show a code yet;
+                // it has for a while, and pointing nowhere was the bigger lie.
+                Text("On your Mac: Kod › Settings › Mobile › Pair a phone.")
                     .font(KodFont.meta)
                     .foregroundStyle(KodColor.muted2)
             }

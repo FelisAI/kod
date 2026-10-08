@@ -24,15 +24,21 @@ enum KodColor {
     static let orange = Color(hex: 0xE08A4E)
     static let red = Color(hex: 0xE68A8A)
 
-    /// The colour a phase dot takes. Busy is green because green means "running";
-    /// idle is grey because an idle session is not news, it is furniture.
+    /// The colour a phase dot takes — the desktop's `theme::phase_color`, to the
+    /// hex: orange is working (ambient, wants nothing), green is idle ("come
+    /// drive me"), amber is waiting on a decision.
+    ///
+    /// It used to be green for working and grey for idle, which disagreed with
+    /// the Mac AND with this app's own project rows (`ProjectGroup.liveMix`): one
+    /// card read "● 2" in orange for two working sessions, then listed those two
+    /// sessions under green dots.
     static func phase(_ p: Phase) -> Color {
         switch p {
-        case .busy: return green
+        case .busy: return orange
         case .awaiting: return amber
-        case .idle: return muted2
-        case .spawning: return muted2
-        case .dead, .unknown: return hair
+        case .idle: return green
+        case .spawning, .unknown: return muted2
+        case .dead: return red
         }
     }
 }

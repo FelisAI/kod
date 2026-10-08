@@ -34,7 +34,10 @@ targets:
         # collides with the last one on the same build number.
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        UILaunchScreen: {}
+        # The app's own background (KodColor.bg), so launch does not flash the
+        # system black before the first frame — the asset is in Assets.xcassets.
+        UILaunchScreen:
+          UIColorName: LaunchBackground
         UIUserInterfaceStyle: Dark
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
@@ -88,7 +91,9 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         PRODUCT_NAME: Kod
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        # Build 1 was archived and exported for TestFlight on 2026-08-26. App Store
+        # Connect refuses a second upload with a build number it has seen.
+        CURRENT_PROJECT_VERSION: "2"
         # iPhone ONLY for the first release. "1,2" means iPad too, which obliges
         # iPad screenshots and a layout that holds up there — review surface for a
         # device this app was not designed against. The Session reader and the

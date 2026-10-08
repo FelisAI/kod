@@ -20,8 +20,8 @@ struct ProjectsView: View {
                 if plan.isEmpty {
                     EmptyNote(title: "No projects yet",
                               detail: model.connection.isConnected
-                                  ? "The bridge reported no sessions."
-                                  : "Connect to your Mac to see them.")
+                                  ? "Kod on your Mac has no sessions right now."
+                                  : "Pair with your Mac to see them.")
                 }
 
                 if !plan.active.isEmpty {

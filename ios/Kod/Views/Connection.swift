@@ -44,7 +44,7 @@ extension ConnectionState {
             return "can't reach \(at) — \(why) Retrying in \(s)s."
         case .unauthorized(let m): return "token rejected — \(m)"
         case .failed(let at, let m): return "can't reach \(at) — \(m)"
-        case .unconfigured: return "no bridge configured"
+        case .unconfigured: return "not paired with a Mac yet"
         case .insecure:
             return "won't send your token in the clear to \(endpoint)"
         }
@@ -61,9 +61,11 @@ struct ConnectionChip: View {
         } label: {
             HStack(spacing: 5) {
                 Circle()
-                    .fill(model.connection.tint)
+                    .fill(model.demoMode ? KodColor.accent : model.connection.tint)
                     .frame(width: 7, height: 7)
-                Text(model.connection.shortLabel)
+                // Never "live" over sample data — that is the one word this chip
+                // must not say about something that is not your Mac.
+                Text(model.demoMode ? "sample" : model.connection.shortLabel)
                     .font(KodFont.pill)
                     .foregroundStyle(KodColor.muted)
             }
@@ -117,6 +119,8 @@ struct ConnectionView: View {
     @State private var port = "\(BridgeSettings.defaultPort)"
     @State private var token = ""
     @State private var showScanner = false
+    /// Why the last pasted link was refused, shown under the paste button.
+    @State private var pasteRefusal: String?
 
     var body: some View {
         NavigationStack {
@@ -125,14 +129,20 @@ struct ConnectionView: View {
                     status
 
                     scan
+                    paste
                     TierHeading(text: "OR ENTER IT BY HAND", color: KodColor.muted2)
 
                     field("HOST", text: $host, placeholder: "192.168.1.20", keyboard: .URL)
                     alternates
                     field("PORT", text: $port, placeholder: "\(BridgeSettings.defaultPort)", keyboard: .numberPad)
+                    if !port.isEmpty && !portIsValid {
+                        Text("A port is a whole number from 1 to 65535.")
+                            .font(KodFont.meta)
+                            .foregroundStyle(KodColor.red)
+                    }
                     secureField("TOKEN", text: $token)
 
-                    Text("The token is the KOD_BRIDGE_TOKEN the bridge was started with. It is stored in the iOS keychain and sent only to the host above.")
+                    Text("The token is the t= part of the pairing link. It is stored in the iOS keychain and sent only to your Mac. To reach a Mac beyond this phone, the link's key is needed too — so pair with the code or link once, and edit the address here after that.")
                         .font(KodFont.meta)
                         .foregroundStyle(KodColor.muted2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -146,11 +156,16 @@ struct ConnectionView: View {
                             .background(canSave ? KodColor.accent : KodColor.hair, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
                     .disabled(!canSave)
+
+                    sampleData
                 }
                 .padding(16)
             }
+            // The number pad has no return key, so dragging the form is the way
+            // to put the keyboard away.
+            .scrollDismissesKeyboard(.interactively)
             .background(KodColor.bg)
-            .navigationTitle("Bridge")
+            .navigationTitle("Your Mac")
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(KodColor.panel, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
@@ -193,6 +208,83 @@ struct ConnectionView: View {
             host = model.settings.host
             port = String(model.settings.port)
             token = model.settings.token
+        }
+        // A pairing link pasted where an address goes — the field a user reaches
+        // for first — is taken for what it is rather than saved as a hostname.
+        // Only a PASTE (many characters at once): a link typed key by key passes
+        // through prefixes that parse — complete up to the token, the key not
+        // yet typed — and would pair a moment early, without the key.
+        .onChange(of: host) { before, typed in
+            let t = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard typed.count - before.count > 1, t.lowercased().hasPrefix("kod://") else { return }
+            pairFromLink(t)
+        }
+    }
+
+    /// Kod on the Mac offers "Copy pairing link" beside the QR code, and with
+    /// Universal Clipboard that link is already on this phone. It is the way in
+    /// for a phone that cannot scan — the Simulator, a denied camera — and,
+    /// unlike the form below, it carries the key, so it works beyond loopback.
+    ///
+    /// `PasteButton`, not a button that reads `UIPasteboard`: the system draws it,
+    /// so pasting asks nothing — reading the pasteboard from an ordinary button
+    /// puts up the "Allow Paste" prompt every time.
+    private var paste: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                PasteButton(payloadType: String.self) { strings in
+                    guard let text = strings.first else { return }
+                    Task { @MainActor in pairFromLink(text) }
+                }
+                .buttonBorderShape(.capsule)
+                .tint(KodColor.accent)
+                .labelStyle(.titleAndIcon)
+                .accessibilityIdentifier("paste-pairing-link")
+                Text("Copy pairing link on your Mac, then paste it here.")
+                    .font(KodFont.meta)
+                    .foregroundStyle(KodColor.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let pasteRefusal {
+                Text(pasteRefusal)
+                    .font(KodFont.meta)
+                    .foregroundStyle(KodColor.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// A link is a code in another form, and is judged by the same parser.
+    private func pairFromLink(_ text: String) {
+        switch Pairing.parse(text) {
+        case .success(let settings):
+            pasteRefusal = nil
+            paired(settings)
+        case .failure(let error):
+            pasteRefusal = error.message
+        }
+    }
+
+    /// For a phone with no Mac to pair with yet — App Review, or anyone deciding
+    /// whether to set Kod up — and the way back when the sample data is up.
+    @ViewBuilder
+    private var sampleData: some View {
+        if model.demoMode {
+            Button("Leave the sample data") {
+                model.exitDemo()
+                dismiss()
+            }
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(KodColor.accent)
+            .frame(maxWidth: .infinity)
+        } else if !model.connection.isConnected {
+            Button("No Mac nearby? Explore with sample data") {
+                model.enterDemo()
+                dismiss()
+            }
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(KodColor.accent)
+            .frame(maxWidth: .infinity)
         }
     }
 
@@ -252,8 +344,15 @@ struct ConnectionView: View {
         model.apply(settings: scanned)
     }
 
+    /// A port the bridge could actually be on. `Int(port) != nil` alone let 0,
+    /// -1 and 65536 through: saved, the sheet closed, and the phone fell silent
+    /// as "not paired" with nothing pointing at the field that was wrong.
+    private var portIsValid: Bool { Int(port).map { (1...65_535).contains($0) } ?? false }
+
     private var canSave: Bool {
-        !host.trimmingCharacters(in: .whitespaces).isEmpty && Int(port) != nil && !token.isEmpty
+        !host.trimmingCharacters(in: .whitespaces).isEmpty
+            && portIsValid
+            && !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Whether the form holds anything the model does not. `model.settings` is
@@ -282,10 +381,12 @@ struct ConnectionView: View {
     }
 
     private var status: some View {
-        KodCard(tint: model.connection.tint) {
+        KodCard(tint: model.demoMode ? KodColor.accent : model.connection.tint) {
             VStack(alignment: .leading, spacing: 6) {
                 TierHeading(text: "STATUS", color: KodColor.muted)
-                Text(model.connection.longLabel(endpoint: model.settings.displayEndpoint))
+                Text(model.demoMode
+                     ? "showing sample data — scan or paste your Mac's pairing code to see your own sessions"
+                     : model.connection.longLabel(endpoint: model.settings.displayEndpoint))
                     .font(KodFont.body)
                     .foregroundStyle(KodColor.text)
                     .fixedSize(horizontal: false, vertical: true)
@@ -304,8 +405,8 @@ struct ConnectionView: View {
                     // the only way out.
                     Text("Your Mac only accepts encrypted connections, and the key "
                          + "for that can't be typed in — it comes from the pairing "
-                         + "code. Tap Scan QR code above, on Settings → Mobile on "
-                         + "your Mac.")
+                         + "code. Scan the code, or paste the pairing link, from "
+                         + "Kod › Settings › Mobile on your Mac.")
                         .font(KodFont.meta)
                         .foregroundStyle(KodColor.muted2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -347,7 +448,7 @@ struct ConnectionView: View {
     private func secureField(_ label: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             TierHeading(text: label, color: KodColor.muted)
-            SecureField("paste KOD_BRIDGE_TOKEN", text: text)
+            SecureField("64-character token", text: text)
                 .accessibilityIdentifier("bridge-token")
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()

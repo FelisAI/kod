@@ -34,7 +34,7 @@ final class ConnectionSheetUITests: XCTestCase {
     /// never closed.
     private enum Placeholder {
         static let host = "192.168.1.20"
-        static let token = "paste KOD_BRIDGE_TOKEN"
+        static let token = "64-character token"
     }
 
     /// What this simulator was configured with, put back on the way out — a test

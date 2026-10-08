@@ -83,6 +83,9 @@ struct SessionStore: Equatable {
         epoch = nil
         sessions.removeAll()
         revs.removeAll()
+        // The terminal goes with the link that streamed it, for the same reason
+        // `adopt` drops it: a frame nothing will ever update looks live.
+        grid = nil
         hasSnapshot = false
     }
 }

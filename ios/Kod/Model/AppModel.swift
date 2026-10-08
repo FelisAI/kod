@@ -71,10 +71,24 @@ struct Composer: Equatable {
         if self.sid != sid { delivered = nil }
         self.sid = sid
         failure = nil
+        // The step keeps the text AS TYPED, because the ack compares it with what
+        // is in the box now. Only the wire copy is flattened.
         inFlight = .paste(text)
         inFlightRid = nextRid
         nextRid += 1
-        return .input(sid: sid, text: text, rid: inFlightRid)
+        return .input(sid: sid, text: Self.oneLine(text), rid: inFlightRid)
+    }
+
+    /// The text as the daemon should receive it: line breaks become spaces.
+    ///
+    /// The daemon strips every control character from phone text, newlines
+    /// included, because a newline in a terminal is SUBMIT and submitting is its
+    /// own key. Stripped rather than replaced, a two-line answer arrives with the
+    /// last word of one line glued to the first word of the next — so the phone
+    /// says what it means before the Mac has to guess.
+    static func oneLine(_ text: String) -> String {
+        text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .joined(separator: " ")
     }
 
     mutating func press(_ key: PhoneKey, on sid: UInt64) -> ClientMessage? {
@@ -99,7 +113,8 @@ struct Composer: Equatable {
         guard self.sid == sid, rid == inFlightRid, let step = inFlight else { return nil }
         guard ok else {
             inFlight = nil
-            failure = message.isEmpty ? "your Mac refused it, without saying why" : message
+            let why = message.isEmpty ? "your Mac refused it, without saying why" : message
+            failure = step == .submit ? Self.submitInDoubt(why) : why
             return nil
         }
         switch step {
@@ -119,9 +134,56 @@ struct Composer: Equatable {
     /// The send did not reach the Mac, or the link died before it answered. The
     /// text STAYS: it was not delivered, so it is not the user's to lose.
     mutating func fail(_ why: String) {
-        guard busy else { return }
+        guard let step = inFlight else { return }
         inFlight = nil
-        failure = why
+        failure = step == .submit ? Self.submitInDoubt(why) : why
+    }
+
+    /// The one failure where "your text is still here" would be false.
+    ///
+    /// The paste WAS accepted — that acceptance is what emptied the box and
+    /// filled "you sent" — so the text is sitting in the session's prompt and only
+    /// the Enter that submits it is in doubt. Retyping would paste it twice; what
+    /// the user needs is the enter key, and the sentence has to say so.
+    static func submitInDoubt(_ why: String) -> String {
+        "Your text reached the session, but the Enter that submits it did not (\(why)). "
+            + "Tap enter to submit it."
+    }
+}
+
+/// Which terminal the Session screen wants streamed, and which one THIS
+/// connection has been told about.
+///
+/// Two values, because they have different lifetimes. What the screen wants
+/// survives a reconnect; what the bridge was told does not — it keeps one watch
+/// per connection and forgets it when the connection ends. One variable doing
+/// both jobs is how the terminal used to freeze for good after the first
+/// reconnect (or the first trip to the background): it still read "already
+/// watching", so the new connection was never told, and no grid ever came again.
+/// A watch asked for before the link was up was lost the same way.
+struct WatchPlan: Equatable {
+    private(set) var wanted: UInt64?
+    private(set) var sent: UInt64?
+
+    mutating func request(_ sid: UInt64?) { wanted = sid }
+
+    /// The connection is gone, and its watch with it.
+    mutating func linkEnded() { sent = nil }
+
+    /// What to put on the wire to make this connection match `wanted` — nil when
+    /// nothing is needed, or nothing can be sent yet. A watch written before
+    /// `hello_ok` is answered with `err` and dropped, so `linkUp` must be true.
+    ///
+    /// Switching sessions sends only the new watch (the bridge replaces the old
+    /// one); an explicit off is sent only when nothing is wanted, which is what
+    /// stops a phone being streamed a terminal nobody is looking at.
+    mutating func next(linkUp: Bool) -> ClientMessage? {
+        guard linkUp, sent != wanted else { return nil }
+        let previous = sent
+        sent = wanted
+        if let sid = wanted { return .watch(sid: sid, on: true) }
+        if let previous { return .watch(sid: previous, on: false) }
+        return nil
     }
 }
 
@@ -138,25 +200,40 @@ final class AppModel {
     /// against an older Mac, which is exactly right: it cannot send them, so the
     /// phone must not offer a screen that would stay blank.
     private(set) var gridAllowed = false
-    /// The session this phone has asked the bridge to stream, so a repeated
-    /// `onAppear` does not re-send the same watch and a switch always turns the
-    /// old one off.
-    private var watching: UInt64?
+    /// The terminal the Session screen wants, and what this connection was told.
+    private var watching = WatchPlan()
 
     var tab: RootTab = .standup
-    var selectedSid: UInt64? {
-        didSet {
-            // Every path that changes the subject goes through here, which is why
-            // the reset lives here and not in the view. An in-flight send is
-            // abandoned rather than followed: its answer will name a session this
-            // composer no longer points at, and `settle` drops it.
-            if selectedSid != oldValue { composer = Composer(sid: selectedSid) }
-        }
-    }
+    /// The Session tab's subject. Changing it touches no composer: each session
+    /// keeps its own (`composers`).
+    var selectedSid: UInt64?
     var showConnectionSheet = false
 
     private(set) var settings = BridgeSettings.empty
-    private(set) var composer = Composer()
+
+    /// One composer per session, for the life of a bridge attach.
+    ///
+    /// There used to be ONE, replaced whenever the selection changed, and three
+    /// things went wrong with it. A draft was thrown away by a glance at another
+    /// session. A send in flight was abandoned rather than followed, so an
+    /// accepted paste never got the Enter that submits it — text left sitting in
+    /// the agent's prompt, typed and unsent. And the replacement restarted its
+    /// request ids at 1, so the late answer to an abandoned send could settle a
+    /// NEW send with the same id: emptying the box and submitting text the Mac
+    /// had not taken. Keyed by session, a composer lives as long as its session
+    /// can, answers route to the one that asked, and ids never repeat within it.
+    private var composers: [UInt64: Composer] = [:]
+
+    /// The selected session's composer — what the Session screen draws.
+    var composer: Composer {
+        guard let sid = selectedSid else { return Composer() }
+        return composers[sid] ?? Composer(sid: sid)
+    }
+
+    /// The bridge attach the selection and the composers belong to. Not the
+    /// store's epoch: a dropped link flushes that, and a reconnect to the SAME
+    /// bridge must keep the user's place and their drafts.
+    private var attachEpoch: String?
 
     /// Server-clock now, in ms. Every age on screen is measured against this and
     /// it ticks on a timer, which is what makes "12m" become "13m" without a frame
@@ -168,32 +245,37 @@ final class AppModel {
 
     private let client = BridgeClient()
     private var clock: Task<Void, Never>?
-    #if DEBUG
-    /// Fixture-backed: no socket, no ticking clock. Set only by the demo hooks.
-    /// Showing sample data instead of a Mac.
+    /// Showing sample data instead of a Mac: no socket, no ticking clock, and
+    /// typing is answered here rather than by a daemon.
     ///
-    /// Reachable from the UI, not just a launch argument: without a Mac running
+    /// SHIPPED, in every build, and reachable from the UI: without a Mac running
     /// Kod this app is a connection screen and nothing else, which is unevaluable
-    /// for anyone deciding whether to set it up — App Review included. Internal,
-    /// not fileprivate, because the views must be able to say so on screen; a
-    /// demo that does not announce itself is a lie.
+    /// for anyone deciding whether to set it up — App Review included. It used to
+    /// be declared under `#if DEBUG` while `start()` read it unconditionally, so
+    /// the Release build — the only one that can be uploaded — did not compile.
+    /// Internal, not fileprivate, because the views must say so on screen; a demo
+    /// that does not announce itself is a lie.
     private(set) var demoMode = false
-    #endif
+    /// The sample sessions' rev counter, so a demo session can change state
+    /// through the same `SessionStore.apply` a bridge frame goes through.
+    private var demoRev: UInt64 = 0
 
     init(settings: BridgeSettings = SettingsStore.load(), autostart: Bool = true) {
         self.settings = settings
-        client.onState = { [weak self] state in self?.connection = state }
+        client.onState = { [weak self] state in
+            guard let self else { return }
+            connection = state
+            // A link that just came up has no watch on it yet, whatever this
+            // phone sent the last one.
+            if state.isConnected { syncWatch() }
+        }
         client.onMessage = { [weak self] msg in self?.ingest(msg) }
         client.onInputResult = { [weak self] answer in self?.settle(answer) }
         client.onDisconnect = { [weak self] in
             // Frozen rows shown as live are a lie; the next attach mints a new
             // epoch and resends everything anyway.
             self?.store.flush()
-            self?.inputAllowed = false
-            // Nothing else ever answers a send that was in the air when the link
-            // died — without this the composer waits forever on a socket that is
-            // gone, and the user cannot even retype.
-            self?.composer.fail("the link dropped before your Mac answered — it may not have arrived")
+            self?.linkEnded()
         }
         if autostart { start() }
         #if DEBUG
@@ -205,18 +287,12 @@ final class AppModel {
     /// `-kod-demo` (and optionally `-kod-tab standup|projects|session`) fills the
     /// app with fixture sessions and dials nothing. It exists so the design can be
     /// looked at in a simulator without a bridge — and so looking at it can never
-    /// involve pointing a client at the real daemon.
+    /// involve pointing a client at the real daemon. Launch arguments stay a
+    /// development hook; the shipped way in is `enterDemo`.
     private func seedDemoIfRequested() {
         let args = CommandLine.arguments
         guard args.contains("-kod-demo") else { return }
-        demoMode = true
-        stop()
-        let fixtures = args.contains("-kod-quiet") ? Fixtures.allQuiet : Fixtures.everyTier
-        store.apply(.sessions(epoch: "demo", sessions: fixtures.map(Self.asTheDaemonWouldMark)))
-        connection = .connected("sample data")
-        inputAllowed = true
-        now = Fixtures.now + 60_000
-        selectedSid = 2
+        enterDemo(args.contains("-kod-quiet") ? Fixtures.allQuiet : Fixtures.everyTier)
         if let i = args.firstIndex(of: "-kod-tab"), i + 1 < args.count {
             switch args[i + 1] {
             case "projects": tab = .projects
@@ -225,42 +301,65 @@ final class AppModel {
             }
         }
     }
+    #endif
 
     /// Fill the app with sample sessions and dial nothing.
     ///
-    /// Same fixtures the `-kod-demo` launch argument uses, so what a reviewer or a
-    /// curious user sees is the same thing the design was checked against.
-    func enterDemo() {
-        demoMode = true
+    /// The same fixtures the previews and the `-kod-demo` launch argument use, so
+    /// what a reviewer or a curious user sees is what the design was checked
+    /// against.
+    func enterDemo(_ sessions: [Session] = Fixtures.everyTier) {
         stop()
-        store.apply(.sessions(epoch: "demo",
-                              sessions: Fixtures.everyTier.map(Self.asTheDaemonWouldMark)))
+        demoMode = true
+        demoRev = 0
+        composers.removeAll()
+        store = SessionStore()
+        store.apply(.sessions(epoch: "demo", sessions: sessions.map(Self.asTheDaemonWouldMark)))
         connection = .connected("sample data")
         inputAllowed = true
+        gridAllowed = true
         now = Fixtures.now + 60_000
-        selectedSid = 2
+        selectedSid = sessions.contains { $0.sid == Fixtures.firstToAnswer }
+            ? Fixtures.firstToAnswer
+            : sessions.first?.sid
         tab = .standup
+        syncWatch()
     }
 
     /// Leave the demo and go back to whatever was configured.
     func exitDemo() {
+        guard demoMode else { return }
+        leaveDemo()
+        start()
+    }
+
+    /// Everything the demo put on screen, gone — without dialling anything. The
+    /// half of `exitDemo` that pairing also needs: a code scanned while the
+    /// sample data is up must connect, not be swallowed by a model that still
+    /// thinks it is a demo.
+    private func leaveDemo() {
+        guard demoMode else { return }
         demoMode = false
         store = SessionStore()
         selectedSid = nil
-        composer = Composer()
-        apply(settings: settings)
+        composers.removeAll()
+        inputAllowed = false
+        gridAllowed = false
+        watching.linkEnded()
+        connection = .unconfigured
+        tab = .standup
     }
 
-    /// The daemon's own rule — agents that are alive accept typing, shells and
-    /// dead sessions never do — applied to fixtures, which carry no `can_input`
-    /// because they never came off a wire. Without it every preview and every
-    /// `-kod-demo` run would show the composer's refusal state and nothing else.
-    fileprivate static func asTheDaemonWouldMark(_ s: Session) -> Session {
+    /// The daemon's own rule — every LIVE session accepts typing, shells
+    /// included, and a dead one never does — applied to fixtures, which carry no
+    /// `can_input` because they never came off a wire. It mirrors the bridge's
+    /// `can_input: alive`; a copy of an older rule here once kept shells
+    /// read-only on the phone long after the Mac started accepting them.
+    static func asTheDaemonWouldMark(_ s: Session) -> Session {
         var marked = s
-        marked.canInput = s.alive && s.phase != .dead && s.cli != .shell
+        marked.canInput = s.alive && s.phase != .dead
         return marked
     }
-    #endif
 
     // MARK: - Derived views of state
 
@@ -290,38 +389,50 @@ final class AppModel {
     /// moment the user starts changing the text it was about.
     var draft: String {
         get { composer.text }
-        set { composer.edit(newValue) }
+        set {
+            guard let sid = selectedSid else { return }
+            composers[sid, default: Composer(sid: sid)].edit(newValue)
+        }
     }
 
     /// Send the draft to the selected session. `canInput` is re-checked here and
     /// not only in the view: a session can die between the frame that drew the
     /// composer and the tap on its send button.
     func sendDraft() {
-        guard let s = selected, s.canInput, let msg = composer.send(to: s.sid) else { return }
+        guard let s = selected, s.canInput,
+              let msg = composers[s.sid, default: Composer(sid: s.sid)].send(to: s.sid)
+        else { return }
         transmit(msg)
     }
 
     func press(_ key: PhoneKey) {
-        guard let s = selected, s.canInput, let msg = composer.press(key, on: s.sid) else { return }
+        guard let s = selected, s.canInput,
+              let msg = composers[s.sid, default: Composer(sid: s.sid)].press(key, on: s.sid)
+        else { return }
         transmit(msg)
     }
 
     /// Point the bridge's terminal stream at one session, or turn it off.
     ///
-    /// Idempotent, because SwiftUI calls `onAppear` more than once for the same
-    /// screen and a watch per call would be a watch per re-layout. Turning the
-    /// old one off is implicit at the bridge (one watch per connection replaces
-    /// the previous), so this sends only the new one — but it DOES send an
-    /// explicit off when there is no new session, which is what stops a
-    /// backgrounded phone being streamed a terminal nobody is looking at.
+    /// This records what the screen WANTS; `syncWatch` decides what to send, now
+    /// and again on every new connection. Idempotent, because SwiftUI calls
+    /// `onAppear` more than once for the same screen and a watch per call would
+    /// be a watch per re-layout.
     func watch(_ sid: UInt64?) {
-        guard gridAllowed, watching != sid else { return }
-        let previous = watching
-        watching = sid
-        if let sid {
-            send(.watch(sid: sid, on: true))
-        } else if let previous {
-            send(.watch(sid: previous, on: false))
+        watching.request(sid)
+        syncWatch()
+    }
+
+    /// Bring this connection's watch in line with what the screen wants.
+    private func syncWatch() {
+        if demoMode {
+            if let sid = watching.wanted, let g = Fixtures.grid(for: sid), store.grid?.sid != sid {
+                store.apply(.grid(epoch: "demo", grid: g))
+            }
+            return
+        }
+        if let msg = watching.next(linkUp: gridAllowed && connection.isConnected) {
+            send(msg)
         }
     }
 
@@ -341,17 +452,29 @@ final class AppModel {
         // decide whether anything had changed could read "edited" for a value it
         // had just saved.
         let new = new.normalized()
+        let changed = new != settings
         settings = new
         SettingsStore.save(new)
+        // Pairing is the way OUT of the sample data, not something to do behind
+        // it: a demo model dials nothing, so a code scanned with the demo up
+        // would otherwise be saved and then silently ignored.
+        leaveDemo()
+        if changed {
+            // What is on screen came from the OLD settings — possibly another
+            // Mac — and the client's restart cancels that link without a
+            // disconnect callback. Left alone, the old Mac's sessions stayed up
+            // under a banner naming the new one, for as long as the new one took
+            // to answer, or forever if it never did.
+            store.flush()
+            linkEnded()
+        }
         start()
     }
 
     func start() {
         // A demo model dials nothing and freezes its clock; otherwise the
         // foreground restart would stomp the fixture `now` with wall-clock time
-        // and every age would read in days. NOT #if DEBUG: the demo is a shipped
-        // feature now, and TestFlight ships Release — gating this on DEBUG meant
-        // the demo silently started dialling in exactly the build a reviewer runs.
+        // and every age would read in days.
         if demoMode { return }
         startClock()
         // HANDED OVER UNCONDITIONALLY, usable or not.
@@ -371,32 +494,102 @@ final class AppModel {
         client.startIfNeeded(settings)
     }
 
+    /// Drop the link — the app is going to the background.
+    ///
+    /// The rows stay on screen, but the state stops claiming they are live: until
+    /// the next `hello_ok` replaces them, they are what the Mac said BEFORE, and
+    /// the banner says it is reconnecting. A cancelled socket never reaches the
+    /// client's disconnect path, so everything that path would have reset is
+    /// reset here too.
     func stop() {
         client.stop()
         clock?.cancel()
         clock = nil
+        guard !demoMode else { return }
+        linkEnded()
+        if case .connected(let at) = connection { connection = .connecting(at) }
     }
 
-    func retry() { client.retry() }
+    func retry() {
+        if demoMode { return }
+        client.retry()
+    }
 
     // MARK: - Plumbing
+
+    /// What every way a link can end has in common.
+    private func linkEnded() {
+        inputAllowed = false
+        // The bridge's watch died with the connection; the next one starts
+        // with none, and `syncWatch` will re-send what the screen wants.
+        watching.linkEnded()
+        // Nothing else ever answers a send that was in the air when the link
+        // died — without this a composer waits forever on a socket that is
+        // gone, and the user cannot even retype. Every composer, not just the
+        // one on screen: a send made before switching sessions is still in the
+        // air.
+        for sid in composers.keys {
+            composers[sid]?.fail("the link dropped before your Mac answered — it may not have arrived")
+        }
+    }
 
     /// Put one message on the wire and own what happens to it. The socket's own
     /// refusal is reported here; the daemon's arrives later as `input_result`.
     private func transmit(_ msg: ClientMessage) {
+        guard let (sid, rid) = msg.request else { return }
         // The bridge answers an oversized frame with `err` and KEEPS the
         // connection, so a too-long paste would leave the composer waiting on an
         // `input_result` that is never coming. Refuse it while there is still
         // someone to tell.
         guard msg.json.utf8.count <= kMaxFrameBytes else {
-            composer.fail("that is too long to send from the phone")
+            composers[sid]?.fail("that is too long to send from the phone")
+            return
+        }
+        if demoMode {
+            answerLikeTheMac(msg)
             return
         }
         Task { [weak self] in
             guard let self else { return }
-            if let why = await client.send(msg) { composer.fail(why) }
+            // Only if that send is still the one in flight: by the time the
+            // socket says no, a deadline may already have failed it and the user
+            // sent something new.
+            if let why = await client.send(msg), composers[sid]?.inFlightRid == rid {
+                composers[sid]?.fail(why)
+            }
         }
-        armInputDeadline()
+        armInputDeadline(sid: sid, rid: rid)
+    }
+
+    /// The sample data's stand-in for a daemon: accept, a beat later, the way a
+    /// Mac on the same Wi-Fi would — and when what was sent answers a waiting
+    /// agent, let that agent get back to work, so the demo shows the whole loop
+    /// rather than a box that empties and nothing else.
+    private func answerLikeTheMac(_ msg: ClientMessage) {
+        let (rid, sid, answersTheAgent): (UInt64, UInt64, Bool)
+        switch msg {
+        case .input(let s, _, let r): (rid, sid, answersTheAgent) = (r, s, false)
+        case .key(let s, let k, let r): (rid, sid, answersTheAgent) = (r, s, k == .enter || k == .escape)
+        default: return
+        }
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard let self, demoMode else { return }
+            settle(InputResult(rid: rid, sid: sid, ok: true, message: ""))
+            if answersTheAgent { demoAgentResumes(sid) }
+        }
+    }
+
+    private func demoAgentResumes(_ sid: UInt64) {
+        guard var s = store[sid], s.phase == .awaiting || s.pendingHeadline != nil else { return }
+        s.phase = .busy
+        s.pendingHeadline = nil
+        s.phaseSince = now
+        demoRev += 1
+        store.apply(.session(epoch: "demo", rev: demoRev, session: s))
+        if let g = Fixtures.gridAfterAnswer(for: sid) {
+            store.apply(.grid(epoch: "demo", grid: g))
+        }
     }
 
     /// How long to wait for the Mac's answer before giving the composer back.
@@ -410,32 +603,48 @@ final class AppModel {
     /// phone mid-send is the ordinary way to reach that.
     private static let inputDeadline: Duration = .seconds(12)
 
-    private func armInputDeadline() {
-        let rid = composer.inFlightRid
+    private func armInputDeadline(sid: UInt64, rid: UInt64) {
         Task { [weak self] in
             try? await Task.sleep(for: Self.inputDeadline)
             guard let self else { return }
             // Only the send this deadline was armed for. A later send has its own,
             // and settling it here would blame the wrong text.
-            guard composer.inFlightRid == rid, composer.busy else { return }
-            composer.fail("your Mac did not answer. Your text is still here — try again.")
+            guard let c = composers[sid], c.inFlightRid == rid, c.busy else { return }
+            composers[sid]?.fail("your Mac did not answer. Your text is still here — try again.")
         }
     }
 
     /// An accepted paste is only half of a send: the composer hands back the
-    /// Enter that submits it, and that goes out on this same ack.
+    /// Enter that submits it, and that goes out on this same ack — whichever
+    /// session is on screen by then.
     private func settle(_ answer: InputResult) {
-        if let next = composer.settle(rid: answer.rid, sid: answer.sid, ok: answer.ok, message: answer.message) {
+        if let next = composers[answer.sid]?.settle(rid: answer.rid, sid: answer.sid,
+                                                    ok: answer.ok, message: answer.message) {
             transmit(next)
         }
     }
 
-    private func ingest(_ msg: ServerMessage) {
-        if case .helloOk(_, _, let serverTime, let input, let grid) = msg {
+    /// Internal rather than private so the epoch rule can be tested without a socket.
+    func ingest(_ msg: ServerMessage) {
+        if case .helloOk(_, let epoch, let serverTime, let input, let grid) = msg {
             inputAllowed = input
             gridAllowed = grid
+            // A fresh connection, so a fresh watch. Sent once the client calls
+            // the link connected — see `onState` — not from here, which runs
+            // before the socket is marked ready for writes.
+            watching.linkEnded()
             clockOffsetMs = serverTime == 0 ? 0 : Int64(serverTime) - Int64(Self.localNowMs())
             now = serverNowMs()
+            // A NEW BRIDGE ATTACH: a restarted Mac, or a different one. Session
+            // ids restart at 1 in a new daemon, so the selection and every draft
+            // may now name a different session — and a draft written for one
+            // agent must never be sendable to another. A reconnect to the same
+            // bridge keeps its epoch, and keeps both.
+            if let held = attachEpoch, held != epoch {
+                composers.removeAll()
+                selectedSid = nil
+            }
+            attachEpoch = epoch
         }
         store.apply(msg)
         // A selection that just went away should not silently point at nothing;
@@ -471,11 +680,8 @@ extension AppModel {
                         state: ConnectionState = .connected("10.0.0.14:18787")) -> AppModel {
         let m = AppModel(settings: BridgeSettings(host: "10.0.0.14", port: BridgeSettings.defaultPort, token: "preview"),
                          autostart: false)
-        m.store.apply(.sessions(epoch: "preview", sessions: sessions.map(asTheDaemonWouldMark)))
-        m.inputAllowed = true
+        m.enterDemo(sessions)
         m.connection = state
-        m.now = Fixtures.now + 60_000
-        m.demoMode = true
         m.selectedSid = sessions.first(where: { $0.pendingHeadline != nil })?.sid
         return m
     }

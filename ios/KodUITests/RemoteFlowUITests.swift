@@ -76,11 +76,13 @@ final class RemoteFlowUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Projects"].waitForExistence(timeout: 5))
 
         // The first project card: tapping the header expands it in place.
-        // Match "sessions ·" (plural, with the separator) — a bare "session"
-        // ALSO matches the "Session" TAB BUTTON, and tapping that silently
-        // changes tab instead of expanding anything.
+        // Match " session" WITH the leading space ("2 sessions", "1 session") —
+        // a bare "session" ALSO matches the "Session" TAB BUTTON, and tapping
+        // that silently changes tab instead of expanding anything. (This read
+        // "sessions ·" until the card subtitle lost its "· 2 working" tail to the
+        // coloured live mix; from then on it matched nothing.)
         let card = app.buttons
-            .matching(NSPredicate(format: "label CONTAINS[c] 'sessions \u{00B7}'")).firstMatch
+            .matching(NSPredicate(format: "label CONTAINS[c] ' session'")).firstMatch
         XCTAssertTrue(card.waitForExistence(timeout: 5), "no project card to open")
         card.tap()
         attach(named: "Projects-expanded")

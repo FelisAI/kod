@@ -12,11 +12,12 @@
 //  you cannot see. The phone had arrow keys and an Enter for a prompt whose text
 //  it never showed.
 //
-//  What has changed is the bottom of the screen. The daemon now accepts typing
-//  from a phone into an AGENT session — never a shell, never a dead one — and
-//  marks each session `can_input`, so the composer appears on the Mac's answer
-//  rather than on this build's opinion. Every state where it cannot appear says
-//  why, in words, instead of leaving a screen that quietly does nothing.
+//  What has changed is the bottom of the screen. The daemon accepts typing from a
+//  phone into any LIVE session — claude, codex and, since the Mac widened the
+//  phone's keys, a shell — and marks each session `can_input`, so the composer
+//  appears on the Mac's answer rather than on this build's opinion. Every state
+//  where it cannot appear says why, in words, instead of leaving a screen that
+//  quietly does nothing.
 
 import SwiftUI
 
@@ -28,9 +29,13 @@ struct SessionView: View {
         Group {
             if let s = model.selected {
                 reader(s)
+            } else if model.selectedSid != nil && !model.hasEverSynced {
+                // The cache was flushed with the link, so "gone" would be a guess.
+                EmptyNote(title: "Waiting for your Mac",
+                          detail: "This session comes back as soon as Kod on your Mac answers.")
             } else if model.selectedSid != nil {
                 EmptyNote(title: "That session is gone",
-                          detail: "It ended, or the bridge reattached. Pick another from Standup or Projects.")
+                          detail: "It ended, or your Mac reconnected. Pick another from Standup or Projects.")
             } else {
                 EmptyNote(title: "No session open",
                           detail: "Tap a card in Standup or a session in Projects.")
@@ -75,7 +80,7 @@ struct SessionView: View {
                     banner(LimitLine.text(s), detail: nil, color: KodColor.red)
                 }
                 if let trouble = s.trouble {
-                    banner(trouble, detail: nil, color: KodColor.red)
+                    banner(TroubleLine.text(trouble), detail: nil, color: KodColor.red)
                 }
                 if let headline = s.pendingHeadline {
                     banner(headline,
@@ -86,6 +91,13 @@ struct SessionView: View {
                            detail: canType(s) ? nil : "This session has ended.",
                            color: KodColor.amber,
                            heading: "WAITING ON YOU")
+                }
+
+                // The live screen goes FIRST after what is waiting: with the
+                // keyboard up only the top of this column is visible, and the
+                // terminal is where the answer to what you just typed appears.
+                if let g = model.store.grid, g.sid == s.sid, !g.lines.isEmpty {
+                    terminal(g)
                 }
 
                 // What YOU sent, echoed locally.
@@ -111,25 +123,26 @@ struct SessionView: View {
                     }
                 }
 
-                if let g = model.store.grid, g.sid == s.sid, !g.lines.isEmpty {
-                    terminal(g)
-                }
-
-                VStack(alignment: .leading, spacing: 10) {
-                    TierHeading(text: "LAST MESSAGE", color: KodColor.muted)
-                    KodCard {
-                        if s.lastMessage.isEmpty {
-                            Text("nothing said yet")
-                                .font(KodFont.body)
-                                .foregroundStyle(KodColor.muted2)
-                        } else {
-                            Text(s.lastMessage)
-                                .font(.system(size: 15))
-                                .foregroundStyle(KodColor.text)
-                                .lineSpacing(3)
-                                .textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                // An agent's last message is written when it finishes a turn. A
+                // shell never finishes one, so for a shell an empty card would
+                // say "nothing said yet" forever about something that never will.
+                if s.cli != .shell || !s.lastMessage.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        TierHeading(text: "LAST MESSAGE", color: KodColor.muted)
+                        KodCard {
+                            if s.lastMessage.isEmpty {
+                                Text("nothing said yet")
+                                    .font(KodFont.body)
+                                    .foregroundStyle(KodColor.muted2)
+                            } else {
+                                Text(s.lastMessage)
+                                    .font(.system(size: 15))
+                                    .foregroundStyle(KodColor.text)
+                                    .lineSpacing(3)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
                         }
                     }
                 }
@@ -174,14 +187,17 @@ struct SessionView: View {
                     .padding(.top, 10)
             }
             Group {
-                // Order matters: the most specific true thing first. A dead shell
-                // is dead before it is a shell.
+                // Order matters: the most specific true thing first.
+                //
+                // There is no shell branch, and that is deliberate. One used to
+                // sit here refusing every shell on the phone's own authority,
+                // after the Mac had started accepting them (`can_input` is
+                // `alive` for every kind, and the daemon's check is the session
+                // being alive). It hid a box that would have worked — including
+                // the interrupt key a stuck shell needs most.
                 if !s.alive || s.phase == .dead {
                     note("This session has ended",
                          "Nothing is listening on the other end. Start it again from Kod on your Mac.")
-                } else if s.cli == .shell {
-                    note("Kod does not let a phone type into a shell",
-                         "A shell runs whatever it is handed. claude and codex ask before they act, so those you can answer from here.")
                 } else if !model.inputAllowed {
                     note("This Mac is not taking typing from the phone",
                          "Its Kod is older than this app, or the bridge has input switched off. Answer it there instead.")
@@ -271,7 +287,8 @@ struct SessionView: View {
     /// stop — and calling that "answer" describes one case out of several. The CLI
     /// name is interpolated, so a codex session says codex.
     private func prompt(for s: Session) -> String {
-        s.phase == .awaiting || s.pendingHeadline != nil
+        if s.cli == .shell { return "type a command…" }
+        return s.phase == .awaiting || s.pendingHeadline != nil
             ? "answer \(s.cli.label)…"
             : "message \(s.cli.label)…"
     }
@@ -328,16 +345,9 @@ struct SessionView: View {
     /// The keys the daemon accepts, and nothing else. Arrow-then-Enter is how a
     /// claude permission prompt gets answered, which is the single most likely
     /// thing anyone does from a phone — so they are one tap away, above the field,
-    /// rather than hidden behind the text you would otherwise have to type.
-    /// Shown ONLY while the agent is actually asking something.
-    ///
-    /// These keys exist to answer a permission prompt — arrow to a choice, Enter
-    /// to take it — and outside that they are a fragment of a keyboard with no
-    /// visible purpose. On first use the reaction was "I don't see how we can use
-    /// them", which is the correct reaction to a control offered at a moment it
-    /// does nothing. When something IS waiting, they appear with a line saying so
-    /// and the whole thing explains itself. Send stays available always, because
-    /// typing is always meaningful.
+    /// rather than hidden behind the text you would otherwise have to type. The
+    /// caption says "Answer the prompt above" while the agent is asking
+    /// something, which is when the top row explains itself.
     @ViewBuilder
     private var keys: some View {
         let answering = model.selected?.pendingHeadline != nil || model.selected?.phase == .awaiting
@@ -413,7 +423,7 @@ struct SessionView: View {
         }
         .buttonStyle(.plain)
         .disabled(model.composer.busy)
-        .accessibilityLabel(which.rawValue)
+        .accessibilityLabel(which.spoken)
     }
 
     @ViewBuilder
@@ -436,6 +446,8 @@ struct SessionView: View {
             .buttonStyle(.plain)
             .disabled(!model.composer.canSend)
             .accessibilityLabel("Send")
+            // The keyboard's return key is ALSO "Send" (`submitLabel(.send)`).
+            .accessibilityIdentifier("composer-send")
         }
     }
 

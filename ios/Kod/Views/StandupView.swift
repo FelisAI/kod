@@ -21,8 +21,8 @@ struct StandupView: View {
                 if !model.settings.isUsable && !model.connection.isConnected {
                     setupPrompt
                 } else if !model.hasEverSynced && plan.attentionCount == 0 {
-                    EmptyNote(title: "Waiting for the bridge",
-                              detail: "Sessions appear as soon as the bridge answers.")
+                    EmptyNote(title: "Waiting for your Mac",
+                              detail: "Sessions appear as soon as Kod on your Mac answers.")
                 }
 
                 if !plan.blocked.isEmpty {
@@ -63,16 +63,36 @@ struct StandupView: View {
 
     @ViewBuilder
     private func header(_ plan: StandupPlan) -> some View {
+        let (title, sub, loud) = headerText(plan)
         VStack(alignment: .leading, spacing: 4) {
-            Text(plan.isQuiet ? "All quiet" : headline(plan))
+            Text(title)
                 .font(.system(size: 28, weight: .semibold))
-                .foregroundStyle(plan.isQuiet ? KodColor.text : KodColor.strong)
-            Text(plan.isQuiet ? "nothing needs you right now" : subhead(plan))
+                .foregroundStyle(loud ? KodColor.strong : KodColor.text)
+            Text(sub)
                 .font(KodFont.body)
                 .foregroundStyle(KodColor.muted)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 4)
+    }
+
+    /// "All quiet" is a claim about sessions, so it is only made about sessions
+    /// the Mac has actually sent. With nothing synced — never paired, still
+    /// connecting, or a dropped link that flushed the cache — it used to say "All
+    /// quiet · nothing needs you right now" in the largest type on screen, while
+    /// three agents might be waiting on a Mac it could not reach.
+    private func headerText(_ plan: StandupPlan) -> (title: String, sub: String, loud: Bool) {
+        if !model.hasEverSynced {
+            if !model.settings.isUsable {
+                return ("Kod Remote", "your coding agents, from your phone", false)
+            }
+            if case .connecting = model.connection {
+                return ("Connecting…", "to Kod on your Mac", false)
+            }
+            return ("Not connected", "nothing here is current until your Mac answers", false)
+        }
+        if plan.isQuiet { return ("All quiet", "nothing needs you right now", false) }
+        return (headline(plan), subhead(plan), true)
     }
 
     private func headline(_ plan: StandupPlan) -> String {
@@ -95,8 +115,9 @@ struct StandupView: View {
         }
     }
 
-    /// The ambient strip: one dot per running session, then the sentence. Green is
-    /// working, grey is idle — the only two states that do not want anything.
+    /// The ambient strip: one dot per running session, then the sentence. Orange
+    /// is working and green is idle, as on the Mac — the states that are not
+    /// waiting on a decision.
     @ViewBuilder
     private func ambientStrip(_ plan: StandupPlan) -> some View {
         Button {
@@ -125,22 +146,39 @@ struct StandupView: View {
         .buttonStyle(.plain)
     }
 
+    /// What a phone that has never been paired sees — which includes App Review,
+    /// opening it cold with no Mac. So it says what the app is for, how to pair,
+    /// and offers a way to see it working without one.
     private var setupPrompt: some View {
         KodCard(tint: KodColor.accent) {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Not connected")
+                Text("Pair with your Mac")
                     .font(KodFont.cardTitle)
                     .foregroundStyle(KodColor.strong)
-                Text("Point Kod at the bridge running on your Mac to see your sessions.")
+                Text("Kod Remote shows the coding agents running in Kod on your Mac — which ones need you — and lets you answer them from here.")
                     .font(KodFont.body)
                     .foregroundStyle(KodColor.muted)
                     .fixedSize(horizontal: false, vertical: true)
-                Button("Set up connection") { model.showConnectionSheet = true }
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(KodColor.bg)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(KodColor.accent, in: Capsule())
+                Text("On your Mac, open Kod › Settings › Mobile, turn on “Serve my sessions to my phone”, then scan the code it shows.")
+                    .font(KodFont.meta)
+                    .foregroundStyle(KodColor.muted2)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Button("Pair") { model.showConnectionSheet = true }
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(KodColor.bg)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(KodColor.accent, in: Capsule())
+                        .accessibilityIdentifier("pair")
+                    Button("Explore with sample data") { model.enterDemo() }
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(KodColor.accent)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .overlay(Capsule().stroke(KodColor.accent.opacity(0.5), lineWidth: 1))
+                        .accessibilityIdentifier("explore-sample-data")
+                }
             }
         }
     }

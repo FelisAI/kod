@@ -174,6 +174,39 @@ final class ConnectTests: XCTestCase {
         XCTAssertTrue(SettingsStore.load().altHosts.isEmpty, "a stale alternate outlives its pairing")
     }
 
+    // MARK: - Loopback means loopback
+
+    /// Plaintext is legal on loopback only, so "is this loopback" is a security
+    /// check — and it was a prefix test. "127.0.0.1@192.168.1.20" starts with
+    /// "127." and is a URL whose HOST is 192.168.1.20; "127.example.com" resolves
+    /// wherever its owner points it. Both would have carried the token in the
+    /// clear.
+    func testOnlyARealLoopbackAddressCountsAsLoopback() {
+        for host in ["127.0.0.1", "127.1.2.3", "localhost", "::1", "[::1]", "LOCALHOST"] {
+            XCTAssertTrue(BridgeSettings.isLoopback(host), host)
+        }
+        for host in ["127.0.0.1@192.168.1.20", "127.example.com", "127.0.0.1.evil.com",
+                     "127.0.0", "127.0.0.256", "127..0.1", "128.0.0.1", "0x7f.0.0.1", ""] {
+            XCTAssertFalse(BridgeSettings.isLoopback(host), host)
+        }
+    }
+
+    func testAHostThatIsNotJustAnAddressIsNeverDialled() {
+        let sneaky = BridgeSettings(host: "127.0.0.1@192.168.1.20", port: 18787, token: Self.token)
+        XCTAssertTrue(sneaky.insecureBeyondThisDevice, "it is not loopback, and it has no pin")
+        XCTAssertFalse(sneaky.isUsable)
+        // Even pinned, an address with userinfo, a path or a query in it is not an
+        // address — the URL would go somewhere no check here looked at.
+        for host in ["mac@evil", "mac/evil", "mac?x=1", "mac#x", "mac evil"] {
+            let pinned = BridgeSettings(host: host, port: 18787, token: Self.token, fingerprint: Self.pin)
+            XCTAssertNil(pinned.url, host)
+            XCTAssertFalse(pinned.isUsable, host)
+        }
+        // A pasted scheme and trailing slash are still tolerated.
+        let pasted = BridgeSettings(host: "wss://mac.local/", port: 18787, token: Self.token, fingerprint: Self.pin)
+        XCTAssertEqual(pasted.url?.absoluteString, "wss://mac.local:18787/")
+    }
+
     // MARK: - Saying what actually went wrong
 
     /// Silence from a Wi-Fi address has one overwhelmingly common cause on iOS
