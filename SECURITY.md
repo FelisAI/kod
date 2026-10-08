@@ -61,38 +61,40 @@ stored **in plaintext** in the local store (see below), not the macOS Keychain �
 so don't put long-lived secrets in a profile's env if your disk or backups aren't
 trusted.
 
-**The mobile bridge and its token.** Kod can serve your session list to a phone,
-and let you answer an agent from it (Settings → Mobile). It is **off by default** and does
-nothing until you turn it on. When you do, Kod mints a 32-byte random bearer
-token — this is the first credential Kod creates *on your behalf* rather than one
-you typed, and it is stored **in plaintext** in the same local store described
-below. Anyone who can read that file, or read the token off your screen, can read
-every project name, session title and last-message line until you regenerate it.
+**The mobile bridge and its token.** Kod can serve your sessions to the Kod Remote
+iPhone app, and let you answer them from it (Settings → Mobile). It is **off by
+default** and does nothing until you turn it on. When you do, Kod mints a 32-byte
+random bearer token — this is the first credential Kod creates *on your behalf*
+rather than one you typed, and it is stored **in plaintext** in the same local store
+described below. The pairing code (and the "Copy pairing link" link) carries it.
 
-The listener always binds loopback, and additionally binds **one** Tailscale
-address (100.64.0.0/10) if you choose that. It refuses every other bind — LAN
-addresses and `0.0.0.0` included — because this version authenticates with a
-shared bearer token and has **no TLS**, so any other interface would put that
-token in the clear. Over Tailscale, WireGuard already authenticates the device and
-encrypts the hop.
+**Treat the token like a password to a shell on your Mac.** A phone holding it can
+see every project name, session title and last message, **and type into any live
+session — a `claude`, a `codex` or a plain shell — and press a fixed set of twenty
+keys, Ctrl-C among them.** Typing into a shell is running commands as you, so
+whoever holds the token can do that too. If a pairing code or link may have been
+seen by someone else, use **Regenerate token** in Settings → Mobile: it signs out
+every paired phone at once.
 
-The phone can **type into claude and codex sessions, never into a shell.** That
-rule is enforced by the daemon, not by the phone and not by the bridge: the phone
-sends only a session id, and the daemon resolves that session's kind from its own
-state before doing anything. It is an allowlist — a session kind added later is
-refused until someone deliberately lists it.
+The listener always binds loopback. It additionally binds your Wi-Fi network address
+and/or your Tailscale address (100.64.0.0/10) only if you turn those on — a "Wi-Fi"
+address must sit on a physical interface, so a VPN tunnel is never offered as one —
+and it refuses `0.0.0.0` always. **Anything beyond loopback is TLS-only:** the Mac
+serves a self-signed certificate, and the pairing code carries the SHA-256 of its
+public key, which the phone pins — it refuses any other key, and it refuses to send
+the token in the clear to anything but its own loopback. The key, not the address,
+identifies your Mac, so the Mac's addresses may change without re-pairing.
 
-Two further limits sit on top. The bridge runs as a **separate process** that
-attaches to the daemon holding a restricted capability, so it is refused every
-other command outright — including the arbitrary-keystroke path the desktop uses.
-And the text a phone sends is stripped of control characters before it reaches a
-terminal, so the deliberately tiny set of pressable keys (enter, escape, up, down,
-tab) cannot be bypassed by smuggling an escape sequence inside a message.
-
-Shells are excluded because a shell *is* arbitrary command execution: typing into
-one from a phone would be remote code execution as you. claude and codex ask
-before they run anything dangerous, so typing into them is bounded by their own
-gate — the phone can answer a prompt, it cannot start work.
+What the phone may do is enforced on the Mac, not by the phone. The bridge runs as a
+**separate process** that attaches to the session daemon holding a restricted
+capability: it may send typed text and the twenty named keys, and is refused every
+other command outright — spawning, closing, and the arbitrary-keystroke path the
+desktop uses included. The phone sends only a session id; the daemon resolves the
+session from its own state and refuses ended sessions and ids it does not know. Text
+from a phone is capped at 8 KiB and stripped of control characters before it reaches
+a terminal, so an escape sequence cannot be smuggled inside a message — the named
+keys are the only way to send one. The bridge accepts at most eight connections and
+drops one that has been silent for a minute.
 
 One consequence worth stating plainly: the bridge is a helper process started by
 Kod's session daemon, which outlives the app window. **Closing or quitting Kod

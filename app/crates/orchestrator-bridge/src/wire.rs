@@ -19,10 +19,10 @@
 //!
 //! THE PHONE CAN NOW TYPE, AND THE AUTHORIZATION STORY IS NOT IN THIS FILE.
 //! `input` and `key` carry a `sid` and nothing else — the phone never says what
-//! KIND of session it is typing into, so it cannot claim a shell is a claude
-//! session. The daemon resolves the kind from its own state and refuses shells,
-//! dead sessions and ids it has never heard of (`ClientRole::Phone` +
-//! `dispatch_checked`). Everything here is the COURIER for that decision and
+//! KIND of session it is typing into, and nothing it says about a session is
+//! believed. The daemon refuses dead sessions and ids it has never heard of from
+//! its own state (`ClientRole::Phone` + `dispatch_checked`); the session kind is
+//! not the boundary — a phone holding the token may drive a shell too. Everything here is the COURIER for that decision and
 //! never the decision: `caps.input` and `can_input` exist so a phone can grey a
 //! composer out early, and neither one grants anything.
 
@@ -414,6 +414,35 @@ impl From<Phase> for WirePhase {
 /// The stable slug for a trouble chip. Slugs, not prose: the phone owns its own
 /// wording and its own localisation, and a server-rendered sentence would freeze
 /// both.
+/// The most of one session's `last_message` a phone is sent, in characters.
+///
+/// The text is claude's whole final message of a turn, and nothing upstream
+/// bounds it. Every live session's copy rides in ONE `sessions` frame, so a Mac
+/// running fifteen agents sent snapshots well past the 64 KiB a phone built
+/// before this release would accept — it called that a desync, dropped the link
+/// and redialled into the same snapshot, forever. Four thousand characters is
+/// several screens on a phone; past that it is a document to read on the Mac.
+pub const LAST_MESSAGE_MAX_CHARS: usize = 4_000;
+
+/// `s` if it fits in `max` characters; otherwise its head and its tail with the
+/// middle elided. Both ends, because a final message usually says what it did
+/// at the top and what is next at the bottom. Counts characters, never bytes,
+/// so a multi-byte character is never cut in half.
+pub fn elide_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    const GAP: &str = "\n\n[…]\n\n";
+    let keep = max.saturating_sub(GAP.chars().count());
+    let head = keep * 2 / 3;
+    let tail = keep - head;
+    let mut out: String = s.chars().take(head).collect();
+    out.push_str(GAP);
+    out.extend(s.chars().skip(n - tail));
+    out
+}
+
 fn trouble_slug(k: TroubleKind) -> &'static str {
     match k {
         TroubleKind::RateLimit => "rate_limit",
@@ -486,7 +515,7 @@ impl From<&SessionInfo> for WireSession {
             // for is worse than no flag, because the phone hides a box that
             // would have worked.
             can_input: i.alive,
-            last_message: i.last_message.clone(),
+            last_message: elide_middle(&i.last_message, LAST_MESSAGE_MAX_CHARS),
             pending_headline: i.pending.as_ref().map(|p| p.view.summary()),
             trouble: i.trouble.map(|t| trouble_slug(t.kind).to_string()),
             // A session with NO banner is not "not limited" in some third state:
@@ -953,6 +982,24 @@ mod tests {
         let mut dead = bare_info();
         dead.alive = false;
         assert!(!WireSession::from(&dead).can_input);
+    }
+
+    #[test]
+    fn a_long_last_message_keeps_both_ends_and_fits() {
+        let mut i = bare_info();
+        i.last_message = format!("SUMMARY{}NEXT STEPS", "é".repeat(20_000));
+        let w = WireSession::from(&i);
+        assert!(w.last_message.chars().count() <= LAST_MESSAGE_MAX_CHARS);
+        assert!(w.last_message.starts_with("SUMMARY"), "the head survives");
+        assert!(w.last_message.ends_with("NEXT STEPS"), "and so does the tail");
+        assert!(w.last_message.contains("[…]"), "and the cut is marked");
+
+        // Short messages are untouched, byte for byte.
+        i.last_message = "Done — 48 tests pass.".into();
+        assert_eq!(WireSession::from(&i).last_message, "Done — 48 tests pass.");
+        // Exactly at the limit is not cut.
+        let at = "x".repeat(LAST_MESSAGE_MAX_CHARS);
+        assert_eq!(elide_middle(&at, LAST_MESSAGE_MAX_CHARS), at);
     }
 
     #[test]

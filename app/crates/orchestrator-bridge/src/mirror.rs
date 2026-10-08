@@ -7,6 +7,7 @@
 //! the daemon.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use orchestrator_host::emulator::GridSnapshot;
 use orchestrator_host::host::SessionInfo;
@@ -35,7 +36,9 @@ pub enum Change {
 #[derive(Default)]
 pub struct Mirror {
     pub sessions: HashMap<SessionId, SessionInfo>,
-    pub grids: HashMap<SessionId, GridSnapshot>,
+    /// Behind an `Arc` so the newest frame can be shared with the phone-facing
+    /// hub (which answers a fresh `watch` from it) without a second copy.
+    pub grids: HashMap<SessionId, Arc<GridSnapshot>>,
     /// True once the daemon has finished replaying the attach snapshot.
     pub replay_done: bool,
 }
@@ -67,7 +70,7 @@ impl Mirror {
                     // LATEST WINS. The daemon sends a whole viewport per tick,
                     // so keeping anything but the newest is keeping garbage —
                     // this is the whole backpressure story in one line.
-                    self.grids.insert(ev.session_id, grid.clone());
+                    self.grids.insert(ev.session_id, Arc::new(grid.clone()));
                     Some(Change::Grid(ev.session_id))
                 }
                 EventKind::Events(_) => Some(Change::Events(ev.session_id)),

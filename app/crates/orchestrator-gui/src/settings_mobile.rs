@@ -53,9 +53,10 @@ impl Orchestrator {
     ) -> impl IntoElement {
         let st = self.bridge_status.clone();
         settings_section(
-            "Read your sessions from your phone",
-            "Kod's session daemon serves a read-only view. It keeps running after you close \
-             or quit Kod — that is the point, and it also means it keeps listening until you \
+            "Your sessions on your phone",
+            "Kod's session daemon serves your sessions to the Kod Remote app on your iPhone — \
+             to see who needs you, and to answer them. It keeps running after you close or \
+             quit Kod — that is the point, and it also means it keeps listening until you \
              turn it off here.",
             div()
                 .flex()

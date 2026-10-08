@@ -706,6 +706,13 @@ struct HubState {
     revs: HashMap<u64, u64>,
     subs: Vec<Sub>,
     next_sub: u64,
+    /// Each session's CURRENT terminal, unprojected — shared with the pump's
+    /// mirror, so keeping it here costs a refcount, not a copy. It exists for
+    /// [`Hub::watch`]: the daemon sends a grid only when a terminal CHANGES, so
+    /// without this a phone that started watching a session idling at a
+    /// permission prompt was sent nothing — no terminal for exactly the screen
+    /// it was opened to answer.
+    grids: HashMap<u64, Arc<orchestrator_host::emulator::GridSnapshot>>,
 }
 
 /// The shared session view and the fan-out to connected phones.
@@ -765,6 +772,7 @@ impl Hub {
                 revs: HashMap::new(),
                 subs: Vec::new(),
                 next_sub: 1,
+                grids: HashMap::new(),
             }),
         }
     }
@@ -828,11 +836,50 @@ impl Hub {
         Some(rev)
     }
 
-    /// Point one connection's terminal stream at a session, or turn it off.
+    /// Point one connection's terminal stream at a session, or turn it off — and
+    /// send that connection the session's current terminal straight away.
+    ///
+    /// Straight away is the fix. Grids reach the bridge only when a terminal
+    /// changes, so a watch that waited for the next one showed nothing for a
+    /// session sitting still — and a session sitting at a permission prompt is
+    /// the one a phone most often opens. Done under the hub lock, like
+    /// [`Hub::grid_changed`], so a newer frame can never be overtaken by this
+    /// one.
     pub fn watch(&self, sub_id: u64, sid: Option<u64>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(sub) = st.subs.iter_mut().find(|s| s.id == sub_id) {
-            sub.watching = sid;
+        let Some(sub) = st.subs.iter_mut().find(|s| s.id == sub_id) else {
+            return;
+        };
+        sub.watching = sid;
+        let Some(sid) = sid else { return };
+        let Some(g) = st.grids.get(&sid).cloned() else { return };
+        let msg = grid_msg(self.epoch.clone(), sid, &g);
+        st.subs.retain(|sub| {
+            if sub.id != sub_id {
+                return true;
+            }
+            if sub.backlog.load(Ordering::Relaxed) >= MAX_BACKLOG {
+                return false;
+            }
+            if sub.tx.send(msg.clone()).is_err() {
+                return false;
+            }
+            sub.backlog.fetch_add(1, Ordering::Relaxed);
+            true
+        });
+    }
+
+    /// A new terminal for `sid`: keep it as the session's current screen, and
+    /// stream it to the connections watching that session. Projected only when
+    /// someone is watching — the daemon sends a grid per session per change, and
+    /// projecting one nobody asked for is work for nothing.
+    pub fn grid_changed(&self, sid: u64, g: Arc<orchestrator_host::emulator::GridSnapshot>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let watched = st.subs.iter().any(|s| s.watching == Some(sid));
+        let msg = watched.then(|| grid_msg(self.epoch.clone(), sid, &g));
+        st.grids.insert(sid, g);
+        if let Some(msg) = msg {
+            send_grid(&mut st, sid, msg);
         }
     }
 
@@ -851,28 +898,15 @@ impl Hub {
             _ => return,
         };
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.subs.retain(|sub| {
-            if sub.watching != Some(sid) {
-                return true;
-            }
-            // A watcher that has fallen behind loses the SUBSCRIPTION, exactly
-            // like `broadcast` — a grid stream is the easiest way to build a
-            // backlog, so it must obey the same bound rather than get an
-            // exemption for being "just a repaint".
-            if sub.backlog.load(Ordering::Relaxed) >= MAX_BACKLOG {
-                return false;
-            }
-            if sub.tx.send(msg.clone()).is_err() {
-                return false;
-            }
-            sub.backlog.fetch_add(1, Ordering::Relaxed);
-            true
-        });
+        send_grid(&mut st, sid, msg);
     }
 
     /// Drop a session and broadcast `gone`.
     pub fn gone(&self, sid: u64) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Its terminal goes with it, whether or not the session was known: a
+        // watch must never be answered with the screen of a session that ended.
+        st.grids.remove(&sid);
         if st.sessions.remove(&sid).is_none() {
             return;
         }
@@ -889,7 +923,11 @@ impl Hub {
     pub fn reset(&self, sessions: Vec<WireSession>) {
         let fresh: BTreeMap<u64, WireSession> = sessions.into_iter().map(|s| (s.sid, s)).collect();
         let stale: Vec<u64> = {
-            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Every terminal held is from before the reset — the mirror drops
+            // its own for the same reason — and the daemon's replay is about to
+            // send each session's current one.
+            st.grids.clear();
             st.sessions.keys().filter(|k| !fresh.contains_key(k)).copied().collect()
         };
         for sid in stale {
@@ -930,6 +968,27 @@ impl Hub {
     pub fn sub_count(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).subs.len()
     }
+}
+
+/// Send one terminal frame to the connections watching `sid`, and to no one else.
+fn send_grid(st: &mut HubState, sid: u64, msg: BridgeMsg) {
+    st.subs.retain(|sub| {
+        if sub.watching != Some(sid) {
+            return true;
+        }
+        // A watcher that has fallen behind loses the SUBSCRIPTION, exactly
+        // like `broadcast` — a grid stream is the easiest way to build a
+        // backlog, so it must obey the same bound rather than get an
+        // exemption for being "just a repaint".
+        if sub.backlog.load(Ordering::Relaxed) >= MAX_BACKLOG {
+            return false;
+        }
+        if sub.tx.send(msg.clone()).is_err() {
+            return false;
+        }
+        sub.backlog.fetch_add(1, Ordering::Relaxed);
+        true
+    });
 }
 
 /// Fan one message out, dropping any subscriber that has stopped reading.
@@ -1659,9 +1718,10 @@ fn serve_attached(
 /// reaches this loop at all, it goes out on [`send_loop`], and all that arrives
 /// here is a reply frame to be routed.
 ///
-/// Grid frames and timeline events are deliberately dropped: the phone shows no
-/// terminal, and forwarding a viewport per tick would be the entire bandwidth
-/// budget spent on something it cannot render.
+/// Timeline events are dropped. Grid frames are KEPT (the hub holds each
+/// session's current terminal, to answer a fresh `watch`) but streamed only to a
+/// phone watching that session: forwarding every viewport per tick would be the
+/// entire bandwidth budget spent on screens nobody is looking at.
 pub fn pump(
     reader: &mut UnixStream,
     mirror: &mut Mirror,
@@ -1682,15 +1742,13 @@ pub fn pump(
                 }
             }
             Some(Change::Closed(id)) => hub.gone(id.0),
-            // A grid nobody asked for is dropped here, before it is projected:
-            // the daemon sends one per session per tick, and this is the line
-            // that keeps a phone's radio out of every session it is not looking
-            // at.
+            // Kept as the session's current screen, and projected and sent only
+            // if someone is watching: the daemon sends one per session per
+            // change, and this is the line that keeps a phone's radio out of
+            // every session it is not looking at.
             Some(Change::Grid(id)) => {
-                if hub.is_watched(id.0) {
-                    if let Some(g) = mirror.grids.get(&id) {
-                        hub.grid(grid_msg(hub.epoch().to_string(), id.0, g));
-                    }
+                if let Some(g) = mirror.grids.get(&id) {
+                    hub.grid_changed(id.0, Arc::clone(g));
                 }
             }
             _ => {}
@@ -2711,6 +2769,96 @@ mod tests {
             cursor: None,
         });
         assert!(watcher.drain().unwrap().is_empty(), "unwatch must actually stop it");
+    }
+
+    fn one_line_grid(text: &str) -> Arc<orchestrator_host::emulator::GridSnapshot> {
+        use orchestrator_host::emulator::{GridSnapshot, StyleRun};
+        let run = StyleRun {
+            text: text.into(),
+            fg: 0,
+            bg: 0,
+            bold: false,
+            italic: false,
+            underline: false,
+            uri: None,
+        };
+        Arc::new(GridSnapshot {
+            seq: 1,
+            rows: vec![vec![run], vec![]],
+            cursor: (0, 0),
+            cursor_visible: false,
+            bracketed_paste: false,
+            kitty_keys: false,
+            display_offset: 0,
+            history_size: 0,
+            alt_screen: false,
+        })
+    }
+
+    /// THE REGRESSION. The daemon sends a grid only when a terminal CHANGES, so
+    /// a session idling at a permission prompt sends none — and a phone that
+    /// started watching it was shown no terminal at all, for exactly the screen
+    /// it was opened to answer. A watch is now answered with the current screen.
+    #[test]
+    fn a_new_watch_is_sent_the_current_terminal_at_once() {
+        let hub = Hub::new("e1");
+        // The terminal changed while nobody was watching: kept, sent nowhere.
+        let early = hub.attach_client();
+        hub.grid_changed(7, one_line_grid("Do you want to proceed?"));
+        assert!(early.drain().unwrap().is_empty(), "nobody was watching");
+
+        // Now a phone opens that session — and nothing on the Mac moves.
+        let phone = hub.attach_client();
+        let bystander = hub.attach_client();
+        hub.watch(phone.id, Some(7));
+        let got = phone.drain().unwrap();
+        assert_eq!(got.len(), 1, "the watch itself must deliver the screen");
+        match &got[0] {
+            BridgeMsg::Grid { sid, lines, rows, .. } => {
+                assert_eq!(*sid, 7);
+                assert_eq!(lines, &vec!["Do you want to proceed?".to_string()],
+                           "trailing blank rows are still dropped");
+                assert_eq!(*rows, 2, "but the real viewport is still reported");
+            }
+            other => panic!("expected a grid, got {other:?}"),
+        }
+        assert!(bystander.drain().unwrap().is_empty(), "only the phone that asked");
+        assert!(early.drain().unwrap().is_empty());
+
+        // Changes after that stream as before, and only to the watcher.
+        hub.grid_changed(7, one_line_grid("❯ 1. Yes"));
+        assert_eq!(phone.drain().unwrap().len(), 1);
+        assert!(bystander.drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_watch_on_a_session_with_no_terminal_yet_sends_nothing() {
+        let hub = Hub::new("e1");
+        let phone = hub.attach_client();
+        hub.watch(phone.id, Some(9));
+        assert!(phone.drain().unwrap().is_empty());
+        // …and the first frame that does arrive is streamed as usual.
+        hub.grid_changed(9, one_line_grid("$ "));
+        assert_eq!(phone.drain().unwrap().len(), 1);
+    }
+
+    /// A screen kept for a session must not outlive it: a watch on an ended
+    /// session, or one from before a reset, would show a terminal that is gone.
+    #[test]
+    fn a_kept_terminal_goes_with_its_session_and_with_a_reset() {
+        let hub = Hub::new("e1");
+        hub.upsert(session(7, WirePhase::Idle));
+        hub.grid_changed(7, one_line_grid("old"));
+        hub.gone(7);
+        let phone = hub.attach_client();
+        hub.watch(phone.id, Some(7));
+        assert!(phone.drain().unwrap().is_empty(), "a gone session has no screen to send");
+
+        hub.grid_changed(8, one_line_grid("before the reset"));
+        hub.reset(vec![session(8, WirePhase::Idle)]);
+        let _ = phone.drain();
+        hub.watch(phone.id, Some(8));
+        assert!(phone.drain().unwrap().is_empty(), "a reset drops every kept screen");
     }
 
     #[test]

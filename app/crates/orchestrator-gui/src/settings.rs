@@ -66,7 +66,7 @@ impl SettingsSection {
             Self::BackgroundAi => {
                 "The model Kod calls on its OWN behalf — summaries, Recover previews, map proposals. Never your sessions."
             }
-            Self::Mobile => "Read your sessions from your iPhone, over Tailscale.",
+            Self::Mobile => "See and answer your sessions from the Kod Remote app on your iPhone.",
         }
     }
 }
