@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy — Kod and Kod Remote</title>
+<meta name="description" content="Kod Remote collects nothing. It talks only to the Mac you pair it with.">
+<link rel="icon" href="assets/kod-mark.png">
+<style>
+/* The main page's palette and type, kept to what a text page needs. Dark-only,
+   like the app; no external requests, like the rest of the site. */
+:root{
+  --bg:#0F1218; --card:#191D27; --hair:#2B303B; --hair-soft:#23272F;
+  --text:#D3D8E1; --strong:#F2F5FA; --muted:#9AA3B1; --muted2:#757E8A; --mint:#7EE2C0;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0; background:var(--bg); color:var(--text); font-family:var(--sans);
+  font-size:17px; line-height:1.65; -webkit-font-smoothing:antialiased}
+.wrap{max-width:720px; margin:0 auto; padding:0 24px}
+a{color:var(--mint); text-decoration:none}
+a:hover{text-decoration:underline}
+header{padding:28px 0 8px; display:flex; align-items:center; gap:11px}
+header a{display:flex; align-items:center; gap:11px; color:var(--strong); font-weight:600}
+header img{width:26px; height:26px}
+h1{color:var(--strong); font-size:34px; line-height:1.2; letter-spacing:-.02em; margin:36px 0 6px}
+h2{color:var(--strong); font-size:20px; margin:34px 0 8px}
+.date{color:var(--muted2); font-size:14px; margin:0 0 26px}
+.lead{font-size:19px; color:var(--strong)}
+ul{padding-left:22px} li{margin:6px 0}
+footer{margin-top:56px; padding:28px 0 56px; border-top:1px solid var(--hair-soft);
+  color:var(--muted2); font-size:14px; display:flex; gap:20px; flex-wrap:wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><a href="/"><img src="assets/kod-mark.png" alt=""><span>Kod</span></a></header>
+
+  <h1>Privacy</h1>
+  <p class="date">Kod Remote for iPhone and Kod for Mac · effective October 8, 2026</p>
+
+  <p class="lead">Kod Remote collects nothing. It has no account, no analytics, no
+  advertising, no tracking and no third-party code. It talks to one thing: the Mac
+  you pair it with.</p>
+
+  <h2>What travels, and where</h2>
+  <p>Kod Remote shows the sessions running in Kod on your own Mac — their titles,
+  status, last messages and terminal text — and sends what you type back to them. All
+  of it goes directly between your iPhone and your Mac, over your Wi-Fi or your
+  Tailscale network, encrypted with TLS and checked against your Mac's own key. It
+  never passes through a server of ours. We — Felis AI — never see it, and could
+  not if we wanted to.</p>
+
+  <h2>What is stored on your iPhone</h2>
+  <ul>
+    <li>Your Mac's network addresses, port and key fingerprint, in the app's
+      preferences.</li>
+    <li>The access token that lets the app talk to your Mac, in the iOS Keychain.</li>
+  </ul>
+  <p>Nothing else is kept. Deleting the app removes the preferences; to revoke the
+  token everywhere at once, use <strong>Regenerate token</strong> in Kod → Settings →
+  Mobile on your Mac.</p>
+
+  <h2>Permissions the app asks for</h2>
+  <ul>
+    <li><strong>Camera</strong> — only to read the pairing code on your Mac's screen.
+      No photo or video is taken, saved or sent.</li>
+    <li><strong>Local Network</strong> — to reach your Mac on your Wi-Fi.</li>
+  </ul>
+
+  <h2>Kod for Mac</h2>
+  <p>Kod runs on your Mac and sends nothing to us. It starts the <code>claude</code>
+  and <code>codex</code> command-line tools under your own accounts; what those tools
+  send to Anthropic or OpenAI is covered by those providers' own policies, as it would
+  be without Kod.</p>
+
+  <h2>Children</h2>
+  <p>Kod and Kod Remote are developer tools and are not directed at children.</p>
+
+  <h2>Changes and contact</h2>
+  <p>If this ever changes, this page will say so, with a new date at the top. Questions
+  are welcome as a <a href="https://github.com/FelisAI/kod/issues">GitHub issue</a>.</p>
+
+  <footer>
+    <span>© 2026 Felis AI LLC</span>
+    <a href="/">Kod</a>
+    <a href="support.html">Support</a>
+    <a href="https://github.com/FelisAI/kod">GitHub</a>
+  </footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support — Kod Remote</title>
+<meta name="description" content="Pair Kod Remote with Kod on your Mac, and what to check when it will not connect.">
+<link rel="icon" href="assets/kod-mark.png">
+<style>
+:root{
+  --bg:#0F1218; --card:#191D27; --hair:#2B303B; --hair-soft:#23272F;
+  --text:#D3D8E1; --strong:#F2F5FA; --muted:#9AA3B1; --muted2:#757E8A; --mint:#7EE2C0;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0; background:var(--bg); color:var(--text); font-family:var(--sans);
+  font-size:17px; line-height:1.65; -webkit-font-smoothing:antialiased}
+.wrap{max-width:720px; margin:0 auto; padding:0 24px}
+a{color:var(--mint); text-decoration:none}
+a:hover{text-decoration:underline}
+header{padding:28px 0 8px; display:flex; align-items:center; gap:11px}
+header a{display:flex; align-items:center; gap:11px; color:var(--strong); font-weight:600}
+header img{width:26px; height:26px}
+h1{color:var(--strong); font-size:34px; line-height:1.2; letter-spacing:-.02em; margin:36px 0 10px}
+h2{color:var(--strong); font-size:20px; margin:34px 0 8px}
+.lead{font-size:19px; color:var(--strong)}
+ol,ul{padding-left:22px} li{margin:7px 0}
+.q{color:var(--strong); font-weight:600}
+.box{background:var(--card); border:1px solid var(--hair); border-radius:12px; padding:16px 20px; margin:18px 0}
+footer{margin-top:56px; padding:28px 0 56px; border-top:1px solid var(--hair-soft);
+  color:var(--muted2); font-size:14px; display:flex; gap:20px; flex-wrap:wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><a href="/"><img src="assets/kod-mark.png" alt=""><span>Kod</span></a></header>
+
+  <h1>Kod Remote support</h1>
+  <p class="lead">Kod Remote is the iPhone companion to <a href="/">Kod</a>, the Mac app
+  that runs your <code>claude</code> and <code>codex</code> sessions. It shows which
+  ones need you, and lets you answer them from your phone.</p>
+
+  <h2>Pairing</h2>
+  <ol>
+    <li>On your Mac, open Kod → Settings → <strong>Mobile</strong> and turn on
+      <strong>Serve my sessions to my phone</strong>.</li>
+    <li>Choose how your phone reaches the Mac: <strong>My Wi-Fi network</strong>,
+      <strong>My Tailscale network</strong>, or both.</li>
+    <li>On your iPhone, open Kod Remote, tap <strong>Pair</strong>, and scan the code
+      Kod shows. No camera handy? Use <strong>Copy pairing link</strong> on the Mac and
+      <strong>Paste</strong> in the app.</li>
+  </ol>
+  <p>Want to look around first? <strong>Explore with sample data</strong> shows the
+  whole app with made-up sessions, no Mac needed.</p>
+
+  <h2>If it will not connect</h2>
+  <ul>
+    <li><span class="q">"No answer" on Wi-Fi.</span> Check that the Mac is awake and on
+      the same network, and that Kod Remote is allowed under iOS Settings → Kod →
+      <strong>Local Network</strong>. A "Don't Allow" there is remembered, and silently
+      blocks every connection.</li>
+    <li><span class="q">Away from home.</span> Turn on Tailscale on both devices and
+      <strong>My Tailscale network</strong> on the Mac, then pair again so the code
+      carries the Tailscale address too.</li>
+    <li><span class="q">"Nothing is listening on that port".</span> Kod is not serving
+      the phone: check the switch in Settings → Mobile, and that Kod is running.</li>
+    <li><span class="q">"Token rejected" or "a different key".</span> The token was
+      regenerated, or this is not the Mac you paired with. Scan a fresh code.</li>
+  </ul>
+
+  <div class="box">
+    Your sessions travel only between your phone and your Mac, encrypted and pinned
+    to your Mac's key. Anyone holding the pairing code can type into your sessions, so
+    treat it like a password — and if it may have been seen, use
+    <strong>Regenerate token</strong> on the Mac. More in our
+    <a href="privacy.html">privacy policy</a>.
+  </div>
+
+  <h2>Contact</h2>
+  <p>Report a problem or ask a question on
+  <a href="https://github.com/FelisAI/kod/issues">GitHub Issues</a>.</p>
+
+  <footer>
+    <span>© 2026 Felis AI LLC</span>
+    <a href="/">Kod</a>
+    <a href="privacy.html">Privacy</a>
+    <a href="https://github.com/FelisAI/kod">GitHub</a>
+  </footer>
+</div>
+</body>
+</html>
