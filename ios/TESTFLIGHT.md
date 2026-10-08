@@ -1,8 +1,9 @@
 # Shipping Kod Remote (TestFlight and the App Store)
 
-1.0 (build 2) was submitted to App Review on 2026-10-08, set to **release
-manually** after approval. Build 1 (August) went through Beta App Review for
-external TestFlight. The App Store Connect record is "Kod Remote",
+1.0 (build 2) was submitted to App Review on 2026-10-08 and releases
+**automatically** on approval. It went out with Kod 0.4.6, the Mac release whose
+bridge sends a phone the terminal of a session sitting still. Build 1 (August)
+went through Beta App Review for external TestFlight. The App Store Connect record is "Kod Remote",
 `pro.felisai.kod.remote`, Apple ID 6805673576.
 
 ## Build and upload
