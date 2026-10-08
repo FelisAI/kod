@@ -1,6 +1,14 @@
-# Shipping Kod Remote to external TestFlight
+# Shipping Kod Remote (TestFlight and the App Store)
 
-## Build
+1.0 (build 2) was submitted to App Review on 2026-10-08, set to **release
+manually** after approval. Build 1 (August) went through Beta App Review for
+external TestFlight. The App Store Connect record is "Kod Remote",
+`pro.felisai.kod.remote`, Apple ID 6805673576.
+
+## Build and upload
+
+Bump `CURRENT_PROJECT_VERSION` in `project.yml` first — App Store Connect refuses
+a build number it has seen. Then:
 
     cd ios
     xcodegen generate
@@ -8,76 +16,67 @@
       -destination 'generic/platform=iOS' -archivePath build-archive/Kod.xcarchive \
       -allowProvisioningUpdates
     xcodebuild -exportArchive -archivePath build-archive/Kod.xcarchive \
-      -exportOptionsPlist export.plist -exportPath build-export -allowProvisioningUpdates
+      -exportOptionsPlist upload.plist -exportPath build-export -allowProvisioningUpdates
 
-Produces `build-export/Kod.ipa`, signed **Apple Distribution: Felis AI LLC
-(BHX233597M)** with a store provisioning profile. `-allowProvisioningUpdates`
-creates the distribution certificate on first run, so no manual cert wrangling.
+where `upload.plist` is `export.plist` with `destination` set to `upload`. That
+uploads through the Apple account signed in to Xcode — no API key needed — and
+signs with the cloud-managed Apple Distribution certificate. `export.plist` as
+committed writes an `.ipa` instead. Processing takes a few minutes; the build then
+reaches the internal TestFlight group on its own.
 
-## Upload
+Check the RELEASE build compiles before archiving
+(`xcodebuild build -configuration Release …`): DEBUG-only code once leaked into a
+path Release compiles, and only the archive noticed.
 
-Needs credentials this repo does not hold. Either:
+## Screenshots
 
-    xcrun altool --upload-app -f build-export/Kod.ipa -t ios \
-      --apiKey <KEY_ID> --apiIssuer <ISSUER_ID>
+App Store Connect asks for 1206 × 2622 (iPhone with Dynamic Island, medium
+display) — the iPhone 17 Pro simulator's exact size. They are generated, not
+staged by hand:
 
-with the `.p8` in `~/.appstoreconnect/private_keys/`, or drag the `.ipa` into
-Xcode's Organizer. The app record for `pro.felisai.kod.remote` must exist in App
-Store Connect first.
+    TEST_RUNNER_KOD_SCREENSHOTS=1 xcodebuild test -project Kod.xcodeproj \
+      -scheme KodUITests -only-testing:KodUITests/AppStoreScreenshots \
+      -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -resultBundlePath shots.xcresult
+    xcrun xcresulttool export attachments --path shots.xcresult --output-path shots/
+
+They run the DEBUG sample data with `-kod-screenshots`, which hides the
+"sample data" banner. Order on the product page: Standup, a waiting session with
+its terminal, the answered session, Projects.
 
 ## Export compliance
 
 `ITSAppUsesNonExemptEncryption` is `false`. The app uses TLS and SHA-256 through
 Apple's own frameworks — standard algorithms, which are exempt. It implements no
-cryptography of its own. Answer "No" to the encryption question.
+cryptography of its own.
 
-## THE REVIEW RISK, and what to say about it
+## App Review — the companion-app problem, and the answer to it
 
-Kod Remote is a **companion app**: it does nothing without a Mac running Kod on
-the same Tailscale network. A reviewer opening it cold sees a connection screen
-and no way in. That is the single most likely rejection, under Guideline 2.1 (app
-completeness) or 4.2 (minimum functionality), and it is worth pre-empting in the
-App Review notes rather than arguing afterwards.
+Kod Remote does nothing on its own: it needs a Mac running Kod. A reviewer
+opening it cold used to see a connection screen and no way in — the classic 2.1 /
+4.2 rejection. **"Explore with sample data"** (home screen and connection sheet)
+now runs the whole app on built-in sessions, typing included, behind a banner that
+says what it is. The review notes lead with it, then explain pairing with a real
+Mac, and why `NSAllowsArbitraryLoads` is set: the Mac's certificate is self-signed
+for a private IP address, so trust is the pinned public key from the pairing code
+— exactly one key accepted, and plaintext refused off the phone's own loopback.
+Do NOT add `NSAllowsLocalNetworking` beside it: iOS then ignores
+`NSAllowsArbitraryLoads`, and the local-networking exemption does not cover a
+100.64/10 Tailscale address.
 
-Suggested notes:
-
-> Kod Remote is the companion to Kod, a macOS app for running coding agents
-> (claude, codex). It shows the sessions running on the user's own Mac and lets
-> them answer an agent that is waiting on a question.
->
-> It connects ONLY to a server the user runs themselves, over their own Tailscale
-> network or LAN — there is no service of ours involved and no account to create.
-> Pairing is by QR code shown in the Mac app, which carries the address, an access
-> token, and the fingerprint of the Mac's TLS key; the app pins that key and
-> refuses any other. Because of that it cannot be exercised without the desktop
-> app and a paired Mac.
->
-> A demo video showing the full flow — pairing, reading sessions, answering an
-> agent — is attached. We are happy to supply a build of the macOS app and a test
-> machine on request.
-
-Attach a screen recording. It is the thing that gets companion apps through.
+App Privacy is **Data Not Collected**; the policy is
+https://kod.felisai.pro/privacy and support is https://kod.felisai.pro/support
+(both in `site/`). Age rating 4+. Free, all regions; not offered on Apple Silicon
+Macs or Vision Pro.
 
 ## What is deliberately NOT in this build
 
 - **iPhone only** (`TARGETED_DEVICE_FAMILY: "1"`). iPad would oblige iPad
-  screenshots and a layout the Session reader and composer were not designed for.
-- **No spawning.** The phone cannot start a session, open a shell, or close
-  anything; it reads, and it types into claude/codex sessions only. The daemon
-  enforces that, not the app.
-- **ATS exception.** `NSAllowsArbitraryLoads` is still required: the Mac presents
-  a self-signed certificate (no CA will issue one for a private IP), so the
-  connection cannot chain to a trusted anchor. Identity comes from the pinned key
-  instead, which is stronger for this case than CA trust — no CA is trusted at
-  all. If review asks, that is the answer. Do NOT add `NSAllowsLocalNetworking`
-  alongside it: iOS then ignores `NSAllowsArbitraryLoads` and honours only the
-  local-networking exemption, which does not cover a 100.64/10 Tailscale address.
-  That combination cost an evening once already.
+  screenshots and a layout the reader and composer were not designed for.
+- **No spawning or closing.** The phone reads, types into live sessions and
+  presses the twenty named keys; the daemon enforces that, not the app.
 
-## External testing specifics
+## External testing
 
-External TestFlight (up to 10,000 testers, public link) needs Beta App Review —
-lighter than App Review, but the companion-app problem above still applies.
-Builds expire after **90 days**, so a public link means a build treadmill.
-Internal testing (up to 100 team members) needs no review at all and is the right
-first step.
+External TestFlight needs Beta App Review; builds expire after 90 days, so a
+public link means a build treadmill. Internal testing (the "Kod Early Users"
+group) needs no review.
