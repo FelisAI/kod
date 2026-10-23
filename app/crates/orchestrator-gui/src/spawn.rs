@@ -199,6 +199,13 @@ impl Orchestrator {
         spec.rows = STAGE_ROWS;
         spec.cols = TERM_COLS;
         spec.effort = self.claude_effort.clone();
+        // Carry THIS process's PATH — the login shell's, see login_env — on
+        // every spawn. A daemon an older Kod forked from the Dock still has
+        // launchd's PATH, and it outlives the upgrade while any session (a
+        // shell, which spawns by absolute path) keeps it alive.
+        if let Some(path) = std::env::var_os("PATH") {
+            spec.env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+        }
         spec
     }
 

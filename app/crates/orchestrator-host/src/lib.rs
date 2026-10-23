@@ -17,6 +17,7 @@ pub mod hooks;
 pub mod host;
 pub mod ingress;
 pub mod input;
+pub mod login_env;
 pub mod osc;
 pub mod protocol;
 pub mod pty;
@@ -63,6 +64,7 @@ mod api_hygiene {
         assert_plain::<crate::handoff::Packet>();
         assert_plain::<crate::handoff::SessionLog>();
         assert_plain::<crate::handoff::RepoSnapshot>();
+        assert_plain::<crate::login_env::Adopted>();
     }
 }
 

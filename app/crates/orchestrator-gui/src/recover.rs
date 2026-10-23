@@ -10,6 +10,25 @@ fn rel_secs(then_secs: u64, now_secs: u64) -> String {
     crate::timefmt::ago_label(now_secs.saturating_sub(then_secs).saturating_mul(1_000))
 }
 
+/// The restore banner's failure line: how many of the attempted restores
+/// failed and the last reason, flattened to one paragraph (a spawn error from
+/// portable-pty carries its own newlines).
+fn restore_failure_line(failed: usize, tried: usize, why: Option<&str>) -> String {
+    let head = if failed == tried && tried == 1 {
+        "Couldn't restore it".to_string()
+    } else if failed == tried {
+        format!("Couldn't restore any of the {tried}")
+    } else {
+        format!("Couldn't restore {failed} of the {tried}")
+    };
+    // restore_one's own "couldn't restore: " prefix would say it twice.
+    let why = why.map(|w| w.trim_start_matches("couldn't restore: "));
+    match why.map(|w| w.split_whitespace().collect::<Vec<_>>().join(" ")) {
+        Some(w) if !w.is_empty() => format!("{head} — {w}"),
+        _ => head,
+    }
+}
+
 impl Orchestrator {
 
     /// Resolve a recoverable session's HOME project, returning `(slug, cwd)`.
@@ -654,11 +673,12 @@ impl Orchestrator {
     /// actually bound to (which may be a freshly-minted ad-hoc home). Sessions
     /// whose restore FAILS (cwd transiently gone, spawn error) are kept in the
     /// offer so the banner can re-surface them rather than silently dropping.
-    fn restore_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn restore_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = std::mem::take(&mut self.restore_offer);
         let mut seen = std::collections::HashSet::new();
         let mut land: Option<String> = None;
         let mut failed: Vec<HostedSessionRow> = Vec::new();
+        let mut why: Option<String> = None;
         for row in rows {
             if !seen.insert(row.cli_session_id.clone()) {
                 continue;
@@ -669,9 +689,19 @@ impl Orchestrator {
                         land = Some(slug);
                     }
                 }
-                None => failed.push(row),
+                None => {
+                    why = self.term_error.clone();
+                    failed.push(row);
+                }
             }
         }
+        // A failure must be said HERE, on the banner the click came from. It
+        // used to reach only `term_error`, which the Standup never draws — so
+        // when every restore after a reboot failed (launchd's PATH, see
+        // login_env) the banner just stayed put and Restore all looked like a
+        // dead button (2026-10-23).
+        self.restore_error = (!failed.is_empty())
+            .then(|| restore_failure_line(failed.len(), seen.len(), why.as_deref()));
         if let Some(k) = land {
             self.selected = self
                 .projects
@@ -711,6 +741,7 @@ impl Orchestrator {
         }
         self.restore_offer.clear();
         self.restore_dismissed = true;
+        self.restore_error = None;
         cx.notify();
     }
 
@@ -956,7 +987,17 @@ impl Orchestrator {
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child(SharedString::from(sub)),
-            );
+            )
+            .when_some(self.restore_error.clone(), |c, err| {
+                c.child(
+                    div()
+                        .id("restore-error")
+                        .pl(px(23.))
+                        .text_size(px(12.))
+                        .text_color(rgb(0xE68A8A))
+                        .child(SharedString::from(err)),
+                )
+            });
         if self.restore_expanded {
             let mut list = div()
                 .id("restore-list")
@@ -1033,6 +1074,12 @@ impl Orchestrator {
                                         if this.restore_offer.is_empty() {
                                             this.restore_dismissed = true;
                                         }
+                                    } else {
+                                        this.restore_error = Some(restore_failure_line(
+                                            1,
+                                            1,
+                                            this.term_error.as_deref(),
+                                        ));
                                     }
                                     cx.notify();
                                 })),
@@ -1358,4 +1405,20 @@ impl Orchestrator {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_failure_line;
+
+    #[test]
+    fn failure_line_counts_and_flattens_the_reason() {
+        let pty = "couldn't restore: Unable to spawn claude because:\nNo viable candidates found in PATH \"/usr/bin:/bin\"";
+        assert_eq!(
+            restore_failure_line(17, 17, Some(pty)),
+            "Couldn't restore any of the 17 — Unable to spawn claude because: No viable candidates found in PATH \"/usr/bin:/bin\""
+        );
+        assert_eq!(restore_failure_line(2, 5, None), "Couldn't restore 2 of the 5");
+        assert_eq!(restore_failure_line(1, 1, Some("  ")), "Couldn't restore it");
+    }
 }

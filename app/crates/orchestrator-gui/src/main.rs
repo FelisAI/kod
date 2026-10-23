@@ -648,6 +648,9 @@ struct Orchestrator {
     /// one stray tap would discard a whole crash's worth of sessions.
     restore_dismiss_armed: bool,
     restore_expanded: bool,
+    /// why the last restore from the banner failed, drawn ON the banner — the
+    /// Standup never draws `term_error`, so a failed Restore all was silent.
+    restore_error: Option<String>,
     /// the control-bar "+" new-session dropdown (claude/codex/shell) open state.
     spawn_menu_open: bool,
     /// on-demand session summaries (Recover screen), keyed by session id.

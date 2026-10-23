@@ -92,11 +92,21 @@ fn sidecar(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     db.with_file_name(name)
 }
 
-/// Open (or create) the DESIGN-tree store at the app-support path.
+/// Open (or create) the DESIGN-tree store at the app-support path, or in
+/// `$KOD_STORE_DIR` — the same knob the seed examples write to. The release
+/// smoke test (scripts/release-smoke.sh) needs a throwaway store under the
+/// user's REAL $HOME: a sandboxed HOME would also hide the login shell's rc
+/// files, and loading those is what it tests.
 fn open_store() -> Arc<std::sync::Mutex<Store>> {
-    let dir = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join("Library/Application Support/orchestrator"))
-        .unwrap_or_else(|_| std::env::temp_dir().join("orchestrator"));
+    let dir = std::env::var_os("KOD_STORE_DIR")
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join("Library/Application Support/orchestrator"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("orchestrator"));
     let _ = std::fs::create_dir_all(&dir);
     // The store outgrew its first job (the design tree) — it now holds projects,
     // restore rows, overrides, and the activity log. One-time rename to a general
@@ -133,6 +143,12 @@ fn setting_flag(v: Option<String>) -> bool {
 
 /// The whole of startup. Called by `main()` and nothing else.
 pub(crate) fn run() {
+    // FIRST, before gpui starts a single thread: a Kod opened from the Dock or
+    // as a login item has launchd's PATH, on which neither claude nor codex
+    // exists — every spawn and every restore failed (2026-10-23). The daemon
+    // forked below inherits what this adopts. See login_env.
+    let adopted = orchestrator_host::login_env::adopt();
+    eprintln!("[kod] environment: {adopted:?}");
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         // Global keyboard map (docs/013 §4). ⌃` folds the terminal, ⇧⌃`
         // expands the stage, ⌘T/⇧⌘T/⌥⌘T spawn claude/codex/shell.
@@ -619,6 +635,7 @@ pub(crate) fn run() {
                         restore_offer: Vec::new(),
                         restore_dismissed: false,
                         restore_dismiss_armed: false,
+                        restore_error: None,
                         prompt_profile_id,
                         sess_profiles: Default::default(),
                         blocked_dismissed: Default::default(),
@@ -705,6 +722,28 @@ pub(crate) fn run() {
                             break;
                         }
                     }
+                })
+                .detach();
+            } else if demo == "restore-all" && std::env::var_os("KOD_STORE_DIR").is_some() {
+                // Presses the restore banner's "Restore all" through the
+                // button's own handler and reports the outcome on stderr — the
+                // release smoke test (scripts/release-smoke.sh), since nothing
+                // without accessibility access can click, and this button
+                // shipped dead once already (2026-10-23, see login_env).
+                // ONLY on a throwaway store: pressed on the real one it would
+                // resume every session the user's last crash left behind.
+                cx.spawn(async move |cx| {
+                    Timer::after(std::time::Duration::from_millis(1500)).await;
+                    let _ = main_window.update(cx, |o, window, cx| {
+                        let offered = o.restore_offer.len();
+                        o.restore_dismiss_armed = false;
+                        o.restore_all(window, cx);
+                        eprintln!(
+                            "[kod] restore-all: offered {offered}, left unrestored {}, error: {:?}",
+                            o.restore_offer.len(),
+                            o.restore_error
+                        );
+                    });
                 })
                 .detach();
             }
