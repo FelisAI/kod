@@ -396,6 +396,20 @@ pub enum AcFire {
 /// whole task again. It is also what a person types at that moment.
 pub const AC_RESUME_TEXT: &str = "continue";
 
+/// Codex keeps a Goal usage-limited after the account recovers. A normal
+/// "continue" does not reactivate it; its live status footer names the command
+/// that does. Read only that footer, never an old message in scrollback, and
+/// never substitute this command for a paused or budget-limited Goal.
+fn ac_resume_text(kind: CliKind, footer: &str) -> &'static str {
+    if kind == CliKind::Codex
+        && footer.lines().any(|line| line.trim_end().ends_with("Goal hit usage limits (/goal resume)"))
+    {
+        "/goal resume"
+    } else {
+        AC_RESUME_TEXT
+    }
+}
+
 pub fn ac_decide(i: &AcInputs, now_ms: u64) -> AcDecision {
     // 1. Flag off ⇒ never act; drop any arm we were holding.
     if !i.on {
@@ -529,6 +543,7 @@ fn ac_apply(
     now: u64,
     hit: bool,
     alive: bool,
+    kind: CliKind,
 ) -> Option<AcFire> {
     match decision {
         AcDecision::Skip => {}
@@ -581,7 +596,7 @@ fn ac_apply(
             // instead would both discard it and ask for something vaguer.
             let draft = g.input_buffer.trim().to_string();
             let fire = if draft.is_empty() {
-                AcFire::Send(AC_RESUME_TEXT)
+                AcFire::Send(ac_resume_text(kind, &g.emu.bottom_plain(3)))
             } else {
                 AcFire::SubmitDraft(draft)
             };
@@ -1078,7 +1093,7 @@ impl HostedSession {
         // Everything except the pty keystrokes is a pure `Inner` mutation, so it's
         // unit-tested on a bare `Inner` (RULE ZERO). `ac_apply` returns the exact
         // ground-truth text ONLY when a live session must be fired into.
-        let fire_text = ac_apply(&mut g, decision, now, hit, alive);
+        let fire_text = ac_apply(&mut g, decision, now, hit, alive, self.kind);
         if let Some(fire) = fire_text {
             // Written WHILE STILL HOLDING `g` (lock-held raw-write path, #2) so a
             // client keystroke cannot interleave between the gate and the write.
@@ -2234,7 +2249,7 @@ mod tests {
     #[test]
     fn apply_arm_sets_arm_state() {
         let mut g = test_inner();
-        let out = ac_apply(&mut g, AcDecision::Arm { reset_at: R }, 5000, true, true);
+        let out = ac_apply(&mut g, AcDecision::Arm { reset_at: R }, 5000, true, true, CliKind::Codex);
         assert_eq!(out, None);
         assert!(g.ac_armed);
         assert_eq!(g.ac_reset_at, Some(R));
@@ -2271,7 +2286,7 @@ mod tests {
         let mut g = test_inner();
         g.ac_armed = true;
         g.ac_reset_at = Some(R);
-        let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, true);
+        let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, true, CliKind::Codex);
         assert_eq!(
             out,
             Some(AcFire::Send(AC_RESUME_TEXT)),
@@ -2288,6 +2303,59 @@ mod tests {
         );
     }
 
+    /// 2026-10-25: the account had recovered and we logged "continue",
+    /// but the terminal still said "Goal hit usage limits (/goal resume)" and
+    /// the Goal stayed usage_limited. Only its resume command restarted work.
+    #[test]
+    fn apply_fire_resumes_a_usage_limited_codex_goal_and_records_the_command() {
+        let mut g = test_inner();
+        g.emu = Emulator::new(10, 140);
+        g.emu.advance(concat!(
+            "\x1b[9;1H  GPT-6.1-Sol xhigh · ~/project · Example project",
+            "                  Goal hit usage limits (/goal resume)",
+            "\x1b[10;1H  ? for shortcuts"
+        ).as_bytes());
+        g.ac_armed = true;
+        g.ac_reset_at = Some(R);
+        let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, true, CliKind::Codex);
+        assert_eq!(out, Some(AcFire::Send("/goal resume")));
+        assert!(g.ac_fired && !g.ac_armed, "the command fires once per block");
+        assert!(g.events.iter().any(|e| matches!(&e.kind,
+            SessionEventKind::Notice { text }
+                if text == "auto-continued at reset — sent \"/goal resume\"")));
+
+        // A draft remains the user's intended next message, even with a Goal.
+        g.input_buffer = "finish the current character first".into();
+        let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, true, CliKind::Codex);
+        assert_eq!(out, Some(AcFire::SubmitDraft("finish the current character first".into())));
+    }
+
+    #[test]
+    fn only_a_usage_limited_codex_goal_selects_the_goal_resume_command() {
+        for footer in [
+            "Pursuing goal (6h 18m)",
+            "Goal paused (/goal resume)",
+            "Goal hit token budget (/goal resume)",
+            "Goal blocked (/goal resume)",
+            "Goal complete",
+            "",
+        ] {
+            assert_eq!(ac_resume_text(CliKind::Codex, footer), AC_RESUME_TEXT, "{footer}");
+        }
+        let limited = "Goal hit usage limits (/goal resume)";
+        assert_eq!(ac_resume_text(CliKind::Claude, limited), AC_RESUME_TEXT);
+        assert_eq!(ac_resume_text(CliKind::Shell, limited), AC_RESUME_TEXT);
+
+        let mut g = test_inner();
+        g.emu = Emulator::new(10, 100);
+        g.emu.advance(format!("{limited}\x1b[9;1H  Pursuing goal (6h 18m)").as_bytes());
+        assert_eq!(
+            ac_resume_text(CliKind::Codex, &g.emu.bottom_plain(3)),
+            AC_RESUME_TEXT,
+            "an older line in the session is not its current Goal status"
+        );
+    }
+
 
     #[test]
     fn apply_fire_dead_skips_and_logs_manual_resume() {
@@ -2295,7 +2363,7 @@ mod tests {
         g.ac_prompt = Some(("x".into(), 100));
         g.ac_armed = true;
         g.ac_reset_at = Some(R);
-        let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, false);
+        let out = ac_apply(&mut g, AcDecision::Fire, 9000, false, false, CliKind::Codex);
         assert_eq!(out, None, "MUST NOT type into a dead session");
         assert!(!g.ac_armed, "disarmed");
         assert!(!g.ac_fired, "no fire latch on a dead skip");
@@ -2308,7 +2376,7 @@ mod tests {
         let mut g = test_inner();
         g.ac_armed = true;
         g.ac_reset_at = Some(R);
-        let out = ac_apply(&mut g, AcDecision::GiveUp, 9000, true, true);
+        let out = ac_apply(&mut g, AcDecision::GiveUp, 9000, true, true, CliKind::Codex);
         assert_eq!(out, None);
         assert!(!g.ac_armed);
         assert!(
@@ -2356,7 +2424,7 @@ mod tests {
                 AcDecision::GiveUp => giveups += 1,
                 _ => {}
             }
-            ac_apply(&mut g, decision, now, true, true);
+            ac_apply(&mut g, decision, now, true, true, CliKind::Codex);
         }
         assert_eq!(giveups, 1, "GiveUp is TERMINAL — exactly one, not one every other tick");
         assert_eq!(arms, 1, "and it must not re-arm against the same dead reset");
@@ -2375,12 +2443,12 @@ mod tests {
         // A genuine not-hit observation re-enables arming for the NEXT hit.
         let mut cleared = test_inner();
         cleared.ac_fired = true;
-        assert_eq!(ac_apply(&mut cleared, AcDecision::Skip, 9000, false, true), None);
+        assert_eq!(ac_apply(&mut cleared, AcDecision::Skip, 9000, false, true, CliKind::Codex), None);
         assert!(!cleared.ac_fired, "not-hit must clear the fired latch");
         // While STILL hit the latch must persist (one auto-continue per block).
         let mut still_hit = test_inner();
         still_hit.ac_fired = true;
-        ac_apply(&mut still_hit, AcDecision::Skip, 9000, true, true);
+        ac_apply(&mut still_hit, AcDecision::Skip, 9000, true, true, CliKind::Codex);
         assert!(still_hit.ac_fired, "fired latch persists while still hit");
     }
 
